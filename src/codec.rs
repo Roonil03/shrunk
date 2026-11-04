@@ -28,13 +28,27 @@ pub enum Codec {
     GorillaRle = 4,
     /// Dolphin-inspired skip encoding for oscillating XOR prefixes.
     Dolphin = 5,
+    /// FCM/DFCM predictor residuals (AFC/FPC-inspired prototype).
+    Predictor = 6,
 }
 
 impl Codec {
-    /// Order matters: on a size tie the earlier codec wins.
-    pub const CANDIDATES: [Codec; 6] = [
+    /// Every persisted codec. Used by research benchmarks and round-trip tests.
+    pub const ALL: [Codec; 7] = [
+        Codec::Raw,
+        Codec::Gorilla,
+        Codec::Delta,
+        Codec::Rle,
         Codec::GorillaRle,
         Codec::Dolphin,
+        Codec::Predictor,
+    ];
+
+    /// Order matters: on a size tie the earlier codec wins.
+    pub const CANDIDATES: [Codec; 7] = [
+        Codec::GorillaRle,
+        Codec::Dolphin,
+        Codec::Predictor,
         Codec::Gorilla,
         Codec::Delta,
         Codec::Rle,
@@ -49,6 +63,7 @@ impl Codec {
             3 => Some(Codec::Rle),
             4 => Some(Codec::GorillaRle),
             5 => Some(Codec::Dolphin),
+            6 => Some(Codec::Predictor),
             _ => None,
         }
     }
@@ -61,6 +76,7 @@ impl Codec {
             Codec::Rle => "rle",
             Codec::GorillaRle => "gorilla-rle",
             Codec::Dolphin => "dolphin",
+            Codec::Predictor => "predictor",
         }
     }
 
@@ -76,6 +92,7 @@ impl Codec {
             Codec::Rle => Some(rle_encode(points)),
             Codec::GorillaRle => Some(gorilla_rle_encode(points)),
             Codec::Dolphin => Some(dolphin_encode(points)),
+            Codec::Predictor => Some(predictor_encode(points)),
         }
     }
 
@@ -90,6 +107,7 @@ impl Codec {
             Codec::Rle => rle_decode(bytes, count),
             Codec::GorillaRle => gorilla_rle_decode(bytes, count),
             Codec::Dolphin => dolphin_decode(bytes, count),
+            Codec::Predictor => predictor_decode(bytes, count),
         }
     }
 }
@@ -599,6 +617,124 @@ fn dolphin_decode(bytes: &[u8], count: usize) -> Result<Vec<Point>, String> {
 }
 
 // ---------------------------------------------------------------------------
+// AFC/FPC-inspired FCM + DFCM predictor residuals
+// ---------------------------------------------------------------------------
+//
+// FPC (Burtscher & Ratanaworabhan, 2008) and AFC (Chen et al., 2024) predict
+// the next 64-bit pattern with two tables: FCM maps a context to the last value
+// seen in it, and DFCM maps a context to the last bit-pattern delta. The
+// predictor with the longer zero prefix in its residual wins. We keep that
+// idea, select per point, and Gorilla-encode the residual. The four exact AFC
+// strategies are not public, so this is an independent predictor prototype.
+
+const PREDICTOR_TABLE_BITS: usize = 12;
+const PREDICTOR_TABLE_SIZE: usize = 1 << PREDICTOR_TABLE_BITS;
+
+#[inline]
+fn predictor_index(bits: u64) -> usize {
+    ((bits >> 52) as usize) & (PREDICTOR_TABLE_SIZE - 1)
+}
+
+/// Cheap per-block gate: encode a small prefix with both the predictor and GR.
+/// This costs a fraction of one block encode and directly tests whether the
+/// predictor is worth trying on the rest of the block.
+pub(crate) fn predictor_is_promising(points: &[Point]) -> bool {
+    let n = points.len().min(128);
+    if n < 8 {
+        return false;
+    }
+    let sample = &points[..n];
+    predictor_encode(sample).len() < gorilla_rle_encode(sample).len()
+}
+
+fn predictor_encode(points: &[Point]) -> Vec<u8> {
+    let mut out = Vec::new();
+    encode_ts_rle(points, &mut out);
+
+    let mut w = BitWriter::new();
+    let mut prev = points[0].value.to_bits();
+    w.write_bits(prev, 64);
+
+    let mut fcm = vec![0u64; PREDICTOR_TABLE_SIZE];
+    let mut dfcm = vec![0u64; PREDICTOR_TABLE_SIZE];
+    let mut last_delta = 0u64;
+    let mut window: Option<(u32, u32)> = None;
+
+    for p in points.iter().skip(1) {
+        let actual = p.value.to_bits();
+
+        let fcm_idx = predictor_index(prev);
+        let fcm_pred = match fcm[fcm_idx] {
+            0 => prev,
+            v => v,
+        };
+        let dfcm_idx = predictor_index(last_delta);
+        let dfcm_pred = prev.wrapping_add(dfcm[dfcm_idx]);
+
+        let fcm_lz = (fcm_pred ^ actual).leading_zeros();
+        let dfcm_lz = (dfcm_pred ^ actual).leading_zeros();
+        let use_dfcm = dfcm_lz > fcm_lz;
+        let prediction = if use_dfcm { dfcm_pred } else { fcm_pred };
+        w.write_bit(use_dfcm);
+        encode_xor(&mut w, prediction, actual, &mut window);
+
+        let delta = actual.wrapping_sub(prev);
+        fcm[fcm_idx] = actual;
+        dfcm[dfcm_idx] = delta;
+        last_delta = delta;
+        prev = actual;
+    }
+
+    out.extend_from_slice(&w.finish());
+    out
+}
+
+fn predictor_decode(bytes: &[u8], count: usize) -> Result<Vec<Point>, String> {
+    let mut pos = 0usize;
+    let timestamps = decode_ts_rle(bytes, &mut pos, count, "predictor")?;
+    if pos >= bytes.len() {
+        return Err("predictor: missing value stream".to_string());
+    }
+    let mut r = BitReader::new(&bytes[pos..]);
+    let mut prev = r.read_bits(64);
+    let mut values = Vec::with_capacity(count);
+    values.push(f64::from_bits(prev));
+
+    let mut fcm = vec![0u64; PREDICTOR_TABLE_SIZE];
+    let mut dfcm = vec![0u64; PREDICTOR_TABLE_SIZE];
+    let mut last_delta = 0u64;
+    let mut window: Option<(u32, u32)> = None;
+
+    for _ in 1..count {
+        let fcm_idx = predictor_index(prev);
+        let fcm_pred = match fcm[fcm_idx] {
+            0 => prev,
+            v => v,
+        };
+        let dfcm_idx = predictor_index(last_delta);
+        let dfcm_pred = prev.wrapping_add(dfcm[dfcm_idx]);
+
+        let use_dfcm = r.read_bit();
+        let prediction = if use_dfcm { dfcm_pred } else { fcm_pred };
+        let actual = decode_xor(&mut r, prediction, &mut window)?;
+        values.push(f64::from_bits(actual));
+
+        let delta = actual.wrapping_sub(prev);
+        fcm[fcm_idx] = actual;
+        dfcm[dfcm_idx] = delta;
+        last_delta = delta;
+        prev = actual;
+    }
+    check_bit_padding(&r, bytes.len() - pos)?;
+
+    let mut out = Vec::with_capacity(count);
+    for (ts, value) in timestamps.into_iter().zip(values) {
+        out.push(Point { ts, value });
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
 // Delta + zigzag varints (integral values only)
 // ---------------------------------------------------------------------------
 
@@ -1001,7 +1137,7 @@ mod tests {
                 points.push(Point { ts, value });
             }
 
-            for codec in Codec::CANDIDATES {
+            for codec in Codec::ALL {
                 let Some(bytes) = codec.encode(&points) else {
                     continue;
                 };
@@ -1041,6 +1177,32 @@ mod tests {
     }
 
     #[test]
+    fn predictor_wins_on_predictable_counter_and_roundtrips() {
+        let pts = crate::gen::generate(crate::gen::Pattern::Counter, 1024, 1_700_000_000_000, 1000);
+        let predictor = Codec::Predictor.encode(&pts).unwrap();
+        let gorilla = Codec::GorillaRle.encode(&pts).unwrap();
+        assert!(
+            predictor.len() * 2 < gorilla.len(),
+            "predictor should win big"
+        );
+        let back = Codec::Predictor.decode(&predictor, pts.len()).unwrap();
+        assert_eq!(back.len(), pts.len());
+        for (a, b) in pts.iter().zip(back.iter()) {
+            assert_eq!(a.ts, b.ts);
+            assert_eq!(a.value.to_bits(), b.value.to_bits());
+        }
+    }
+
+    #[test]
+    fn predictor_gate_recognizes_predictable_data() {
+        let counter =
+            crate::gen::generate(crate::gen::Pattern::Counter, 1024, 1_700_000_000_000, 1000);
+        assert!(predictor_is_promising(&counter));
+        let noise = crate::gen::generate(crate::gen::Pattern::Noise, 1024, 1_700_000_000_000, 1000);
+        assert!(!predictor_is_promising(&noise));
+    }
+
+    #[test]
     fn codec_ids_are_stable() {
         // IDs are persisted in block headers; never renumber an existing codec.
         for (id, codec) in [
@@ -1050,10 +1212,11 @@ mod tests {
             (3, Codec::Rle),
             (4, Codec::GorillaRle),
             (5, Codec::Dolphin),
+            (6, Codec::Predictor),
         ] {
             assert_eq!(Codec::from_u8(id), Some(codec));
             assert_eq!(codec as u8, id);
         }
-        assert_eq!(Codec::from_u8(6), None);
+        assert_eq!(Codec::from_u8(7), None);
     }
 }

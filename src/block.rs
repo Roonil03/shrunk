@@ -3,7 +3,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
 
-use crate::codec::{dolphin_skip_rate, Codec};
+use crate::codec::{dolphin_skip_rate, predictor_is_promising, Codec};
 use crate::crc::crc32;
 use crate::Point;
 
@@ -138,8 +138,14 @@ impl Block {
         // Dolphin only pays off on oscillating blocks. Skip its extra bit per
         // new window elsewhere, where it cannot beat Gorilla.
         let use_dolphin = dolphin_skip_rate(points) >= 0.08;
+        // Predictor tables only pay off on predictable blocks. A short sample
+        // encode decides whether trying the full block is worthwhile.
+        let use_predictor = predictor_is_promising(points);
         for codec in Codec::CANDIDATES {
             if codec == Codec::Dolphin && !use_dolphin {
+                continue;
+            }
+            if codec == Codec::Predictor && !use_predictor {
                 continue;
             }
             if let Some(bytes) = codec.encode(points) {
