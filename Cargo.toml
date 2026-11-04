@@ -1,0 +1,15 @@
+[package]
+name = "shrunk"
+version = "0.1.0"
+edition = "2021"
+description = "A tiny time series database that stores compressed blocks and queries them without fully decoding"
+
+[[bin]]
+name = "shrunk"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
