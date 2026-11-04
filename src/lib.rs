@@ -22,6 +22,7 @@ pub mod codec;
 mod crc;
 pub mod db;
 pub mod gen;
+mod wal;
 
 pub use block::Block;
 pub use codec::Codec;

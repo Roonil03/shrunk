@@ -12,12 +12,13 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::block::{Block, Payload, BLOCK_HEADER_BYTES};
 use crate::codec::Codec;
 use crate::crc::crc32;
+use crate::wal::{self, Wal};
 use crate::Point;
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -294,6 +295,8 @@ pub struct Db {
     block_size: usize,
     format_version: u16,
     series: BTreeMap<String, Series>,
+    path: Option<PathBuf>,
+    wal: Option<Wal>,
 }
 
 impl Default for Db {
@@ -312,6 +315,8 @@ impl Db {
             block_size: block_size.clamp(1, MAX_BLOCK_SIZE),
             format_version: FORMAT_VERSION,
             series: BTreeMap::new(),
+            path: None,
+            wal: None,
         }
     }
 
@@ -336,6 +341,9 @@ impl Db {
     /// Write one point. Timestamps must strictly increase per series; writing
     /// the same timestamp twice returns `Error::Duplicate`.
     pub fn write(&mut self, series: &str, ts: i64, value: f64) -> Result<()> {
+        if self.wal.is_some() {
+            return self.write_many(series, &[Point { ts, value }]);
+        }
         let block_size = self.block_size;
         let s = self
             .series
@@ -395,6 +403,10 @@ impl Db {
             prev = Some(p.ts);
         }
 
+        if let Some(wal) = self.wal.as_mut() {
+            wal.append(series, points)?;
+        }
+
         let block_size = self.block_size;
         let s = self
             .series
@@ -415,6 +427,17 @@ impl Db {
             s.pending = rest.to_vec();
         }
         Ok(())
+    }
+
+    /// Append a batch to a database opened for read/write. Returns an error if
+    /// the database is not bound to a WAL path.
+    pub fn append(&mut self, series: &str, points: &[Point]) -> Result<()> {
+        if self.wal.is_none() {
+            return Err(Error::Format(
+                "append requires Db::open_rw or Db::open_rw_with_block_size".into(),
+            ));
+        }
+        self.write_many(series, points)
     }
 
     pub fn flush(&mut self, series: &str) -> Result<()> {
@@ -724,44 +747,148 @@ impl Db {
                 }
             }
         }
+        // The snapshot is now the durable source of truth. Truncating after
+        // the rename is safe: a crash before this point replays a WAL whose
+        // points are already in the snapshot, and replay skips them.
+        if let Some(wal) = self.wal.as_mut() {
+            wal.truncate()?;
+        }
+        self.path = Some(path.to_path_buf());
         self.format_version = FORMAT_VERSION;
         Ok(())
     }
 
+    /// Flush pending points, write an atomic snapshot, and truncate the WAL.
+    pub fn checkpoint(&mut self) -> Result<()> {
+        let path = self
+            .path
+            .clone()
+            .ok_or_else(|| Error::Format("checkpoint requires a bound database path".into()))?;
+        self.save(&path)
+    }
+
+    /// Open a snapshot and replay any WAL. The returned handle is not bound
+    /// for further appends; use [`Db::open_rw`] for that.
     pub fn open(path: &Path) -> Result<Db> {
-        let meta = fs::metadata(path)?;
-        if meta.len() > MAX_DB_BYTES {
-            return Err(Error::Format(format!(
-                "database is {} bytes, limit is {MAX_DB_BYTES}",
-                meta.len()
+        let wal_path = wal::wal_path(path);
+        if !path.exists() {
+            if wal_path.exists() {
+                return recover_from_wal(&wal_path);
+            }
+            return Err(Error::Io(std::io::Error::from(
+                std::io::ErrorKind::NotFound,
             )));
         }
-        let mut f = File::open(path)?;
-        let mut magic = [0u8; 8];
-        if f.read_exact(&mut magic).is_err() {
-            return Err(Error::Format("truncated file header".into()));
-        }
-        match &magic {
-            m if m == &FORMAT_MAGIC => decode_current_file(f, meta.len()),
-            m if m == &MAGIC_V1 || m == &MAGIC_V2 => {
-                let mut data = Vec::with_capacity(meta.len() as usize);
-                data.extend_from_slice(&magic);
-                f.read_to_end(&mut data)?;
-                decode_db(&data)
+        let mut db = open_snapshot(path)?;
+        replay_wal_into(&mut db, &wal_path)?;
+        Ok(db)
+    }
+
+    /// Open for durable incremental appends. A missing database is created
+    /// with the default block size; existing snapshots and WALs are replayed.
+    pub fn open_rw(path: &Path) -> Result<Db> {
+        Self::open_rw_with_block_size(path, 1024)
+    }
+
+    pub fn open_rw_with_block_size(path: &Path, block_size: usize) -> Result<Db> {
+        let wal_path = wal::wal_path(path);
+        let mut db = if path.exists() {
+            let mut db = open_snapshot(path)?;
+            replay_wal_into(&mut db, &wal_path)?;
+            db
+        } else if wal_path.exists() {
+            if fs::metadata(&wal_path)?.len() < wal::WAL_HEADER_BYTES {
+                Db::with_block_size(block_size)
+            } else {
+                recover_from_wal(&wal_path)?
             }
-            _ => Err(Error::Format(
-                format!("bad magic; not a shrunk database (current format is SHRUNK{FORMAT_VERSION:02})").into(),
-            )),
-        }
+        } else {
+            Db::with_block_size(block_size)
+        };
+        let wal = Wal::open(&wal_path, db.block_size)?;
+        db.wal = Some(wal);
+        db.path = Some(path.to_path_buf());
+        Ok(db)
     }
 
     pub fn load_or_new(path: &Path) -> Result<Db> {
-        if path.exists() {
-            Db::open(path)
+        if path.exists() || wal::wal_path(path).exists() {
+            Db::open_rw(path)
         } else {
-            Ok(Db::new())
+            Db::open_rw_with_block_size(path, 1024)
         }
     }
+
+    fn replay_record(&mut self, series: &str, points: &[Point]) -> Result<()> {
+        let last = self.series.get(series).and_then(|s| s.last_ts);
+        let start = match last {
+            Some(last) => points.partition_point(|p| p.ts <= last),
+            None => 0,
+        };
+        if start < points.len() {
+            self.write_many(series, &points[start..])?;
+        }
+        Ok(())
+    }
+}
+
+fn open_snapshot(path: &Path) -> Result<Db> {
+    let meta = fs::metadata(path)?;
+    if meta.len() > MAX_DB_BYTES {
+        return Err(Error::Format(format!(
+            "database is {} bytes, limit is {MAX_DB_BYTES}",
+            meta.len()
+        )));
+    }
+    let mut f = File::open(path)?;
+    let mut magic = [0u8; 8];
+    if f.read_exact(&mut magic).is_err() {
+        return Err(Error::Format("truncated file header".into()));
+    }
+    match &magic {
+        m if m == &FORMAT_MAGIC => decode_current_file(f, meta.len()),
+        m if m == &MAGIC_V1 || m == &MAGIC_V2 => {
+            let mut data = Vec::with_capacity(meta.len() as usize);
+            data.extend_from_slice(&magic);
+            f.read_to_end(&mut data)?;
+            decode_db(&data)
+        }
+        _ => Err(Error::Format(format!(
+            "bad magic; not a shrunk database (current format is SHRUNK{FORMAT_VERSION:02})"
+        ))),
+    }
+}
+
+fn replay_wal_into(db: &mut Db, wal_path: &Path) -> Result<()> {
+    if !wal_path.exists() {
+        return Ok(());
+    }
+    let len = fs::metadata(wal_path)?.len();
+    if len < wal::WAL_HEADER_BYTES {
+        return Ok(());
+    }
+    let block_size = wal::read_block_size(wal_path)?;
+    if block_size != db.block_size {
+        return Err(Error::Format(format!(
+            "WAL block size {block_size} does not match database block size {}",
+            db.block_size
+        )));
+    }
+    wal::replay(wal_path, &mut |series, points| {
+        db.replay_record(series, points)
+    })
+}
+
+fn recover_from_wal(wal_path: &Path) -> Result<Db> {
+    if fs::metadata(wal_path)?.len() < wal::WAL_HEADER_BYTES {
+        return Ok(Db::new());
+    }
+    let block_size = wal::read_block_size(wal_path)?;
+    let mut db = Db::with_block_size(block_size);
+    wal::replay(wal_path, &mut |series, points| {
+        db.replay_record(series, points)
+    })?;
+    Ok(db)
 }
 
 fn fold(

@@ -417,3 +417,185 @@ fn v3_header_and_metadata_corruption_are_rejected() {
 
     let _ = fs::remove_dir_all(&dir);
 }
+
+fn wal_sidecar(path: &std::path::Path) -> std::path::PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".wal");
+    std::path::PathBuf::from(name)
+}
+
+#[test]
+fn wal_recovers_without_a_snapshot() {
+    let dir = std::env::temp_dir().join(format!("shrunk-wal1-{}", std::process::id()));
+    let _ = fs::create_dir_all(&dir);
+    let path = dir.join("db.shrunk");
+    let wal = wal_sidecar(&path);
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_file(&wal);
+
+    let mut db = Db::open_rw_with_block_size(&path, 64).unwrap();
+    db.append("m", &series(100, 1_000, 10)).unwrap();
+    assert!(!path.exists(), "append must not rewrite a snapshot");
+    assert!(wal.exists());
+    drop(db);
+
+    let reopened = Db::open(&path).unwrap();
+    assert_eq!(reopened.point_count(), 100);
+    assert_eq!(
+        reopened
+            .query(&Query::new("m", i64::MIN, i64::MAX))
+            .unwrap()
+            .points,
+        series(100, 1_000, 10)
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn wal_append_does_not_rewrite_the_snapshot_and_checkpoint_truncates() {
+    let dir = std::env::temp_dir().join(format!("shrunk-wal2-{}", std::process::id()));
+    let _ = fs::create_dir_all(&dir);
+    let path = dir.join("db.shrunk");
+    let wal = wal_sidecar(&path);
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_file(&wal);
+
+    let mut db = Db::open_rw_with_block_size(&path, 64).unwrap();
+    db.append("m", &series(64, 1_000, 10)).unwrap();
+    db.checkpoint().unwrap();
+    let snapshot = fs::read(&path).unwrap();
+    assert_eq!(fs::metadata(&wal).unwrap().len(), 0);
+
+    db.append("m", &series(10, 1_000 + 64 * 10, 10)).unwrap();
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        snapshot,
+        "append rewrote snapshot"
+    );
+    assert!(fs::metadata(&wal).unwrap().len() > 0);
+    drop(db);
+
+    let reopened = Db::open(&path).unwrap();
+    assert_eq!(reopened.point_count(), 74);
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn wal_ignores_a_torn_tail() {
+    let dir = std::env::temp_dir().join(format!("shrunk-wal3-{}", std::process::id()));
+    let _ = fs::create_dir_all(&dir);
+    let path = dir.join("db.shrunk");
+    let wal = wal_sidecar(&path);
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_file(&wal);
+
+    let mut db = Db::open_rw_with_block_size(&path, 64).unwrap();
+    db.append("m", &series(10, 1_000, 10)).unwrap();
+    db.append("m", &series(10, 1_100, 10)).unwrap();
+    drop(db);
+
+    let len = fs::metadata(&wal).unwrap().len();
+    let f = fs::OpenOptions::new().write(true).open(&wal).unwrap();
+    f.set_len(len - 3).unwrap();
+    drop(f);
+
+    let reopened = Db::open(&path).unwrap();
+    assert_eq!(reopened.point_count(), 10);
+    assert_eq!(
+        reopened
+            .query(&Query::new("m", i64::MIN, i64::MAX))
+            .unwrap()
+            .points,
+        series(10, 1_000, 10)
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn wal_replay_is_idempotent_after_checkpoint() {
+    let dir = std::env::temp_dir().join(format!("shrunk-wal4-{}", std::process::id()));
+    let _ = fs::create_dir_all(&dir);
+    let path = dir.join("db.shrunk");
+    let wal = wal_sidecar(&path);
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_file(&wal);
+
+    let mut db = Db::open_rw_with_block_size(&path, 64).unwrap();
+    db.append("m", &series(100, 1_000, 10)).unwrap();
+    drop(db);
+    let old_wal = fs::read(&wal).unwrap();
+
+    let mut db = Db::open_rw_with_block_size(&path, 64).unwrap();
+    db.checkpoint().unwrap();
+    assert_eq!(fs::metadata(&wal).unwrap().len(), 0);
+    drop(db);
+
+    // Simulate a crash after the snapshot rename but before WAL truncation.
+    fs::write(&wal, &old_wal).unwrap();
+    let reopened = Db::open(&path).unwrap();
+    assert_eq!(reopened.point_count(), 100);
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn failed_append_leaves_wal_and_memory_unchanged() {
+    let dir = std::env::temp_dir().join(format!("shrunk-wal5-{}", std::process::id()));
+    let _ = fs::create_dir_all(&dir);
+    let path = dir.join("db.shrunk");
+    let wal = wal_sidecar(&path);
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_file(&wal);
+
+    let mut db = Db::open_rw_with_block_size(&path, 64).unwrap();
+    db.append("m", &series(10, 1_000, 10)).unwrap();
+    let before = fs::metadata(&wal).unwrap().len();
+    let err = db
+        .append(
+            "m",
+            &[Point {
+                ts: 1_090,
+                value: 1.0,
+            }],
+        )
+        .unwrap_err();
+    assert!(matches!(err, shrunk::Error::Duplicate { .. }), "{err}");
+    assert_eq!(fs::metadata(&wal).unwrap().len(), before);
+    assert_eq!(db.point_count(), 10);
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn open_reader_keeps_a_stable_snapshot_across_checkpoint() {
+    let dir = std::env::temp_dir().join(format!("shrunk-wal6-{}", std::process::id()));
+    let _ = fs::create_dir_all(&dir);
+    let path = dir.join("db.shrunk");
+    let wal = wal_sidecar(&path);
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_file(&wal);
+
+    let mut writer = Db::open_rw_with_block_size(&path, 64).unwrap();
+    writer.append("m", &series(100, 1_000, 10)).unwrap();
+    writer.checkpoint().unwrap();
+
+    let reader = Db::open(&path).unwrap();
+    assert_eq!(reader.point_count(), 100);
+
+    writer
+        .append("m", &series(100, 1_000 + 100 * 10, 10))
+        .unwrap();
+    writer.checkpoint().unwrap();
+    assert_eq!(writer.point_count(), 200);
+
+    // The reader still has the old inode open, so it sees its original data.
+    assert_eq!(reader.point_count(), 100);
+    let fresh = Db::open(&path).unwrap();
+    assert_eq!(fresh.point_count(), 200);
+
+    let _ = fs::remove_dir_all(&dir);
+}
