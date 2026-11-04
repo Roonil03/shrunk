@@ -157,11 +157,13 @@ paywalled. We prototyped the segmentation idea: cut where the local
 leading-zero variance changes, then encode each segment with the best codec.
 
 `segment-bench` compares variance segments against fixed blocks of the same
-average length. At thresholds 16, 4, and 1 the change was at most -0.18% on
-cpu/noise and oscillating, and the apparent large wins disappeared once block
-size was controlled. Conclusion: no consistent measurable win on the available
-workloads, so segmentation is not part of the default write path. The benchmark
-command remains for future work.
+average length. At thresholds 16, 4, and 1 the change was between +0.08% and
+-1.06%; the only repeatable win is about 1% on oscillating data, while the
+lowest threshold also makes several patterns much worse in absolute terms
+(counter 2.16 -> 6.94 bits/point) because segments shrink to ~127 points.
+Conclusion: no consistent measurable win across workloads, so segmentation is
+not part of the default write path. The benchmark command remains for future
+work.
 
 ### AFC — predictor prototyped and integrated
 
