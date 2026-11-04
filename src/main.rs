@@ -103,6 +103,7 @@ fn cmd_ingest(args: &[String]) -> Result<(), String> {
     let mut db = Db::load_or_new(&path).map_err(|e| e.to_string())?;
     let before = db.point_count();
     let t0 = Instant::now();
+    let mut points = Vec::new();
     for (lineno, line) in text.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -123,11 +124,14 @@ fn cmd_ingest(args: &[String]) -> Result<(), String> {
                     "line {}: expected integer_ms,value (got {:?})",
                     lineno + 1,
                     line
-                ))
+                ));
             }
         };
-        db.write(series, ts, value).map_err(|e| e.to_string())?;
+        points.push(shrunk::Point { ts, value });
     }
+    // One atomic batch: a duplicate or out-of-order line cannot leave a
+    // partially ingested file behind.
+    db.write_many(series, &points).map_err(|e| e.to_string())?;
     db.save(&path).map_err(|e| e.to_string())?;
     let added = db.point_count() - before;
     println!(

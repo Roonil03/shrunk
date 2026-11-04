@@ -6,6 +6,12 @@ use crate::Point;
 /// v_max(8) + sum(8) + payload_len(4) + crc(4).
 pub const BLOCK_HEADER_BYTES: usize = 54;
 
+/// Upper bounds used when parsing untrusted files. They are deliberately
+/// generous for real workloads but stop a corrupt length field from causing
+/// unbounded allocation.
+pub const MAX_BLOCK_POINTS: u32 = 1_048_576;
+pub const MAX_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
+
 /// A compressed, immutable run of points plus the metadata queries need to
 /// decide whether decoding it is necessary.
 #[derive(Clone, Debug)]
@@ -69,13 +75,117 @@ impl Block {
             v_min,
             v_max,
             has_nan,
-            sum: if all_finite { Some(sum) } else { None },
+            // Sum can overflow to infinity for huge finite inputs. Treat that
+            // as "no trusted sum" rather than persisting an unusable value.
+            sum: if all_finite && sum.is_finite() {
+                Some(sum)
+            } else {
+                None
+            },
             payload: best,
         }
     }
 
+    /// Check metadata read from disk before it can influence query planning.
+    /// Payload bytes are not decoded here.
+    pub fn validate_meta(&self) -> Result<(), String> {
+        if self.count == 0 {
+            return Err("block with zero points".into());
+        }
+        if self.count > MAX_BLOCK_POINTS {
+            return Err(format!(
+                "block has {} points, limit is {MAX_BLOCK_POINTS}",
+                self.count
+            ));
+        }
+        if self.t_min > self.t_max {
+            return Err(format!(
+                "block time bounds inverted: t_min {} > t_max {}",
+                self.t_min, self.t_max
+            ));
+        }
+        if self.payload.is_empty() {
+            return Err("block has an empty payload".into());
+        }
+        if self.payload.len() > MAX_PAYLOAD_BYTES {
+            return Err(format!(
+                "block payload is {} bytes, limit is {MAX_PAYLOAD_BYTES}",
+                self.payload.len()
+            ));
+        }
+        if !self.has_nan && self.v_min > self.v_max {
+            return Err(format!(
+                "block value bounds inverted: v_min {} > v_max {}",
+                self.v_min, self.v_max
+            ));
+        }
+        if let Some(sum) = self.sum {
+            if !sum.is_finite() {
+                return Err("block sum is not finite".into());
+            }
+        }
+        let min_payload = match self.codec {
+            Codec::Raw => (self.count as usize)
+                .checked_mul(16)
+                .ok_or_else(|| "raw block size overflow".to_string())?,
+            _ => 1,
+        };
+        if self.payload.len() < min_payload {
+            return Err(format!(
+                "{} payload is {} bytes, need at least {} for {} points",
+                self.codec.name(),
+                self.payload.len(),
+                min_payload,
+                self.count
+            ));
+        }
+        if self.codec == Codec::Raw && self.payload.len() != min_payload {
+            return Err(format!(
+                "raw payload is {} bytes, expected {}",
+                self.payload.len(),
+                min_payload
+            ));
+        }
+        Ok(())
+    }
+
     pub fn decode(&self) -> Result<Vec<Point>, String> {
-        self.codec.decode(&self.payload, self.count as usize)
+        let points = self.codec.decode(&self.payload, self.count as usize)?;
+        self.validate_decoded(&points)?;
+        Ok(points)
+    }
+
+    /// Verify that a payload's decoded contents agree with the header that was
+    /// used to plan the query. This catches corruption that a payload CRC
+    /// cannot catch in legacy files, and metadata/codec disagreements.
+    pub fn validate_decoded(&self, points: &[Point]) -> Result<(), String> {
+        if points.len() != self.count as usize {
+            return Err(format!(
+                "decoded {} points, header says {}",
+                points.len(),
+                self.count
+            ));
+        }
+        let bounded_values = !self.has_nan || self.v_min <= self.v_max;
+        for (i, p) in points.iter().enumerate() {
+            if p.ts < self.t_min || p.ts > self.t_max {
+                return Err(format!(
+                    "point {i} timestamp {} outside block bounds [{}, {}]",
+                    p.ts, self.t_min, self.t_max
+                ));
+            }
+            if p.value.is_nan() {
+                if !self.has_nan {
+                    return Err(format!("point {i} is NaN but block has_nan is false"));
+                }
+            } else if bounded_values && (p.value < self.v_min || p.value > self.v_max) {
+                return Err(format!(
+                    "point {i} value {} outside block bounds [{}, {}]",
+                    p.value, self.v_min, self.v_max
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub fn stored_bytes(&self) -> usize {

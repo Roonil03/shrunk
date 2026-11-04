@@ -88,9 +88,9 @@ fn raw_decode(bytes: &[u8], count: usize) -> Result<Vec<Point>, String> {
     let need = count
         .checked_mul(16)
         .ok_or_else(|| "raw block size overflow".to_string())?;
-    if bytes.len() < need {
+    if bytes.len() != need {
         return Err(format!(
-            "raw block truncated: need {need} bytes, got {}",
+            "raw block size mismatch: need {need} bytes, got {}",
             bytes.len()
         ));
     }
@@ -218,9 +218,7 @@ fn gorilla_decode(bytes: &[u8], count: usize) -> Result<Vec<Point>, String> {
     let mut out = Vec::with_capacity(count);
     out.push(Point { ts: ts0, value: v0 });
     if count == 1 {
-        if r.overrun() {
-            return Err("gorilla: truncated block".to_string());
-        }
+        check_bit_padding(&r, bytes.len())?;
         return Ok(out);
     }
 
@@ -258,7 +256,28 @@ fn gorilla_decode(bytes: &[u8], count: usize) -> Result<Vec<Point>, String> {
     if r.overrun() {
         return Err("gorilla: truncated block".to_string());
     }
+    check_bit_padding(&r, bytes.len())?;
     Ok(out)
+}
+
+fn check_bit_padding(r: &BitReader<'_>, byte_len: usize) -> Result<(), String> {
+    if r.overrun() {
+        return Err("gorilla: truncated block".to_string());
+    }
+    let total = byte_len
+        .checked_mul(8)
+        .ok_or_else(|| "gorilla: block size overflow".to_string())?;
+    let consumed = r.bits_consumed();
+    if consumed > total {
+        return Err("gorilla: read past end of block".to_string());
+    }
+    if total - consumed >= 8 {
+        return Err(format!(
+            "gorilla: {} trailing bytes after last point",
+            (total - consumed) / 8
+        ));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -308,6 +327,12 @@ fn delta_decode(bytes: &[u8], count: usize) -> Result<Vec<Point>, String> {
             ts,
             value: val as f64,
         });
+    }
+    if pos != bytes.len() {
+        return Err(format!(
+            "delta-varint: {} trailing bytes after last point",
+            bytes.len() - pos
+        ));
     }
     Ok(out)
 }
@@ -417,6 +442,12 @@ fn rle_decode(bytes: &[u8], count: usize) -> Result<Vec<Point>, String> {
     }
     if out.len() != count {
         return Err(format!("rle: expected {count} points, got {}", out.len()));
+    }
+    if pos != bytes.len() {
+        return Err(format!(
+            "rle: {} trailing bytes after last run",
+            bytes.len() - pos
+        ));
     }
     Ok(out)
 }

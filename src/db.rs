@@ -20,12 +20,24 @@ use crate::Point;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+const MAGIC_V1: &[u8; 8] = b"SHRUNK01";
+const MAGIC_V2: &[u8; 8] = b"SHRUNK02";
+/// Current on-disk version. Version 1 used payload-only CRCs and no explicit
+/// version field; version 2 adds a format header and CRC coverage over block
+/// metadata as well as the payload.
+pub const FORMAT_VERSION: u16 = 2;
+const MAX_SERIES: usize = 1_000_000;
+const MAX_SERIES_NAME: usize = 1024;
+const MAX_BLOCK_SIZE: usize = crate::block::MAX_BLOCK_POINTS as usize;
+const MAX_DB_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+
 #[derive(Debug)]
 pub enum Error {
     Io(std::io::Error),
     Format(String),
     UnknownSeries(String),
     OutOfOrder { series: String, last: i64, got: i64 },
+    Duplicate { series: String, ts: i64 },
 }
 
 impl fmt::Display for Error {
@@ -37,6 +49,10 @@ impl fmt::Display for Error {
             Error::OutOfOrder { series, last, got } => write!(
                 f,
                 "out-of-order write to {series}: last timestamp {last}, got {got}"
+            ),
+            Error::Duplicate { series, ts } => write!(
+                f,
+                "duplicate timestamp {ts} in {series}; timestamps must strictly increase"
             ),
         }
     }
@@ -249,6 +265,7 @@ impl Series {
 #[derive(Debug)]
 pub struct Db {
     block_size: usize,
+    format_version: u16,
     series: BTreeMap<String, Series>,
 }
 
@@ -265,13 +282,20 @@ impl Db {
 
     pub fn with_block_size(block_size: usize) -> Self {
         Self {
-            block_size: block_size.max(1),
+            block_size: block_size.clamp(1, MAX_BLOCK_SIZE),
+            format_version: FORMAT_VERSION,
             series: BTreeMap::new(),
         }
     }
 
     pub fn block_size(&self) -> usize {
         self.block_size
+    }
+
+    /// On-disk format version of the loaded file, or the version the next
+    /// `save` will write for a new database.
+    pub fn format_version(&self) -> u16 {
+        self.format_version
     }
 
     pub fn series_names(&self) -> Vec<&str> {
@@ -282,35 +306,52 @@ impl Db {
         self.series.values().map(Series::point_count).sum()
     }
 
+    /// Write one point. Timestamps must strictly increase per series; writing
+    /// the same timestamp twice returns `Error::Duplicate`.
     pub fn write(&mut self, series: &str, ts: i64, value: f64) -> Result<()> {
+        self.write_many(series, &[Point { ts, value }])
+    }
+
+    /// Write a batch atomically. The whole batch is validated before any point
+    /// is accepted, so an out-of-order or duplicate point leaves the database
+    /// unchanged. Timestamps must be strictly increasing, both within the
+    /// batch and relative to the series' last timestamp.
+    pub fn write_many(&mut self, series: &str, points: &[Point]) -> Result<()> {
+        if points.is_empty() {
+            return Ok(());
+        }
+
+        let existing_last = self.series.get(series).and_then(|s| s.last_ts);
+        let mut prev = existing_last;
+        for p in points {
+            if let Some(last) = prev {
+                if p.ts < last {
+                    return Err(Error::OutOfOrder {
+                        series: series.to_string(),
+                        last,
+                        got: p.ts,
+                    });
+                }
+                if p.ts == last {
+                    return Err(Error::Duplicate {
+                        series: series.to_string(),
+                        ts: p.ts,
+                    });
+                }
+            }
+            prev = Some(p.ts);
+        }
+
         let block_size = self.block_size;
         let s = self
             .series
             .entry(series.to_string())
             .or_insert_with(|| Series::new(series));
-        if let Some(last) = s.last_ts {
-            if ts < last {
-                return Err(Error::OutOfOrder {
-                    series: series.to_string(),
-                    last,
-                    got: ts,
-                });
-            }
-        }
-        s.last_ts = Some(ts);
-        s.pending.push(Point { ts, value });
-        if s.pending.len() >= block_size {
-            s.flush();
-        }
-        Ok(())
-    }
-
-    /// Write a batch. All points go to one series and must be in timestamp
-    /// order (the whole batch is rolled back only in the sense that the
-    /// offending point is not accepted; earlier points stay).
-    pub fn write_many(&mut self, series: &str, points: &[Point]) -> Result<()> {
-        for p in points {
-            self.write(series, p.ts, p.value)?;
+        s.last_ts = prev;
+        s.pending.extend_from_slice(points);
+        while s.pending.len() >= block_size {
+            let chunk: Vec<Point> = s.pending.drain(..block_size).collect();
+            s.blocks.push(Block::build(&chunk));
         }
         Ok(())
     }
@@ -597,8 +638,9 @@ impl Db {
             .collect()
     }
 
-    /// Flush pending points and write the whole database to `path` atomically
-    /// (temp file, fsync, rename, directory fsync).
+    /// Flush pending points and write a complete v2 snapshot atomically
+    /// (temp file, fsync, rename, directory fsync). Legacy v1 files are
+    /// upgraded in memory and become v2 after the first save.
     pub fn save(&mut self, path: &Path) -> Result<()> {
         self.flush_all();
         let bytes = encode_db(self);
@@ -621,11 +663,19 @@ impl Db {
                 }
             }
         }
+        self.format_version = FORMAT_VERSION;
         Ok(())
     }
 
     pub fn open(path: &Path) -> Result<Db> {
-        let mut data = Vec::new();
+        let meta = fs::metadata(path)?;
+        if meta.len() > MAX_DB_BYTES {
+            return Err(Error::Format(format!(
+                "database is {} bytes, limit is {MAX_DB_BYTES}",
+                meta.len()
+            )));
+        }
+        let mut data = Vec::with_capacity(meta.len() as usize);
         File::open(path)?.read_to_end(&mut data)?;
         decode_db(&data)
     }
@@ -674,11 +724,11 @@ fn fold(
     }
 }
 
-const MAGIC: &[u8; 8] = b"SHRUNK01";
-
 fn encode_db(db: &Db) -> Vec<u8> {
     let mut out = Vec::new();
-    out.extend_from_slice(MAGIC);
+    out.extend_from_slice(MAGIC_V2);
+    out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes()); // reserved flags
     out.extend_from_slice(&(db.block_size as u32).to_le_bytes());
     out.extend_from_slice(&(db.series.len() as u32).to_le_bytes());
 
@@ -689,6 +739,7 @@ fn encode_db(db: &Db) -> Vec<u8> {
         out.extend_from_slice(&(s.blocks.len() as u32).to_le_bytes());
 
         for b in &s.blocks {
+            let start = out.len();
             out.push(b.codec as u8);
             let mut flags = 0u8;
             if b.sum.is_some() {
@@ -706,82 +757,192 @@ fn encode_db(db: &Db) -> Vec<u8> {
             out.extend_from_slice(&b.sum.unwrap_or(f64::NAN).to_le_bytes());
             out.extend_from_slice(&(b.payload.len() as u32).to_le_bytes());
             out.extend_from_slice(&b.payload);
-            out.extend_from_slice(&crc32(&b.payload).to_le_bytes());
+            // v2 CRC covers the block header and the payload, so corrupt
+            // metadata cannot silently produce wrong fast aggregates.
+            out.extend_from_slice(&crc32(&out[start..]).to_le_bytes());
         }
     }
     out
 }
 
 fn decode_db(data: &[u8]) -> Result<Db> {
+    if data.len() < 8 {
+        return Err(Error::Format("truncated file header".into()));
+    }
+    match &data[..8] {
+        m if m == MAGIC_V1 => decode_v1(data),
+        m if m == MAGIC_V2 => decode_v2(data),
+        _ => Err(Error::Format(
+            "bad magic; not a shrunk database (expected SHRUNK01 or SHRUNK02)".into(),
+        )),
+    }
+}
+
+fn decode_v1(data: &[u8]) -> Result<Db> {
     let mut c = Cursor::new(data);
-    if c.take(8)? != MAGIC.as_slice() {
-        return Err(Error::Format("bad magic; not a shrunk database".into()));
+    c.take(8)?;
+    let block_size = c.u32()? as usize;
+    let series_count = c.u32()? as usize;
+    let mut db = decode_body(&mut c, data, block_size, series_count, false)?;
+    db.format_version = 1;
+    Ok(db)
+}
+
+fn decode_v2(data: &[u8]) -> Result<Db> {
+    let mut c = Cursor::new(data);
+    c.take(8)?;
+    let version = u16::from_le_bytes(c.take(2)?.try_into().unwrap());
+    let flags = u16::from_le_bytes(c.take(2)?.try_into().unwrap());
+    if version != FORMAT_VERSION {
+        return Err(Error::Format(format!(
+            "unsupported format version {version}; this build reads version {FORMAT_VERSION}"
+        )));
+    }
+    if flags != 0 {
+        return Err(Error::Format(format!(
+            "unsupported format flags {flags:#x}"
+        )));
     }
     let block_size = c.u32()? as usize;
     let series_count = c.u32()? as usize;
-    if series_count > (data.len().saturating_sub(c.pos)) / 8 {
+    let mut db = decode_body(&mut c, data, block_size, series_count, true)?;
+    db.format_version = FORMAT_VERSION;
+    Ok(db)
+}
+
+fn decode_body(
+    c: &mut Cursor<'_>,
+    data: &[u8],
+    block_size: usize,
+    series_count: usize,
+    v2_crc: bool,
+) -> Result<Db> {
+    if !(1..=MAX_BLOCK_SIZE).contains(&block_size) {
+        return Err(Error::Format(format!(
+            "block size {block_size} outside 1..={MAX_BLOCK_SIZE}"
+        )));
+    }
+    if series_count > MAX_SERIES {
+        return Err(Error::Format(format!(
+            "series count {series_count} exceeds limit {MAX_SERIES}"
+        )));
+    }
+    if series_count > data.len().saturating_sub(c.pos) / 8 {
         return Err(Error::Format("series count exceeds file size".into()));
     }
-    let mut db = Db::with_block_size(block_size);
 
+    let mut db = Db::with_block_size(block_size);
     for _ in 0..series_count {
         let name_len = c.u32()? as usize;
+        if name_len > MAX_SERIES_NAME {
+            return Err(Error::Format(format!(
+                "series name length {name_len} exceeds limit {MAX_SERIES_NAME}"
+            )));
+        }
         let name = String::from_utf8(c.take(name_len)?.to_vec())
             .map_err(|_| Error::Format("series name is not utf-8".into()))?;
         let block_count = c.u32()? as usize;
         if block_count > (data.len().saturating_sub(c.pos)) / BLOCK_HEADER_BYTES {
-            return Err(Error::Format("block count exceeds file size".into()));
+            return Err(Error::Format(format!(
+                "series {name:?}: block count {block_count} exceeds remaining file size"
+            )));
         }
         let mut blocks = Vec::with_capacity(block_count);
+        let mut prev_t_max: Option<i64> = None;
 
         for _ in 0..block_count {
-            let codec =
-                Codec::from_u8(c.u8()?).ok_or_else(|| Error::Format("unknown codec id".into()))?;
-            let flags = c.u8()?;
-            let count = c.u32()?;
-            if count == 0 {
-                return Err(Error::Format("block with zero points".into()));
+            let block = read_block(c, data, &name, v2_crc)?;
+            if let Some(prev) = prev_t_max {
+                if block.t_min < prev {
+                    return Err(Error::Format(format!(
+                        "series {name:?}: block starting at {} overlaps previous block ending at {prev}",
+                        block.t_min
+                    )));
+                }
             }
-            let t_min = c.i64()?;
-            let t_max = c.i64()?;
-            let v_min = c.f64()?;
-            let v_max = c.f64()?;
-            let raw_sum = c.f64()?;
-            let payload_len = c.u32()? as usize;
-            let payload = c.take(payload_len)?.to_vec();
-            let crc = c.u32()?;
-            if crc32(&payload) != crc {
-                return Err(Error::Format(format!("checksum mismatch in series {name}")));
-            }
-            blocks.push(Block {
-                codec,
-                count,
-                t_min,
-                t_max,
-                v_min,
-                v_max,
-                has_nan: flags & 2 != 0,
-                sum: if flags & 1 != 0 { Some(raw_sum) } else { None },
-                payload,
-            });
+            prev_t_max = Some(block.t_max);
+            blocks.push(block);
         }
 
         let last_ts = blocks.last().map(|b| b.t_max);
-        db.series.insert(
-            name.clone(),
-            Series {
-                name,
-                blocks,
-                pending: Vec::new(),
-                last_ts,
-            },
-        );
+        if db
+            .series
+            .insert(
+                name.clone(),
+                Series {
+                    name,
+                    blocks,
+                    pending: Vec::new(),
+                    last_ts,
+                },
+            )
+            .is_some()
+        {
+            return Err(Error::Format("duplicate series name".into()));
+        }
     }
 
     if c.pos != data.len() {
-        return Err(Error::Format("trailing bytes after database".into()));
+        return Err(Error::Format(format!(
+            "{} trailing bytes after database",
+            data.len() - c.pos
+        )));
     }
     Ok(db)
+}
+
+fn read_block(c: &mut Cursor<'_>, data: &[u8], name: &str, v2_crc: bool) -> Result<Block> {
+    let start = c.pos;
+    let codec = Codec::from_u8(c.u8()?)
+        .ok_or_else(|| Error::Format(format!("series {name:?}: unknown codec id")))?;
+    let flags = c.u8()?;
+    if flags & !3 != 0 {
+        return Err(Error::Format(format!(
+            "series {name:?}: unknown block flags {flags:#x}"
+        )));
+    }
+    let count = c.u32()?;
+    let t_min = c.i64()?;
+    let t_max = c.i64()?;
+    let v_min = c.f64()?;
+    let v_max = c.f64()?;
+    let raw_sum = c.f64()?;
+    let payload_len = c.u32()? as usize;
+    if payload_len > crate::block::MAX_PAYLOAD_BYTES {
+        return Err(Error::Format(format!(
+            "series {name:?}: payload length {payload_len} exceeds limit {}",
+            crate::block::MAX_PAYLOAD_BYTES
+        )));
+    }
+    let payload = c.take(payload_len)?.to_vec();
+    let crc = c.u32()?;
+    let calculated = if v2_crc {
+        // `c.pos` is just past the CRC, so the covered region ends 4 bytes
+        // before it and starts at the block's first header byte.
+        crc32(&data[start..c.pos - 4])
+    } else {
+        crc32(&payload)
+    };
+    if calculated != crc {
+        return Err(Error::Format(format!(
+            "checksum mismatch in series {name:?}"
+        )));
+    }
+    let block = Block {
+        codec,
+        count,
+        t_min,
+        t_max,
+        v_min,
+        v_max,
+        has_nan: flags & 2 != 0,
+        sum: if flags & 1 != 0 { Some(raw_sum) } else { None },
+        payload,
+    };
+    block
+        .validate_meta()
+        .map_err(|e| Error::Format(format!("series {name:?}: {e}")))?;
+    Ok(block)
 }
 
 struct Cursor<'a> {

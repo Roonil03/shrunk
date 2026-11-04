@@ -238,3 +238,150 @@ fn corrupt_payload_is_rejected() {
 
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn duplicate_and_out_of_order_writes_are_rejected_atomically() {
+    let mut db = Db::with_block_size(4);
+    let base = series(4, 0, 1);
+    db.write_many("m", &base).unwrap();
+    assert_eq!(db.point_count(), 4);
+
+    // A duplicate of the current last timestamp is rejected.
+    let err = db.write("m", 3, 99.0).unwrap_err();
+    assert!(
+        matches!(err, shrunk::Error::Duplicate { ts: 3, .. }),
+        "{err}"
+    );
+
+    // A bad point later in a batch must not partially apply the batch.
+    let bad = vec![
+        Point { ts: 4, value: 1.0 },
+        Point { ts: 5, value: 2.0 },
+        Point { ts: 5, value: 3.0 },
+    ];
+    let err = db.write_many("m", &bad).unwrap_err();
+    assert!(
+        matches!(err, shrunk::Error::Duplicate { ts: 5, .. }),
+        "{err}"
+    );
+    assert_eq!(db.point_count(), 4);
+    assert!(db
+        .query(&Query::new("m", i64::MIN, i64::MAX))
+        .unwrap()
+        .points
+        .iter()
+        .all(|p| p.ts < 4));
+
+    // Out-of-order inside a batch is also atomic.
+    let bad = vec![Point { ts: 4, value: 1.0 }, Point { ts: 2, value: 2.0 }];
+    let err = db.write_many("m", &bad).unwrap_err();
+    assert!(matches!(err, shrunk::Error::OutOfOrder { .. }), "{err}");
+    assert_eq!(db.point_count(), 4);
+
+    // Empty batches are no-ops.
+    db.write_many("m", &[]).unwrap();
+    assert_eq!(db.point_count(), 4);
+}
+
+#[test]
+fn v1_fixture_opens_and_migrates_to_v2() {
+    let dir = std::env::temp_dir().join(format!("shrunk-migrate-{}", std::process::id()));
+    let _ = fs::create_dir_all(&dir);
+    let path = dir.join("v1.shrunk");
+    let fixture = include_bytes!("fixtures/v1.shrunk");
+    fs::write(&path, fixture).unwrap();
+
+    let mut db = Db::open(&path).unwrap();
+    assert_eq!(db.format_version(), 1);
+    assert_eq!(db.point_count(), 300);
+    let before = db
+        .query(&Query::new("fixture", i64::MIN, i64::MAX))
+        .unwrap()
+        .points;
+    assert_eq!(before.len(), 300);
+
+    db.save(&path).unwrap();
+    assert_eq!(&fs::read(&path).unwrap()[..8], b"SHRUNK02");
+    let reopened = Db::open(&path).unwrap();
+    assert_eq!(reopened.format_version(), 2);
+    let after = reopened
+        .query(&Query::new("fixture", i64::MIN, i64::MAX))
+        .unwrap()
+        .points;
+    assert_eq!(before, after);
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn v2_header_and_metadata_corruption_are_rejected() {
+    let dir = std::env::temp_dir().join(format!("shrunk-header-{}", std::process::id()));
+    let _ = fs::create_dir_all(&dir);
+    let path = dir.join("db.shrunk");
+
+    let mut db = Db::with_block_size(2);
+    db.write_many("m", &series(4, 100, 10)).unwrap();
+    db.save(&path).unwrap();
+    let good = fs::read(&path).unwrap();
+    assert_eq!(&good[..8], b"SHRUNK02");
+
+    // v2 header: magic(8) version(2) flags(2) block_size(4) series_count(4)
+    // series: name_len(4) name(1) block_count(4); block starts at 29.
+    let block_start = 29usize;
+
+    let check = |bytes: &[u8], needle: &str| {
+        fs::write(&path, bytes).unwrap();
+        let err = Db::open(&path).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains(needle), "expected {needle:?}, got {msg}");
+    };
+
+    // Header metadata is covered by the v2 checksum.
+    let mut b = good.clone();
+    b[block_start + 2] ^= 0x01; // count
+    check(&b, "checksum");
+
+    let mut b = good.clone();
+    b[block_start + 6] ^= 0x01; // t_min
+    check(&b, "checksum");
+
+    let mut b = good.clone();
+    b[block_start + 46] = 0xFF; // payload_len high byte
+    b[block_start + 47] = 0xFF;
+    b[block_start + 48] = 0xFF;
+    b[block_start + 49] = 0xFF;
+    check(&b, "payload length");
+
+    // Structural limits are checked before allocation.
+    let mut b = good.clone();
+    b[12..16].copy_from_slice(&0u32.to_le_bytes()); // block_size
+    check(&b, "block size");
+
+    let mut b = good.clone();
+    b[16..20].copy_from_slice(&u32::MAX.to_le_bytes()); // series_count
+    check(&b, "series count");
+
+    let mut b = good.clone();
+    b[block_start] = 99; // unknown codec
+    check(&b, "unknown codec");
+
+    // Truncation and trailing bytes.
+    check(&good[..good.len() - 1], "truncated");
+    let mut b = good.clone();
+    b.push(0);
+    check(&b, "trailing bytes");
+
+    // v1 CRCs cover only the payload, so metadata must be validated too.
+    let v1 = include_bytes!("fixtures/v1.shrunk");
+    // v1 header 16, name_len(4), name(7), block_count(4) => block at 31.
+    let v1_block = 31usize;
+    let mut b = v1.to_vec();
+    b[v1_block + 2..v1_block + 6].copy_from_slice(&0u32.to_le_bytes()); // count=0
+    check(&b, "zero points");
+
+    let mut b = v1.to_vec();
+    b[v1_block] = 99; // unknown codec
+    check(&b, "unknown codec");
+
+    let _ = fs::remove_dir_all(&dir);
+}
