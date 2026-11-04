@@ -13,19 +13,46 @@ use std::fmt;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::Path;
+use std::sync::Arc;
 
-use crate::block::{Block, BLOCK_HEADER_BYTES};
+use crate::block::{Block, Payload, BLOCK_HEADER_BYTES};
 use crate::codec::Codec;
+use crate::crc::crc32;
 use crate::Point;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-const MAGIC_V1: &[u8; 8] = b"SHRUNK01";
-const MAGIC_V2: &[u8; 8] = b"SHRUNK02";
-/// Current on-disk version. Version 1 used payload-only CRCs and no explicit
-/// version field; version 2 adds a format header and CRC coverage over block
-/// metadata as well as the payload.
-pub const FORMAT_VERSION: u16 = 2;
+const MAGIC_PREFIX: &[u8; 6] = b"SHRUNK";
+
+/// Build the 8-byte magic for a format version: `SHRUNK` plus two decimal
+/// digits. Keeping this derived means adding a format version only requires
+/// changing `FORMAT_VERSION` (and, if needed, a legacy decoder).
+const fn magic_for(version: u16) -> [u8; 8] {
+    [
+        MAGIC_PREFIX[0],
+        MAGIC_PREFIX[1],
+        MAGIC_PREFIX[2],
+        MAGIC_PREFIX[3],
+        MAGIC_PREFIX[4],
+        MAGIC_PREFIX[5],
+        b'0' + (version / 10) as u8,
+        b'0' + (version % 10) as u8,
+    ]
+}
+
+const VERSION_V1: u16 = 1;
+const VERSION_V2: u16 = 2;
+/// Current on-disk version. Change this one constant to bump the format; the
+/// magic, writer, and new-file version all follow it.
+///
+/// * v1: original snapshot, CRC over payload only.
+/// * v2: format header, CRC over block metadata plus payload.
+/// * v3: separate header CRC and payload CRC, so open validates metadata
+///   without reading payloads and query validates payloads lazily.
+pub const FORMAT_VERSION: u16 = 3;
+pub const FORMAT_MAGIC: [u8; 8] = magic_for(FORMAT_VERSION);
+const MAGIC_V1: [u8; 8] = magic_for(VERSION_V1);
+const MAGIC_V2: [u8; 8] = magic_for(VERSION_V2);
 const MAX_SERIES: usize = 1_000_000;
 const MAX_SERIES_NAME: usize = 1024;
 const MAX_BLOCK_SIZE: usize = crate::block::MAX_BLOCK_POINTS as usize;
@@ -309,7 +336,33 @@ impl Db {
     /// Write one point. Timestamps must strictly increase per series; writing
     /// the same timestamp twice returns `Error::Duplicate`.
     pub fn write(&mut self, series: &str, ts: i64, value: f64) -> Result<()> {
-        self.write_many(series, &[Point { ts, value }])
+        let block_size = self.block_size;
+        let s = self
+            .series
+            .entry(series.to_string())
+            .or_insert_with(|| Series::new(series));
+        if let Some(last) = s.last_ts {
+            if ts < last {
+                return Err(Error::OutOfOrder {
+                    series: series.to_string(),
+                    last,
+                    got: ts,
+                });
+            }
+            if ts == last {
+                return Err(Error::Duplicate {
+                    series: series.to_string(),
+                    ts,
+                });
+            }
+        }
+        s.last_ts = Some(ts);
+        s.pending.push(Point { ts, value });
+        if s.pending.len() >= block_size {
+            let chunk = std::mem::take(&mut s.pending);
+            s.blocks.push(Block::build(&chunk));
+        }
+        Ok(())
     }
 
     /// Write a batch atomically. The whole batch is validated before any point
@@ -348,10 +401,18 @@ impl Db {
             .entry(series.to_string())
             .or_insert_with(|| Series::new(series));
         s.last_ts = prev;
-        s.pending.extend_from_slice(points);
-        while s.pending.len() >= block_size {
-            let chunk: Vec<Point> = s.pending.drain(..block_size).collect();
-            s.blocks.push(Block::build(&chunk));
+        let mut all = std::mem::take(&mut s.pending);
+        all.extend_from_slice(points);
+        let full = all.len() / block_size;
+        for i in 0..full {
+            let start = i * block_size;
+            s.blocks.push(Block::build(&all[start..start + block_size]));
+        }
+        let rest = &all[full * block_size..];
+        if rest.is_empty() {
+            s.pending = Vec::new();
+        } else {
+            s.pending = rest.to_vec();
         }
         Ok(())
     }
@@ -643,7 +704,7 @@ impl Db {
     /// upgraded in memory and become v2 after the first save.
     pub fn save(&mut self, path: &Path) -> Result<()> {
         self.flush_all();
-        let bytes = encode_db(self);
+        let bytes = encode_db(self)?;
         let file_name = path
             .file_name()
             .ok_or_else(|| Error::Format(format!("invalid path: {}", path.display())))?;
@@ -675,9 +736,23 @@ impl Db {
                 meta.len()
             )));
         }
-        let mut data = Vec::with_capacity(meta.len() as usize);
-        File::open(path)?.read_to_end(&mut data)?;
-        decode_db(&data)
+        let mut f = File::open(path)?;
+        let mut magic = [0u8; 8];
+        if f.read_exact(&mut magic).is_err() {
+            return Err(Error::Format("truncated file header".into()));
+        }
+        match &magic {
+            m if m == &FORMAT_MAGIC => decode_current_file(f, meta.len()),
+            m if m == &MAGIC_V1 || m == &MAGIC_V2 => {
+                let mut data = Vec::with_capacity(meta.len() as usize);
+                data.extend_from_slice(&magic);
+                f.read_to_end(&mut data)?;
+                decode_db(&data)
+            }
+            _ => Err(Error::Format(
+                format!("bad magic; not a shrunk database (current format is SHRUNK{FORMAT_VERSION:02})").into(),
+            )),
+        }
     }
 
     pub fn load_or_new(path: &Path) -> Result<Db> {
@@ -724,9 +799,9 @@ fn fold(
     }
 }
 
-fn encode_db(db: &Db) -> Vec<u8> {
+fn encode_db(db: &Db) -> Result<Vec<u8>> {
     let mut out = Vec::new();
-    out.extend_from_slice(MAGIC_V2);
+    out.extend_from_slice(&FORMAT_MAGIC);
     out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
     out.extend_from_slice(&0u16.to_le_bytes()); // reserved flags
     out.extend_from_slice(&(db.block_size as u32).to_le_bytes());
@@ -739,7 +814,17 @@ fn encode_db(db: &Db) -> Vec<u8> {
         out.extend_from_slice(&(s.blocks.len() as u32).to_le_bytes());
 
         for b in &s.blocks {
-            let start = out.len();
+            b.validate_meta().map_err(Error::Format)?;
+            let payload = b.payload.bytes().map_err(Error::Format)?;
+            if let Some(expected) = b.payload_crc {
+                if crc32(&payload) != expected {
+                    return Err(Error::Format(format!(
+                        "series {:?}: payload changed before save",
+                        s.name
+                    )));
+                }
+            }
+            let header_start = out.len();
             out.push(b.codec as u8);
             let mut flags = 0u8;
             if b.sum.is_some() {
@@ -755,14 +840,16 @@ fn encode_db(db: &Db) -> Vec<u8> {
             out.extend_from_slice(&b.v_min.to_le_bytes());
             out.extend_from_slice(&b.v_max.to_le_bytes());
             out.extend_from_slice(&b.sum.unwrap_or(f64::NAN).to_le_bytes());
-            out.extend_from_slice(&(b.payload.len() as u32).to_le_bytes());
-            out.extend_from_slice(&b.payload);
-            // v2 CRC covers the block header and the payload, so corrupt
-            // metadata cannot silently produce wrong fast aggregates.
-            out.extend_from_slice(&crc32(&out[start..]).to_le_bytes());
+            out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            // Header CRC lets `open` validate query-planning metadata without
+            // reading any payload bytes.
+            let header_crc = crc32(&out[header_start..]);
+            out.extend_from_slice(&header_crc.to_le_bytes());
+            out.extend_from_slice(&payload);
+            out.extend_from_slice(&crc32(&payload).to_le_bytes());
         }
     }
-    out
+    Ok(out)
 }
 
 fn decode_db(data: &[u8]) -> Result<Db> {
@@ -770,10 +857,13 @@ fn decode_db(data: &[u8]) -> Result<Db> {
         return Err(Error::Format("truncated file header".into()));
     }
     match &data[..8] {
-        m if m == MAGIC_V1 => decode_v1(data),
-        m if m == MAGIC_V2 => decode_v2(data),
+        m if m == &MAGIC_V1 => decode_v1(data),
+        m if m == &MAGIC_V2 => decode_v2(data),
         _ => Err(Error::Format(
-            "bad magic; not a shrunk database (expected SHRUNK01 or SHRUNK02)".into(),
+            format!(
+                "bad magic; not a shrunk database (current format is SHRUNK{FORMAT_VERSION:02})"
+            )
+            .into(),
         )),
     }
 }
@@ -784,7 +874,7 @@ fn decode_v1(data: &[u8]) -> Result<Db> {
     let block_size = c.u32()? as usize;
     let series_count = c.u32()? as usize;
     let mut db = decode_body(&mut c, data, block_size, series_count, false)?;
-    db.format_version = 1;
+    db.format_version = VERSION_V1;
     Ok(db)
 }
 
@@ -793,6 +883,30 @@ fn decode_v2(data: &[u8]) -> Result<Db> {
     c.take(8)?;
     let version = u16::from_le_bytes(c.take(2)?.try_into().unwrap());
     let flags = u16::from_le_bytes(c.take(2)?.try_into().unwrap());
+    if version != VERSION_V2 {
+        return Err(Error::Format(format!(
+            "unsupported v2 format version {version}; expected 2"
+        )));
+    }
+    if flags != 0 {
+        return Err(Error::Format(format!(
+            "unsupported format flags {flags:#x}"
+        )));
+    }
+    let block_size = c.u32()? as usize;
+    let series_count = c.u32()? as usize;
+    let mut db = decode_body(&mut c, data, block_size, series_count, true)?;
+    db.format_version = VERSION_V2;
+    Ok(db)
+}
+
+/// Parse a v3 file lazily. Only block headers and series metadata are read;
+/// payloads stay on disk until a query decodes the block.
+fn decode_current_file(file: File, len: u64) -> Result<Db> {
+    let file = Arc::new(file);
+    let mut c = FileCursor::new(file, len, 8);
+    let version = c.u16()?;
+    let flags = c.u16()?;
     if version != FORMAT_VERSION {
         return Err(Error::Format(format!(
             "unsupported format version {version}; this build reads version {FORMAT_VERSION}"
@@ -805,9 +919,131 @@ fn decode_v2(data: &[u8]) -> Result<Db> {
     }
     let block_size = c.u32()? as usize;
     let series_count = c.u32()? as usize;
-    let mut db = decode_body(&mut c, data, block_size, series_count, true)?;
+    if !(1..=MAX_BLOCK_SIZE).contains(&block_size) {
+        return Err(Error::Format(format!(
+            "block size {block_size} outside 1..={MAX_BLOCK_SIZE}"
+        )));
+    }
+    if series_count > MAX_SERIES {
+        return Err(Error::Format(format!(
+            "series count {series_count} exceeds limit {MAX_SERIES}"
+        )));
+    }
+    if series_count as u64 > c.remaining() / 8 {
+        return Err(Error::Format("series count exceeds file size".into()));
+    }
+
+    let mut db = Db::with_block_size(block_size);
+    for _ in 0..series_count {
+        let name_len = c.u32()? as usize;
+        if name_len > MAX_SERIES_NAME {
+            return Err(Error::Format(format!(
+                "series name length {name_len} exceeds limit {MAX_SERIES_NAME}"
+            )));
+        }
+        let name = String::from_utf8(c.take(name_len)?)
+            .map_err(|_| Error::Format("series name is not utf-8".into()))?;
+        let block_count = c.u32()? as usize;
+        if block_count as u64 > c.remaining() / BLOCK_HEADER_BYTES as u64 {
+            return Err(Error::Format(format!(
+                "series {name:?}: block count {block_count} exceeds remaining file size"
+            )));
+        }
+        let mut blocks = Vec::with_capacity(block_count);
+        let mut prev_t_max: Option<i64> = None;
+        for _ in 0..block_count {
+            let block = read_current_block(&mut c, &name)?;
+            if let Some(prev) = prev_t_max {
+                if block.t_min < prev {
+                    return Err(Error::Format(format!(
+                        "series {name:?}: block starting at {} overlaps previous block ending at {prev}",
+                        block.t_min
+                    )));
+                }
+            }
+            prev_t_max = Some(block.t_max);
+            blocks.push(block);
+        }
+        let last_ts = blocks.last().map(|b| b.t_max);
+        if db
+            .series
+            .insert(
+                name.clone(),
+                Series {
+                    name,
+                    blocks,
+                    pending: Vec::new(),
+                    last_ts,
+                },
+            )
+            .is_some()
+        {
+            return Err(Error::Format("duplicate series name".into()));
+        }
+    }
+    if c.pos != len {
+        return Err(Error::Format(format!(
+            "{} trailing bytes after database",
+            len - c.pos
+        )));
+    }
     db.format_version = FORMAT_VERSION;
     Ok(db)
+}
+
+fn read_current_block(c: &mut FileCursor, name: &str) -> Result<Block> {
+    let header = c.take(BLOCK_HEADER_BYTES)?;
+    let header_crc = u32::from_le_bytes(header[50..54].try_into().unwrap());
+    let actual = crc32(&header[..50]);
+    if actual != header_crc {
+        return Err(Error::Format(format!(
+            "series {name:?}: block header checksum mismatch"
+        )));
+    }
+    let codec = Codec::from_u8(header[0])
+        .ok_or_else(|| Error::Format(format!("series {name:?}: unknown codec id")))?;
+    let flags = header[1];
+    if flags & !3 != 0 {
+        return Err(Error::Format(format!(
+            "series {name:?}: unknown block flags {flags:#x}"
+        )));
+    }
+    let count = u32::from_le_bytes(header[2..6].try_into().unwrap());
+    let t_min = i64::from_le_bytes(header[6..14].try_into().unwrap());
+    let t_max = i64::from_le_bytes(header[14..22].try_into().unwrap());
+    let v_min = f64::from_le_bytes(header[22..30].try_into().unwrap());
+    let v_max = f64::from_le_bytes(header[30..38].try_into().unwrap());
+    let raw_sum = f64::from_le_bytes(header[38..46].try_into().unwrap());
+    let payload_len = u32::from_le_bytes(header[46..50].try_into().unwrap()) as usize;
+    if payload_len > crate::block::MAX_PAYLOAD_BYTES {
+        return Err(Error::Format(format!(
+            "series {name:?}: payload length {payload_len} exceeds limit {}",
+            crate::block::MAX_PAYLOAD_BYTES
+        )));
+    }
+    let offset = c.pos;
+    c.skip(payload_len as u64)?;
+    let payload_crc = c.u32()?;
+    let block = Block {
+        codec,
+        count,
+        t_min,
+        t_max,
+        v_min,
+        v_max,
+        has_nan: flags & 2 != 0,
+        sum: if flags & 1 != 0 { Some(raw_sum) } else { None },
+        payload: Payload::File {
+            file: c.file.clone(),
+            offset,
+            len: payload_len as u32,
+        },
+        payload_crc: Some(payload_crc),
+    };
+    block
+        .validate_meta()
+        .map_err(|e| Error::Format(format!("series {name:?}: {e}")))?;
+    Ok(block)
 }
 
 fn decode_body(
@@ -937,12 +1173,62 @@ fn read_block(c: &mut Cursor<'_>, data: &[u8], name: &str, v2_crc: bool) -> Resu
         v_max,
         has_nan: flags & 2 != 0,
         sum: if flags & 1 != 0 { Some(raw_sum) } else { None },
-        payload,
+        payload: Payload::Memory(payload),
+        payload_crc: None,
     };
     block
         .validate_meta()
         .map_err(|e| Error::Format(format!("series {name:?}: {e}")))?;
     Ok(block)
+}
+
+struct FileCursor {
+    file: Arc<File>,
+    pos: u64,
+    len: u64,
+}
+
+impl FileCursor {
+    fn new(file: Arc<File>, len: u64, pos: u64) -> Self {
+        Self { file, pos, len }
+    }
+
+    fn remaining(&self) -> u64 {
+        self.len.saturating_sub(self.pos)
+    }
+
+    fn take(&mut self, n: usize) -> Result<Vec<u8>> {
+        let n = n as u64;
+        if n > self.remaining() {
+            return Err(Error::Format(format!(
+                "truncated at byte {} (wanted {n} more)",
+                self.pos
+            )));
+        }
+        let mut buf = vec![0u8; n as usize];
+        crate::block::read_at(&self.file, self.pos, &mut buf).map_err(Error::Format)?;
+        self.pos += n;
+        Ok(buf)
+    }
+
+    fn skip(&mut self, n: u64) -> Result<()> {
+        if n > self.remaining() {
+            return Err(Error::Format(format!(
+                "truncated at byte {} (wanted to skip {n})",
+                self.pos
+            )));
+        }
+        self.pos += n;
+        Ok(())
+    }
+
+    fn u16(&mut self) -> Result<u16> {
+        Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
+    }
+
+    fn u32(&mut self) -> Result<u32> {
+        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+    }
 }
 
 struct Cursor<'a> {
@@ -988,26 +1274,9 @@ impl<'a> Cursor<'a> {
     }
 }
 
-fn crc32(data: &[u8]) -> u32 {
-    let mut crc = 0xFFFF_FFFFu32;
-    for &b in data {
-        crc ^= b as u32;
-        for _ in 0..8 {
-            let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
-        }
-    }
-    !crc
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn crc32_known_value() {
-        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
-    }
 
     #[test]
     fn out_of_order_rejected() {

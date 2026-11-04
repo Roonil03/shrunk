@@ -233,7 +233,10 @@ fn corrupt_payload_is_rejected() {
     let n = bytes.len();
     bytes[n - 10] ^= 0xFF;
     fs::write(&path, &bytes).unwrap();
-    let err = Db::open(&path).unwrap_err();
+
+    // v3 opens from metadata only; the payload checksum is verified lazily.
+    let db = Db::open(&path).expect("metadata is intact");
+    let err = db.query(&Query::new("m", i64::MIN, i64::MAX)).unwrap_err();
     assert!(format!("{err}").contains("checksum"), "got: {err}");
 
     let _ = fs::remove_dir_all(&dir);
@@ -284,7 +287,7 @@ fn duplicate_and_out_of_order_writes_are_rejected_atomically() {
 }
 
 #[test]
-fn v1_fixture_opens_and_migrates_to_v2() {
+fn v1_fixture_opens_and_migrates_to_current_format() {
     let dir = std::env::temp_dir().join(format!("shrunk-migrate-{}", std::process::id()));
     let _ = fs::create_dir_all(&dir);
     let path = dir.join("v1.shrunk");
@@ -301,9 +304,9 @@ fn v1_fixture_opens_and_migrates_to_v2() {
     assert_eq!(before.len(), 300);
 
     db.save(&path).unwrap();
-    assert_eq!(&fs::read(&path).unwrap()[..8], b"SHRUNK02");
+    assert_eq!(&fs::read(&path).unwrap()[..8], &shrunk::FORMAT_MAGIC);
     let reopened = Db::open(&path).unwrap();
-    assert_eq!(reopened.format_version(), 2);
+    assert_eq!(reopened.format_version(), 3);
     let after = reopened
         .query(&Query::new("fixture", i64::MIN, i64::MAX))
         .unwrap()
@@ -314,7 +317,36 @@ fn v1_fixture_opens_and_migrates_to_v2() {
 }
 
 #[test]
-fn v2_header_and_metadata_corruption_are_rejected() {
+fn v2_fixture_opens_and_migrates_to_current_format() {
+    let dir = std::env::temp_dir().join(format!("shrunk-migrate2-{}", std::process::id()));
+    let _ = fs::create_dir_all(&dir);
+    let path = dir.join("v2.shrunk");
+    fs::write(&path, include_bytes!("fixtures/v2.shrunk")).unwrap();
+
+    let mut db = Db::open(&path).unwrap();
+    assert_eq!(db.format_version(), 2);
+    assert_eq!(db.point_count(), 300);
+    let before = db
+        .query(&Query::new("fixture", i64::MIN, i64::MAX))
+        .unwrap()
+        .points;
+    assert_eq!(before.len(), 300);
+
+    db.save(&path).unwrap();
+    assert_eq!(&fs::read(&path).unwrap()[..8], &shrunk::FORMAT_MAGIC);
+    let reopened = Db::open(&path).unwrap();
+    assert_eq!(reopened.format_version(), 3);
+    let after = reopened
+        .query(&Query::new("fixture", i64::MIN, i64::MAX))
+        .unwrap()
+        .points;
+    assert_eq!(before, after);
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn v3_header_and_metadata_corruption_are_rejected() {
     let dir = std::env::temp_dir().join(format!("shrunk-header-{}", std::process::id()));
     let _ = fs::create_dir_all(&dir);
     let path = dir.join("db.shrunk");
@@ -323,9 +355,9 @@ fn v2_header_and_metadata_corruption_are_rejected() {
     db.write_many("m", &series(4, 100, 10)).unwrap();
     db.save(&path).unwrap();
     let good = fs::read(&path).unwrap();
-    assert_eq!(&good[..8], b"SHRUNK02");
+    assert_eq!(&good[..8], &shrunk::FORMAT_MAGIC);
 
-    // v2 header: magic(8) version(2) flags(2) block_size(4) series_count(4)
+    // v3 header: magic(8) version(2) flags(2) block_size(4) series_count(4)
     // series: name_len(4) name(1) block_count(4); block starts at 29.
     let block_start = 29usize;
 
@@ -336,21 +368,21 @@ fn v2_header_and_metadata_corruption_are_rejected() {
         assert!(msg.contains(needle), "expected {needle:?}, got {msg}");
     };
 
-    // Header metadata is covered by the v2 checksum.
+    // v3 block metadata has its own checksum, checked without payloads.
     let mut b = good.clone();
     b[block_start + 2] ^= 0x01; // count
-    check(&b, "checksum");
+    check(&b, "header checksum");
 
     let mut b = good.clone();
     b[block_start + 6] ^= 0x01; // t_min
-    check(&b, "checksum");
+    check(&b, "header checksum");
 
     let mut b = good.clone();
     b[block_start + 46] = 0xFF; // payload_len high byte
     b[block_start + 47] = 0xFF;
     b[block_start + 48] = 0xFF;
     b[block_start + 49] = 0xFF;
-    check(&b, "payload length");
+    check(&b, "header checksum");
 
     // Structural limits are checked before allocation.
     let mut b = good.clone();
@@ -361,17 +393,13 @@ fn v2_header_and_metadata_corruption_are_rejected() {
     b[16..20].copy_from_slice(&u32::MAX.to_le_bytes()); // series_count
     check(&b, "series count");
 
-    let mut b = good.clone();
-    b[block_start] = 99; // unknown codec
-    check(&b, "unknown codec");
-
     // Truncation and trailing bytes.
     check(&good[..good.len() - 1], "truncated");
     let mut b = good.clone();
     b.push(0);
     check(&b, "trailing bytes");
 
-    // v1 CRCs cover only the payload, so metadata must be validated too.
+    // v1 has no header CRC, so metadata and limits must be validated directly.
     let v1 = include_bytes!("fixtures/v1.shrunk");
     // v1 header 16, name_len(4), name(7), block_count(4) => block at 31.
     let v1_block = 31usize;
@@ -382,6 +410,10 @@ fn v2_header_and_metadata_corruption_are_rejected() {
     let mut b = v1.to_vec();
     b[v1_block] = 99; // unknown codec
     check(&b, "unknown codec");
+
+    let mut b = v1.to_vec();
+    b[v1_block + 46..v1_block + 50].copy_from_slice(&u32::MAX.to_le_bytes()); // payload_len
+    check(&b, "payload length");
 
     let _ = fs::remove_dir_all(&dir);
 }

@@ -1,9 +1,16 @@
+use std::fs::File;
+#[cfg(not(unix))]
+use std::io::{Read, Seek, SeekFrom};
+use std::sync::Arc;
+
 use crate::codec::Codec;
+use crate::crc::crc32;
 use crate::Point;
 
-/// Bytes of block header written to disk, excluding the payload:
+/// Bytes of block header written to disk, excluding the payload and trailing
+/// payload checksum:
 /// codec(1) + flags(1) + count(4) + t_min(8) + t_max(8) + v_min(8) +
-/// v_max(8) + sum(8) + payload_len(4) + crc(4).
+/// v_max(8) + sum(8) + payload_len(4) + header_crc(4).
 pub const BLOCK_HEADER_BYTES: usize = 54;
 
 /// Upper bounds used when parsing untrusted files. They are deliberately
@@ -11,6 +18,74 @@ pub const BLOCK_HEADER_BYTES: usize = 54;
 /// unbounded allocation.
 pub const MAX_BLOCK_POINTS: u32 = 1_048_576;
 pub const MAX_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
+
+/// Where a block's compressed bytes live.
+#[derive(Clone, Debug)]
+pub enum Payload {
+    /// Payload built in memory and not yet written to a file.
+    Memory(Vec<u8>),
+    /// Payload in an open snapshot file, read on demand.
+    File {
+        file: Arc<File>,
+        offset: u64,
+        len: u32,
+    },
+}
+
+impl Payload {
+    pub fn len(&self) -> usize {
+        match self {
+            Payload::Memory(bytes) => bytes.len(),
+            Payload::File { len, .. } => *len as usize,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Read the payload. File-backed blocks allocate only for the block being
+    /// decoded, which keeps open and query memory bounded.
+    pub fn bytes(&self) -> Result<Vec<u8>, String> {
+        match self {
+            Payload::Memory(bytes) => Ok(bytes.clone()),
+            Payload::File { file, offset, len } => {
+                let mut buf = vec![0u8; *len as usize];
+                read_at(file, *offset, &mut buf)?;
+                Ok(buf)
+            }
+        }
+    }
+
+    fn with_bytes<T>(&self, f: impl FnOnce(&[u8]) -> T) -> Result<T, String> {
+        match self {
+            Payload::Memory(bytes) => Ok(f(bytes)),
+            Payload::File { .. } => {
+                let bytes = self.bytes()?;
+                Ok(f(&bytes))
+            }
+        }
+    }
+}
+
+pub(crate) fn read_at(file: &File, offset: u64, buf: &mut [u8]) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.read_exact_at(buf, offset)
+            .map_err(|e| format!("read block payload at {offset}: {e}"))
+    }
+    #[cfg(not(unix))]
+    {
+        let mut f = file
+            .try_clone()
+            .map_err(|e| format!("clone block file: {e}"))?;
+        f.seek(SeekFrom::Start(offset))
+            .map_err(|e| format!("seek block payload at {offset}: {e}"))?;
+        f.read_exact(buf)
+            .map_err(|e| format!("read block payload at {offset}: {e}"))
+    }
+}
 
 /// A compressed, immutable run of points plus the metadata queries need to
 /// decide whether decoding it is necessary.
@@ -24,7 +99,9 @@ pub struct Block {
     pub v_max: f64,
     pub has_nan: bool,
     pub sum: Option<f64>,
-    pub payload: Vec<u8>,
+    pub payload: Payload,
+    /// Expected payload-only CRC from a v3 file. Checked lazily on decode.
+    pub payload_crc: Option<u32>,
 }
 
 impl Block {
@@ -82,7 +159,8 @@ impl Block {
             } else {
                 None
             },
-            payload: best,
+            payload: Payload::Memory(best),
+            payload_crc: None,
         }
     }
 
@@ -150,7 +228,17 @@ impl Block {
     }
 
     pub fn decode(&self) -> Result<Vec<Point>, String> {
-        let points = self.codec.decode(&self.payload, self.count as usize)?;
+        let points = self.payload.with_bytes(|bytes| {
+            if let Some(expected) = self.payload_crc {
+                let actual = crc32(bytes);
+                if actual != expected {
+                    return Err(format!(
+                        "payload checksum mismatch: stored {expected:#010x}, got {actual:#010x}"
+                    ));
+                }
+            }
+            self.codec.decode(bytes, self.count as usize)
+        })??;
         self.validate_decoded(&points)?;
         Ok(points)
     }
@@ -189,7 +277,7 @@ impl Block {
     }
 
     pub fn stored_bytes(&self) -> usize {
-        BLOCK_HEADER_BYTES + self.payload.len()
+        BLOCK_HEADER_BYTES + self.payload.len() + 4
     }
 
     pub fn raw_bytes(&self) -> u64 {
