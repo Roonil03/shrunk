@@ -24,11 +24,19 @@ pub enum Codec {
     Gorilla = 1,
     Delta = 2,
     Rle = 3,
+    /// Gorilla XOR values with delta-of-delta run-length timestamps (GR).
+    GorillaRle = 4,
 }
 
 impl Codec {
     /// Order matters: on a size tie the earlier codec wins.
-    pub const CANDIDATES: [Codec; 4] = [Codec::Gorilla, Codec::Delta, Codec::Rle, Codec::Raw];
+    pub const CANDIDATES: [Codec; 5] = [
+        Codec::GorillaRle,
+        Codec::Gorilla,
+        Codec::Delta,
+        Codec::Rle,
+        Codec::Raw,
+    ];
 
     pub fn from_u8(v: u8) -> Option<Codec> {
         match v {
@@ -36,6 +44,7 @@ impl Codec {
             1 => Some(Codec::Gorilla),
             2 => Some(Codec::Delta),
             3 => Some(Codec::Rle),
+            4 => Some(Codec::GorillaRle),
             _ => None,
         }
     }
@@ -46,6 +55,7 @@ impl Codec {
             Codec::Gorilla => "gorilla",
             Codec::Delta => "delta-varint",
             Codec::Rle => "rle",
+            Codec::GorillaRle => "gorilla-rle",
         }
     }
 
@@ -59,6 +69,7 @@ impl Codec {
             Codec::Gorilla => Some(gorilla_encode(points)),
             Codec::Delta => delta_encode(points),
             Codec::Rle => Some(rle_encode(points)),
+            Codec::GorillaRle => Some(gorilla_rle_encode(points)),
         }
     }
 
@@ -71,6 +82,7 @@ impl Codec {
             Codec::Gorilla => gorilla_decode(bytes, count),
             Codec::Delta => delta_decode(bytes, count),
             Codec::Rle => rle_decode(bytes, count),
+            Codec::GorillaRle => gorilla_rle_decode(bytes, count),
         }
     }
 }
@@ -278,6 +290,120 @@ fn check_bit_padding(r: &BitReader<'_>, byte_len: usize) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Gorilla values + GR delta-of-delta timestamp RLE
+// ---------------------------------------------------------------------------
+
+/// Timestamps use first timestamp, first delta, then runs of identical
+/// delta-of-delta values (the GR idea from Zhou et al., 2026). Values reuse the
+/// Gorilla XOR bitstream. Fixed-frequency series collapse to one timestamp run.
+fn gorilla_rle_encode(points: &[Point]) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_uvarint(&mut out, zigzag(points[0].ts));
+
+    if points.len() >= 2 {
+        // The first delta is stored verbatim; the run loop starts at the
+        // third point, so `prev_ts` must already be the second timestamp.
+        let mut prev_ts = points[1].ts;
+        let mut prev_delta = points[1].ts.wrapping_sub(points[0].ts);
+        put_uvarint(&mut out, zigzag(prev_delta));
+
+        let mut runs: Vec<(i64, u64)> = Vec::new();
+        for p in points.iter().skip(2) {
+            let delta = p.ts.wrapping_sub(prev_ts);
+            let dod = delta.wrapping_sub(prev_delta);
+            if let Some((last_dod, len)) = runs.last_mut() {
+                if *last_dod == dod {
+                    *len += 1;
+                } else {
+                    runs.push((dod, 1));
+                }
+            } else {
+                runs.push((dod, 1));
+            }
+            prev_delta = delta;
+            prev_ts = p.ts;
+        }
+        put_uvarint(&mut out, runs.len() as u64);
+        for (dod, len) in runs {
+            put_uvarint(&mut out, zigzag(dod));
+            put_uvarint(&mut out, len);
+        }
+    }
+
+    let mut w = BitWriter::new();
+    w.write_bits(points[0].value.to_bits(), 64);
+    let mut prev_bits = points[0].value.to_bits();
+    let mut window: Option<(u32, u32)> = None;
+    for p in points.iter().skip(1) {
+        let bits = p.value.to_bits();
+        encode_xor(&mut w, prev_bits, bits, &mut window);
+        prev_bits = bits;
+    }
+    out.extend_from_slice(&w.finish());
+    out
+}
+
+fn gorilla_rle_decode(bytes: &[u8], count: usize) -> Result<Vec<Point>, String> {
+    let mut pos = 0usize;
+    let ts0 = unzigzag(get_uvarint(bytes, &mut pos)?);
+    let mut timestamps = Vec::with_capacity(count);
+    timestamps.push(ts0);
+
+    if count >= 2 {
+        let mut prev_delta = unzigzag(get_uvarint(bytes, &mut pos)?);
+        let mut ts = ts0.wrapping_add(prev_delta);
+        timestamps.push(ts);
+        let run_count = get_uvarint(bytes, &mut pos)?;
+        if run_count > (count - 2) as u64 {
+            return Err("gorilla-rle: more timestamp runs than points".to_string());
+        }
+        for _ in 0..run_count {
+            let dod = unzigzag(get_uvarint(bytes, &mut pos)?);
+            let len = get_uvarint(bytes, &mut pos)?;
+            if len == 0 || timestamps.len() as u64 + len > count as u64 {
+                return Err("gorilla-rle: timestamp runs exceed point count".to_string());
+            }
+            for _ in 0..len {
+                prev_delta = prev_delta.wrapping_add(dod);
+                ts = ts.wrapping_add(prev_delta);
+                timestamps.push(ts);
+            }
+        }
+        if timestamps.len() != count {
+            return Err(format!(
+                "gorilla-rle: expected {count} timestamps, got {}",
+                timestamps.len()
+            ));
+        }
+    }
+
+    if pos >= bytes.len() {
+        return Err("gorilla-rle: missing value stream".to_string());
+    }
+    let values = gorilla_values_decode(&bytes[pos..], count)?;
+    let mut out = Vec::with_capacity(count);
+    for (ts, value) in timestamps.into_iter().zip(values) {
+        out.push(Point { ts, value });
+    }
+    Ok(out)
+}
+
+fn gorilla_values_decode(bytes: &[u8], count: usize) -> Result<Vec<f64>, String> {
+    let mut r = BitReader::new(bytes);
+    let mut out = Vec::with_capacity(count);
+    let mut prev_bits = r.read_bits(64);
+    out.push(f64::from_bits(prev_bits));
+    let mut window: Option<(u32, u32)> = None;
+    for _ in 1..count {
+        let bits = decode_xor(&mut r, prev_bits, &mut window)?;
+        out.push(f64::from_bits(bits));
+        prev_bits = bits;
+    }
+    check_bit_padding(&r, bytes.len())?;
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -571,6 +697,65 @@ mod tests {
     }
 
     #[test]
+    fn gorilla_roundtrip_linear() {
+        let pts: Vec<Point> = (0..1024)
+            .map(|i| Point {
+                ts: 1_700_000_000_000 + i * 1000,
+                value: i as f64 * 2.0,
+            })
+            .collect();
+        let bytes = Codec::Gorilla.encode(&pts).unwrap();
+        let back = Codec::Gorilla.decode(&bytes, pts.len()).unwrap();
+        assert_eq!(back, pts);
+    }
+
+    #[test]
+    fn gorilla_rle_roundtrip_fixed_and_irregular() {
+        let fixed: Vec<Point> = (0..1024)
+            .map(|i| Point {
+                ts: 1_700_000_000_000 + i * 1000,
+                value: i as f64 * 2.0,
+            })
+            .collect();
+        let bytes = Codec::GorillaRle.encode(&fixed).unwrap();
+        let back = Codec::GorillaRle.decode(&bytes, fixed.len()).unwrap();
+        assert_eq!(back, fixed);
+        assert!(
+            bytes.len() < Codec::Gorilla.encode(&fixed).unwrap().len(),
+            "GR should beat Gorilla on fixed-step timestamps"
+        );
+
+        let irregular = sample();
+        let bytes = Codec::GorillaRle.encode(&irregular).unwrap();
+        let back = Codec::GorillaRle.decode(&bytes, irregular.len()).unwrap();
+        assert_eq!(back, irregular);
+    }
+
+    #[test]
+    fn gorilla_rle_roundtrip_specials_and_short() {
+        let pts = vec![
+            Point { ts: -5, value: 0.0 },
+            Point {
+                ts: -5,
+                value: f64::NAN,
+            },
+            Point {
+                ts: i64::MAX,
+                value: f64::NEG_INFINITY,
+            },
+        ];
+        for n in 1..=pts.len() {
+            let bytes = Codec::GorillaRle.encode(&pts[..n]).unwrap();
+            let back = Codec::GorillaRle.decode(&bytes, n).unwrap();
+            assert_eq!(back.len(), n);
+            for (a, b) in pts[..n].iter().zip(back.iter()) {
+                assert_eq!(a.ts, b.ts);
+                assert_eq!(a.value.to_bits(), b.value.to_bits());
+            }
+        }
+    }
+
+    #[test]
     fn varint_and_zigzag_helpers() {
         let mut v = Vec::new();
         for x in [0u64, 1, 127, 128, 300, u64::MAX] {
@@ -583,5 +768,80 @@ mod tests {
         for x in [i64::MIN, -1000, -1, 0, 1, 1000, i64::MAX] {
             assert_eq!(unzigzag(zigzag(x)), x);
         }
+    }
+
+    /// Deterministic xorshift so the randomized test is reproducible and
+    /// dependency-free.
+    fn xorshift(state: &mut u64) -> u64 {
+        let mut x = *state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *state = x;
+        x
+    }
+
+    #[test]
+    fn randomized_roundtrips_for_every_codec() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        for trial in 0..64 {
+            let n = 1 + (xorshift(&mut state) as usize % 300);
+            let mut ts = (xorshift(&mut state) as i64) % 10_000;
+            let mut points = Vec::with_capacity(n);
+            for _ in 0..n {
+                // Mix fixed steps, irregular steps, and occasional equal values
+                // so every codec path (runs, XOR windows, varints) is exercised.
+                let step = match xorshift(&mut state) % 4 {
+                    0 => 1,
+                    1 => 1000,
+                    _ => 1 + (xorshift(&mut state) as i64 % 50),
+                };
+                ts = ts.saturating_add(step);
+                let value = match xorshift(&mut state) % 8 {
+                    0 => 0.0,
+                    1 => -0.0,
+                    2 => f64::NAN,
+                    3 => f64::INFINITY,
+                    4 => f64::NEG_INFINITY,
+                    5 => (xorshift(&mut state) as f64) / 7.0,
+                    _ => (xorshift(&mut state) % 1000) as f64,
+                };
+                points.push(Point { ts, value });
+            }
+
+            for codec in Codec::CANDIDATES {
+                let Some(bytes) = codec.encode(&points) else {
+                    continue;
+                };
+                let back = codec
+                    .decode(&bytes, points.len())
+                    .unwrap_or_else(|e| panic!("{codec:?} trial {trial} failed: {e}"));
+                assert_eq!(back.len(), points.len(), "{codec:?} trial {trial}");
+                for (a, b) in points.iter().zip(back.iter()) {
+                    assert_eq!(a.ts, b.ts, "{codec:?} trial {trial} timestamp");
+                    assert_eq!(
+                        a.value.to_bits(),
+                        b.value.to_bits(),
+                        "{codec:?} trial {trial} value"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn codec_ids_are_stable() {
+        // IDs are persisted in block headers; never renumber an existing codec.
+        for (id, codec) in [
+            (0, Codec::Raw),
+            (1, Codec::Gorilla),
+            (2, Codec::Delta),
+            (3, Codec::Rle),
+            (4, Codec::GorillaRle),
+        ] {
+            assert_eq!(Codec::from_u8(id), Some(codec));
+            assert_eq!(codec as u8, id);
+        }
+        assert_eq!(Codec::from_u8(5), None);
     }
 }

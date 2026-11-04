@@ -6,7 +6,7 @@ use std::str::FromStr;
 use std::time::Instant;
 
 use shrunk::gen::{generate, Pattern};
-use shrunk::{Agg, Db, Predicate, Query, QueryStats};
+use shrunk::{Agg, Codec, Db, Predicate, Query, QueryStats};
 
 fn main() {
     if let Err(e) = run() {
@@ -27,6 +27,7 @@ fn run() -> Result<(), String> {
         "query" => cmd_query(&args[1..]),
         "stats" => cmd_stats(&args[1..]),
         "bench" => cmd_bench(&args[1..]),
+        "codec-bench" => cmd_codec_bench(&args[1..]),
         "demo" => cmd_demo(&args[1..]),
         other => Err(format!("unknown command {other:?}\n\n{}", help_text())),
     }
@@ -44,6 +45,7 @@ usage:
                 [--limit N] [--csv] [--explain]
   shrunk stats <db>
   shrunk bench [--points N] [--pattern NAME] [--block-size N]
+  shrunk codec-bench [--points N] [--block-size N]
   shrunk demo [--points N]
 
 notes:
@@ -294,6 +296,92 @@ fn cmd_bench(args: &[String]) -> Result<(), String> {
     );
     print_summaries(&db);
     let _ = fs::remove_file(&path);
+    Ok(())
+}
+
+fn cmd_codec_bench(args: &[String]) -> Result<(), String> {
+    let points: usize = number(flag(args, "--points"), "--points", 1_000_000)?;
+    let block_size: usize = number(flag(args, "--block-size"), "--block-size", 1024)?;
+    let start = 1_700_000_000_000i64;
+    let interval = 1000i64;
+    let patterns = [
+        Pattern::Cpu,
+        Pattern::Counter,
+        Pattern::Constant,
+        Pattern::Noise,
+        Pattern::Saw,
+    ];
+
+    println!(
+        "codec-bench: {points} points per pattern, block size {block_size}; payload bytes only"
+    );
+    println!(
+        "{:<10} {:<14} {:>9} {:>8} {:>11} {:>11}",
+        "pattern", "codec", "b/pt", "ratio", "encode ns/pt", "decode ns/pt"
+    );
+
+    for pattern in patterns {
+        let batch = generate(pattern, points, start, interval);
+        let n = batch.len();
+        // (name, bits/point, encode ns/point, decode ns/point)
+        let mut rows: Vec<(&'static str, f64, f64, f64)> = Vec::new();
+        for codec in Codec::CANDIDATES {
+            let t0 = Instant::now();
+            let mut encoded: Vec<Vec<u8>> = Vec::new();
+            let mut applicable = true;
+            for chunk in batch.chunks(block_size) {
+                match codec.encode(chunk) {
+                    Some(bytes) => encoded.push(bytes),
+                    None => {
+                        applicable = false;
+                        break;
+                    }
+                }
+            }
+            let encode = t0.elapsed();
+            if !applicable {
+                continue;
+            }
+            let total: usize = encoded.iter().map(|b| b.len()).sum();
+
+            let t1 = Instant::now();
+            let mut decoded = 0usize;
+            for (chunk, bytes) in batch.chunks(block_size).zip(&encoded) {
+                match codec.decode(bytes, chunk.len()) {
+                    Ok(points) => decoded += points.len(),
+                    Err(e) => return Err(format!("{} decode failed: {e}", codec.name())),
+                }
+            }
+            let decode = t1.elapsed();
+            std::hint::black_box(decoded);
+
+            let bits = (total * 8) as f64 / n as f64;
+            rows.push((
+                codec.name(),
+                bits,
+                encode.as_secs_f64() * 1e9 / n as f64,
+                decode.as_secs_f64() * 1e9 / n as f64,
+            ));
+        }
+        let best_bits = rows.iter().map(|r| r.1).fold(f64::INFINITY, f64::min);
+        for (name, bits, encode_ns, decode_ns) in rows {
+            let marker = if (bits - best_bits).abs() < 1e-9 {
+                " *"
+            } else {
+                ""
+            };
+            println!(
+                "{:<10} {:<14} {:>9.2} {:>7.1}x {:>11.1} {:>11.1}{}",
+                pattern.name(),
+                name,
+                bits,
+                128.0 / bits,
+                encode_ns,
+                decode_ns,
+                marker
+            );
+        }
+    }
     Ok(())
 }
 
