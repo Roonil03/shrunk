@@ -37,7 +37,7 @@ fn help_text() -> &'static str {
     "shrunk - a tiny time series database with queryable compression
 
 usage:
-  shrunk seed <db> --series NAME [--pattern cpu|counter|constant|noise|saw]
+  shrunk seed <db> --series NAME [--pattern cpu|counter|constant|noise|saw|oscillating]
                  [--points N] [--interval MS] [--start MS] [--block-size N]
   shrunk ingest <db> --series NAME --file PATH
   shrunk query <db> --series NAME [--from MS] [--to MS] [--agg count|sum|min|max|avg]
@@ -66,7 +66,7 @@ fn cmd_seed(args: &[String]) -> Result<(), String> {
     let series = flag(args, "--series").unwrap_or("metric");
     let pattern_s = flag(args, "--pattern").unwrap_or("cpu");
     let pattern = Pattern::parse(pattern_s).ok_or_else(|| {
-        format!("unknown pattern {pattern_s:?} (cpu, counter, constant, noise, saw)")
+        format!("unknown pattern {pattern_s:?} (cpu, counter, constant, noise, saw, oscillating)")
     })?;
     let points: usize = number(flag(args, "--points"), "--points", 100_000)?;
     let interval: i64 = number(flag(args, "--interval"), "--interval", 1000)?;
@@ -310,6 +310,7 @@ fn cmd_codec_bench(args: &[String]) -> Result<(), String> {
         Pattern::Constant,
         Pattern::Noise,
         Pattern::Saw,
+        Pattern::Oscillating,
     ];
 
     println!(

@@ -26,12 +26,15 @@ pub enum Codec {
     Rle = 3,
     /// Gorilla XOR values with delta-of-delta run-length timestamps (GR).
     GorillaRle = 4,
+    /// Dolphin-inspired skip encoding for oscillating XOR prefixes.
+    Dolphin = 5,
 }
 
 impl Codec {
     /// Order matters: on a size tie the earlier codec wins.
-    pub const CANDIDATES: [Codec; 5] = [
+    pub const CANDIDATES: [Codec; 6] = [
         Codec::GorillaRle,
+        Codec::Dolphin,
         Codec::Gorilla,
         Codec::Delta,
         Codec::Rle,
@@ -45,6 +48,7 @@ impl Codec {
             2 => Some(Codec::Delta),
             3 => Some(Codec::Rle),
             4 => Some(Codec::GorillaRle),
+            5 => Some(Codec::Dolphin),
             _ => None,
         }
     }
@@ -56,6 +60,7 @@ impl Codec {
             Codec::Delta => "delta-varint",
             Codec::Rle => "rle",
             Codec::GorillaRle => "gorilla-rle",
+            Codec::Dolphin => "dolphin",
         }
     }
 
@@ -70,6 +75,7 @@ impl Codec {
             Codec::Delta => delta_encode(points),
             Codec::Rle => Some(rle_encode(points)),
             Codec::GorillaRle => Some(gorilla_rle_encode(points)),
+            Codec::Dolphin => Some(dolphin_encode(points)),
         }
     }
 
@@ -83,6 +89,7 @@ impl Codec {
             Codec::Delta => delta_decode(bytes, count),
             Codec::Rle => rle_decode(bytes, count),
             Codec::GorillaRle => gorilla_rle_decode(bytes, count),
+            Codec::Dolphin => dolphin_decode(bytes, count),
         }
     }
 }
@@ -297,18 +304,17 @@ fn check_bit_padding(r: &BitReader<'_>, byte_len: usize) -> Result<(), String> {
 // ---------------------------------------------------------------------------
 
 /// Timestamps use first timestamp, first delta, then runs of identical
-/// delta-of-delta values (the GR idea from Zhou et al., 2026). Values reuse the
-/// Gorilla XOR bitstream. Fixed-frequency series collapse to one timestamp run.
-fn gorilla_rle_encode(points: &[Point]) -> Vec<u8> {
-    let mut out = Vec::new();
-    put_uvarint(&mut out, zigzag(points[0].ts));
+/// delta-of-delta values (the GR idea from Zhou et al., 2026). Fixed-frequency
+/// series collapse to one timestamp run.
+fn encode_ts_rle(points: &[Point], out: &mut Vec<u8>) {
+    put_uvarint(out, zigzag(points[0].ts));
 
     if points.len() >= 2 {
         // The first delta is stored verbatim; the run loop starts at the
         // third point, so `prev_ts` must already be the second timestamp.
         let mut prev_ts = points[1].ts;
         let mut prev_delta = points[1].ts.wrapping_sub(points[0].ts);
-        put_uvarint(&mut out, zigzag(prev_delta));
+        put_uvarint(out, zigzag(prev_delta));
 
         let mut runs: Vec<(i64, u64)> = Vec::new();
         for p in points.iter().skip(2) {
@@ -326,12 +332,57 @@ fn gorilla_rle_encode(points: &[Point]) -> Vec<u8> {
             prev_delta = delta;
             prev_ts = p.ts;
         }
-        put_uvarint(&mut out, runs.len() as u64);
+        put_uvarint(out, runs.len() as u64);
         for (dod, len) in runs {
-            put_uvarint(&mut out, zigzag(dod));
-            put_uvarint(&mut out, len);
+            put_uvarint(out, zigzag(dod));
+            put_uvarint(out, len);
         }
     }
+}
+
+fn decode_ts_rle(
+    bytes: &[u8],
+    pos: &mut usize,
+    count: usize,
+    codec: &str,
+) -> Result<Vec<i64>, String> {
+    let ts0 = unzigzag(get_uvarint(bytes, pos)?);
+    let mut timestamps = Vec::with_capacity(count);
+    timestamps.push(ts0);
+
+    if count >= 2 {
+        let mut prev_delta = unzigzag(get_uvarint(bytes, pos)?);
+        let mut ts = ts0.wrapping_add(prev_delta);
+        timestamps.push(ts);
+        let run_count = get_uvarint(bytes, pos)?;
+        if run_count > (count - 2) as u64 {
+            return Err(format!("{codec}: more timestamp runs than points"));
+        }
+        for _ in 0..run_count {
+            let dod = unzigzag(get_uvarint(bytes, pos)?);
+            let len = get_uvarint(bytes, pos)?;
+            if len == 0 || timestamps.len() as u64 + len > count as u64 {
+                return Err(format!("{codec}: timestamp runs exceed point count"));
+            }
+            for _ in 0..len {
+                prev_delta = prev_delta.wrapping_add(dod);
+                ts = ts.wrapping_add(prev_delta);
+                timestamps.push(ts);
+            }
+        }
+        if timestamps.len() != count {
+            return Err(format!(
+                "{codec}: expected {count} timestamps, got {}",
+                timestamps.len()
+            ));
+        }
+    }
+    Ok(timestamps)
+}
+
+fn gorilla_rle_encode(points: &[Point]) -> Vec<u8> {
+    let mut out = Vec::new();
+    encode_ts_rle(points, &mut out);
 
     let mut w = BitWriter::new();
     w.write_bits(points[0].value.to_bits(), 64);
@@ -348,38 +399,7 @@ fn gorilla_rle_encode(points: &[Point]) -> Vec<u8> {
 
 fn gorilla_rle_decode(bytes: &[u8], count: usize) -> Result<Vec<Point>, String> {
     let mut pos = 0usize;
-    let ts0 = unzigzag(get_uvarint(bytes, &mut pos)?);
-    let mut timestamps = Vec::with_capacity(count);
-    timestamps.push(ts0);
-
-    if count >= 2 {
-        let mut prev_delta = unzigzag(get_uvarint(bytes, &mut pos)?);
-        let mut ts = ts0.wrapping_add(prev_delta);
-        timestamps.push(ts);
-        let run_count = get_uvarint(bytes, &mut pos)?;
-        if run_count > (count - 2) as u64 {
-            return Err("gorilla-rle: more timestamp runs than points".to_string());
-        }
-        for _ in 0..run_count {
-            let dod = unzigzag(get_uvarint(bytes, &mut pos)?);
-            let len = get_uvarint(bytes, &mut pos)?;
-            if len == 0 || timestamps.len() as u64 + len > count as u64 {
-                return Err("gorilla-rle: timestamp runs exceed point count".to_string());
-            }
-            for _ in 0..len {
-                prev_delta = prev_delta.wrapping_add(dod);
-                ts = ts.wrapping_add(prev_delta);
-                timestamps.push(ts);
-            }
-        }
-        if timestamps.len() != count {
-            return Err(format!(
-                "gorilla-rle: expected {count} timestamps, got {}",
-                timestamps.len()
-            ));
-        }
-    }
-
+    let timestamps = decode_ts_rle(bytes, &mut pos, count, "gorilla-rle")?;
     if pos >= bytes.len() {
         return Err("gorilla-rle: missing value stream".to_string());
     }
@@ -403,6 +423,178 @@ fn gorilla_values_decode(bytes: &[u8], count: usize) -> Result<Vec<f64>, String>
         prev_bits = bits;
     }
     check_bit_padding(&r, bytes.len())?;
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Dolphin-inspired skip encoding
+// ---------------------------------------------------------------------------
+//
+// Dolphin (Chen et al., 2026) observes that oscillating series produce XOR
+// residuals with zero leading zeros, but the two high bits flip (01/10/11) and
+// are often followed by seven zero bits. It adds a skip path that transmits the
+// two-bit prefix once and jumps past the redundant nine-bit prefix region.
+//
+// This is a self-contained prototype of that idea layered on our Gorilla XOR
+// stream; it shares the GR timestamp encoding. A 2-bit value tag selects
+// reuse (0), a normal window (10), or a Dolphin skip (11). The skip path stores
+// the two prefix bits and the number of bits below the prefix, so the decoder
+// never walks the skipped zeros.
+
+/// Fraction of adjacent pairs whose XOR would take the Dolphin skip path.
+/// `Block::build` uses this to avoid paying Dolphin's one-bit overhead on
+/// blocks where it cannot win. Break-even is roughly 8% because a skip saves
+/// ~12 bits while a non-skip window costs one extra bit.
+pub(crate) fn dolphin_skip_rate(points: &[Point]) -> f64 {
+    if points.len() < 2 {
+        return 0.0;
+    }
+    let mut hits = 0usize;
+    let mut prev = points[0].value.to_bits();
+    for p in &points[1..] {
+        let bits = p.value.to_bits();
+        let xor = prev ^ bits;
+        let prefix = (xor >> 62) & 0b11;
+        let mid = (xor >> 55) & 0x7f;
+        if xor != 0 && xor.leading_zeros() == 0 && prefix != 0 && mid == 0 {
+            hits += 1;
+        }
+        prev = bits;
+    }
+    hits as f64 / (points.len() - 1) as f64
+}
+
+fn dolphin_encode(points: &[Point]) -> Vec<u8> {
+    let mut out = Vec::new();
+    encode_ts_rle(points, &mut out);
+
+    let mut w = BitWriter::new();
+    w.write_bits(points[0].value.to_bits(), 64);
+    let mut prev_bits = points[0].value.to_bits();
+    let mut window: Option<(u32, u32)> = None;
+    for p in points.iter().skip(1) {
+        let bits = p.value.to_bits();
+        dolphin_encode_xor(&mut w, prev_bits, bits, &mut window);
+        prev_bits = bits;
+    }
+    out.extend_from_slice(&w.finish());
+    out
+}
+
+fn dolphin_encode_xor(
+    w: &mut BitWriter,
+    prev_bits: u64,
+    bits: u64,
+    window: &mut Option<(u32, u32)>,
+) {
+    let xor = prev_bits ^ bits;
+    if xor == 0 {
+        w.write_bit(false);
+        return;
+    }
+    w.write_bit(true);
+
+    let lz = xor.leading_zeros().min(31);
+    let tz = xor.trailing_zeros();
+    let meaningful = 64 - lz - tz;
+
+    let reused = window
+        .map(|(plz, ptz)| lz >= plz && tz >= ptz)
+        .unwrap_or(false);
+    if reused {
+        let (plz, ptz) = window.unwrap();
+        w.write_bit(false);
+        w.write_bits(xor >> ptz, 64 - plz - ptz);
+        return;
+    }
+
+    // Top two bits flipped and bits 2..8 are all zero: skip the 9-bit prefix.
+    let prefix = (xor >> 62) & 0b11;
+    let mid = (xor >> 55) & 0x7f;
+    if lz == 0 && prefix != 0 && mid == 0 {
+        let skip_bits = 55u32.saturating_sub(tz);
+        w.write_bits(0b11, 2);
+        w.write_bits(prefix, 2);
+        w.write_bits(skip_bits as u64, 6);
+        if skip_bits > 0 {
+            let mask = (1u64 << skip_bits) - 1;
+            w.write_bits((xor >> tz) & mask, skip_bits);
+        }
+        *window = Some((9, 55 - skip_bits));
+        return;
+    }
+
+    w.write_bits(0b10, 2);
+    w.write_bits(lz as u64, 5);
+    w.write_bits((meaningful - 1) as u64, 6);
+    w.write_bits(xor >> tz, meaningful);
+    *window = Some((lz, tz));
+}
+
+fn dolphin_decode_xor(
+    r: &mut BitReader,
+    prev_bits: u64,
+    window: &mut Option<(u32, u32)>,
+) -> Result<u64, String> {
+    if !r.read_bit() {
+        return Ok(prev_bits);
+    }
+    if !r.read_bit() {
+        let (lz, tz) = window.ok_or_else(|| "dolphin: reused empty window".to_string())?;
+        let meaningful = 64 - lz - tz;
+        let bits = r.read_bits(meaningful) << tz;
+        return Ok(prev_bits ^ bits);
+    }
+    if !r.read_bit() {
+        let lz = r.read_bits(5) as u32;
+        let meaningful = r.read_bits(6) as u32 + 1;
+        if lz + meaningful > 64 {
+            return Err("dolphin: invalid window".to_string());
+        }
+        let tz = 64 - lz - meaningful;
+        let bits = r.read_bits(meaningful) << tz;
+        *window = Some((lz, tz));
+        return Ok(prev_bits ^ bits);
+    }
+
+    let prefix = r.read_bits(2);
+    let skip_bits = r.read_bits(6) as u32;
+    if skip_bits > 55 {
+        return Err("dolphin: invalid skip length".to_string());
+    }
+    let payload = if skip_bits == 0 {
+        0
+    } else {
+        r.read_bits(skip_bits)
+    };
+    let tz = 55 - skip_bits;
+    let xor = (prefix << 62) | (payload << tz);
+    *window = Some((9, tz));
+    Ok(prev_bits ^ xor)
+}
+
+fn dolphin_decode(bytes: &[u8], count: usize) -> Result<Vec<Point>, String> {
+    let mut pos = 0usize;
+    let timestamps = decode_ts_rle(bytes, &mut pos, count, "dolphin")?;
+    if pos >= bytes.len() {
+        return Err("dolphin: missing value stream".to_string());
+    }
+    let mut r = BitReader::new(&bytes[pos..]);
+    let mut values = Vec::with_capacity(count);
+    let mut prev_bits = r.read_bits(64);
+    values.push(f64::from_bits(prev_bits));
+    let mut window: Option<(u32, u32)> = None;
+    for _ in 1..count {
+        let bits = dolphin_decode_xor(&mut r, prev_bits, &mut window)?;
+        values.push(f64::from_bits(bits));
+        prev_bits = bits;
+    }
+    check_bit_padding(&r, bytes.len() - pos)?;
+
+    let mut out = Vec::with_capacity(count);
+    for (ts, value) in timestamps.into_iter().zip(values) {
+        out.push(Point { ts, value });
+    }
     Ok(out)
 }
 
@@ -830,6 +1022,25 @@ mod tests {
     }
 
     #[test]
+    fn dolphin_roundtrip_and_win_on_oscillating_data() {
+        let pts = crate::gen::generate(
+            crate::gen::Pattern::Oscillating,
+            1024,
+            1_700_000_000_000,
+            1000,
+        );
+        let dolphin = Codec::Dolphin.encode(&pts).unwrap();
+        let gorilla = Codec::GorillaRle.encode(&pts).unwrap();
+        assert!(dolphin.len() < gorilla.len(), "dolphin should win");
+        let back = Codec::Dolphin.decode(&dolphin, pts.len()).unwrap();
+        assert_eq!(back.len(), pts.len());
+        for (a, b) in pts.iter().zip(back.iter()) {
+            assert_eq!(a.ts, b.ts);
+            assert_eq!(a.value.to_bits(), b.value.to_bits());
+        }
+    }
+
+    #[test]
     fn codec_ids_are_stable() {
         // IDs are persisted in block headers; never renumber an existing codec.
         for (id, codec) in [
@@ -838,10 +1049,11 @@ mod tests {
             (2, Codec::Delta),
             (3, Codec::Rle),
             (4, Codec::GorillaRle),
+            (5, Codec::Dolphin),
         ] {
             assert_eq!(Codec::from_u8(id), Some(codec));
             assert_eq!(codec as u8, id);
         }
-        assert_eq!(Codec::from_u8(5), None);
+        assert_eq!(Codec::from_u8(6), None);
     }
 }

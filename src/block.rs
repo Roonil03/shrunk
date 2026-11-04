@@ -3,7 +3,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
 
-use crate::codec::Codec;
+use crate::codec::{dolphin_skip_rate, Codec};
 use crate::crc::crc32;
 use crate::Point;
 
@@ -135,7 +135,13 @@ impl Block {
 
         let mut best_codec = Codec::Raw;
         let mut best = Codec::Raw.encode(points).expect("raw always encodes");
+        // Dolphin only pays off on oscillating blocks. Skip its extra bit per
+        // new window elsewhere, where it cannot beat Gorilla.
+        let use_dolphin = dolphin_skip_rate(points) >= 0.08;
         for codec in Codec::CANDIDATES {
+            if codec == Codec::Dolphin && !use_dolphin {
+                continue;
+            }
             if let Some(bytes) = codec.encode(points) {
                 if bytes.len() < best.len() {
                     best_codec = codec;
@@ -282,5 +288,20 @@ impl Block {
 
     pub fn raw_bytes(&self) -> u64 {
         self.count as u64 * 16
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gen::{generate, Pattern};
+
+    #[test]
+    fn dolphin_is_selected_only_for_oscillating_blocks() {
+        let oscillating = generate(Pattern::Oscillating, 1024, 1_700_000_000_000, 1000);
+        assert_eq!(Block::build(&oscillating).codec, Codec::Dolphin);
+
+        let cpu = generate(Pattern::Cpu, 1024, 1_700_000_000_000, 1000);
+        assert_ne!(Block::build(&cpu).codec, Codec::Dolphin);
     }
 }
