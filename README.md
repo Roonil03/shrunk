@@ -1,15 +1,91 @@
 # shrunk
 
-A small time series database that keeps points compressed and avoids decoding
-blocks a query does not need.
+shrunk stores time-stamped numbers in less space and answers questions without
+unpacking every reading.
 
-The idea: group points into fixed-size blocks, compress each block with the
-codec that wins on that block, and store enough per-block metadata (time range,
-value range, count, sum) that reads and aggregates can skip work. Timestamps and
-values are not stored as 16 raw bytes per point unless a block is truly
-incompressible.
+## The problem, without the jargon
 
-Written in Rust with no dependencies.
+Picture this. A small greenhouse has 100 temperature and humidity sensors. Each
+sensor sends a reading every 10 seconds. That is 864,000 readings a day, or 315
+million readings a year. Every reading is just a timestamp and a number.
+
+Stored the usual way, that is about 5 GB a year for one greenhouse. Two
+greenhouses over five years is 50 GB of tiny numbers. Backups get slower, disks
+fill up, and a simple question like "what was the temperature last Tuesday at
+2:15?" makes the software walk through millions of readings to find a few
+hundred.
+
+The readings themselves are small. The cost of keeping and searching them is
+not.
+
+shrunk changes how the readings are stored:
+
+- Readings are grouped into blocks. The default is 1024 readings, about 3 hours
+  of data at one reading every 10 seconds.
+- Each block is compressed with whichever of four methods makes that block
+  smallest. A flat thermostat uses a different method than a noisy sensor.
+- Each block gets a label: its time range, its lowest and highest value, how
+  many readings it holds, and their sum.
+- Queries use labels to skip blocks. Totals come from the labels, so a question
+  like "what was the average?" does not need to unpack every reading.
+
+On 600,000 synthetic readings from three sensors:
+
+```text
+9.2 MiB of raw readings  ->  1.7 MiB stored  (5.5x smaller)
+
+noisy sensor      2.2x smaller
+counter          10.1x smaller
+constant value  223.7x smaller
+```
+
+A 5-minute query read 2 blocks out of 196. The other 194 stayed compressed.
+
+## How a query avoids work
+
+Think of each block as a sealed box of readings with a label on the lid:
+
+```text
+box 42
+time:   14:00 to 16:49
+count:  1024 readings
+lowest: 18.2
+highest: 24.9
+sum:    22,431.7
+```
+
+Now ask "did the temperature ever go above 23?"
+
+Any box whose label says `highest: 22.1` cannot contain a match. Leave it
+sealed. Only open boxes whose label says the highest value is at least 23.
+
+Ask "what was the average?" Add the sums printed on the labels and divide by
+the counts. No box needs to be opened.
+
+That is the whole trick. The compression makes the file smaller. The labels
+make the searches smaller.
+
+## Why not just zip the file?
+
+Zip compresses a whole file into one stream. To read one page, you have to
+unpack the stream.
+
+shrunk compresses small independent blocks and keeps a label on each one. It
+can unpack one block without touching the other 195. A zip file answers "what is
+on page 400?" by unpacking everything up to page 400. shrunk answers by reading
+the label on the box.
+
+## What shrunk is not
+
+- It is not a cloud service. It is one file and one local process.
+- It is not a replacement for Prometheus, InfluxDB, or TimescaleDB. There is no
+  replication, clustering, retention policy, or SQL.
+- It is not lossless magic for every data set. Noisy floating point sensors get
+  about 2x. Integer counters and flat signals get 10x to 200x.
+- It does not avoid reading the file from disk. The file is loaded when the
+  database opens. The saving is in file size and in how much compressed data a
+  query has to unpack.
+- It is a small project meant to be read, run, and extended.
 
 ## Try it
 
@@ -54,18 +130,17 @@ filtered        0.1 ms  (2 points, 975 blocks skipped of 977)
 ratio 2.2x (57 bits/point)
 ```
 
-The noisy gauge is the hard case: Gorilla XOR compression gets about 2.2x on
-f64 sensor values. Counters and constants do much better because they match the
-delta and RLE codecs. Numbers vary with the data; the benchmark command is
-repeatable.
+The noisy gauge is the hard case. Counters and constants do much better because
+they match the delta and RLE codecs. Numbers vary with the data; the benchmark
+command is repeatable.
 
 ## How it works
 
 ### Blocks and codec selection
 
 Each series is an ordered list of immutable blocks, 1024 points by default.
-When a block fills, `shrunk` encodes it with every applicable codec and keeps
-the smallest result:
+When a block fills, shrunk encodes it with every applicable codec and keeps the
+smallest result:
 
 | codec | timestamps | values | good for |
 |---|---|---|---|
