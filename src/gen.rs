@@ -14,6 +14,8 @@ pub enum Pattern {
     Noise,
     /// Repeating ramp.
     Saw,
+    /// Sign-alternating wave: the oscillating case Dolphin targets.
+    Oscillating,
 }
 
 impl Pattern {
@@ -24,6 +26,7 @@ impl Pattern {
             "constant" => Some(Pattern::Constant),
             "noise" => Some(Pattern::Noise),
             "saw" | "sawtooth" => Some(Pattern::Saw),
+            "oscillating" | "oscillate" => Some(Pattern::Oscillating),
             _ => None,
         }
     }
@@ -35,6 +38,7 @@ impl Pattern {
             Pattern::Constant => "constant",
             Pattern::Noise => "noise",
             Pattern::Saw => "saw",
+            Pattern::Oscillating => "oscillating",
         }
     }
 }
@@ -75,6 +79,14 @@ pub fn generate(pattern: Pattern, n: usize, start: i64, interval_ms: i64) -> Vec
             Pattern::Constant => 42.0,
             Pattern::Noise => rng.next_f64() * 100.0,
             Pattern::Saw => (i % 1000) as f64 / 10.0,
+            Pattern::Oscillating => {
+                let amplitude = 50.0 + 10.0 * (x / 500.0).sin();
+                if i % 2 == 0 {
+                    amplitude
+                } else {
+                    -amplitude
+                }
+            }
         };
         out.push(Point {
             ts: start.wrapping_add((i as i64).wrapping_mul(interval_ms)),

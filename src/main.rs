@@ -6,7 +6,7 @@ use std::str::FromStr;
 use std::time::Instant;
 
 use shrunk::gen::{generate, Pattern};
-use shrunk::{Agg, Db, Predicate, Query, QueryStats};
+use shrunk::{Agg, Block, Codec, Db, Point, Predicate, Query, QueryStats};
 
 fn main() {
     if let Err(e) = run() {
@@ -27,6 +27,8 @@ fn run() -> Result<(), String> {
         "query" => cmd_query(&args[1..]),
         "stats" => cmd_stats(&args[1..]),
         "bench" => cmd_bench(&args[1..]),
+        "codec-bench" => cmd_codec_bench(&args[1..]),
+        "segment-bench" => cmd_segment_bench(&args[1..]),
         "demo" => cmd_demo(&args[1..]),
         other => Err(format!("unknown command {other:?}\n\n{}", help_text())),
     }
@@ -36,7 +38,7 @@ fn help_text() -> &'static str {
     "shrunk - a tiny time series database with queryable compression
 
 usage:
-  shrunk seed <db> --series NAME [--pattern cpu|counter|constant|noise|saw]
+  shrunk seed <db> --series NAME [--pattern cpu|counter|constant|noise|saw|oscillating]
                  [--points N] [--interval MS] [--start MS] [--block-size N]
   shrunk ingest <db> --series NAME --file PATH
   shrunk query <db> --series NAME [--from MS] [--to MS] [--agg count|sum|min|max|avg]
@@ -44,6 +46,8 @@ usage:
                 [--limit N] [--csv] [--explain]
   shrunk stats <db>
   shrunk bench [--points N] [--pattern NAME] [--block-size N]
+  shrunk codec-bench [--points N] [--block-size N]
+  shrunk segment-bench [--points N] [--block-size N] [--min-seg N] [--max-seg N]
   shrunk demo [--points N]
 
 notes:
@@ -64,7 +68,7 @@ fn cmd_seed(args: &[String]) -> Result<(), String> {
     let series = flag(args, "--series").unwrap_or("metric");
     let pattern_s = flag(args, "--pattern").unwrap_or("cpu");
     let pattern = Pattern::parse(pattern_s).ok_or_else(|| {
-        format!("unknown pattern {pattern_s:?} (cpu, counter, constant, noise, saw)")
+        format!("unknown pattern {pattern_s:?} (cpu, counter, constant, noise, saw, oscillating)")
     })?;
     let points: usize = number(flag(args, "--points"), "--points", 100_000)?;
     let interval: i64 = number(flag(args, "--interval"), "--interval", 1000)?;
@@ -103,6 +107,7 @@ fn cmd_ingest(args: &[String]) -> Result<(), String> {
     let mut db = Db::load_or_new(&path).map_err(|e| e.to_string())?;
     let before = db.point_count();
     let t0 = Instant::now();
+    let mut points = Vec::new();
     for (lineno, line) in text.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -123,11 +128,14 @@ fn cmd_ingest(args: &[String]) -> Result<(), String> {
                     "line {}: expected integer_ms,value (got {:?})",
                     lineno + 1,
                     line
-                ))
+                ));
             }
         };
-        db.write(series, ts, value).map_err(|e| e.to_string())?;
+        points.push(shrunk::Point { ts, value });
     }
+    // One atomic batch: a duplicate or out-of-order line cannot leave a
+    // partially ingested file behind.
+    db.write_many(series, &points).map_err(|e| e.to_string())?;
     db.save(&path).map_err(|e| e.to_string())?;
     let added = db.point_count() - before;
     println!(
@@ -290,6 +298,218 @@ fn cmd_bench(args: &[String]) -> Result<(), String> {
     );
     print_summaries(&db);
     let _ = fs::remove_file(&path);
+    Ok(())
+}
+
+fn cmd_codec_bench(args: &[String]) -> Result<(), String> {
+    let points: usize = number(flag(args, "--points"), "--points", 1_000_000)?;
+    let block_size: usize = number(flag(args, "--block-size"), "--block-size", 1024)?;
+    let start = 1_700_000_000_000i64;
+    let interval = 1000i64;
+    let patterns = [
+        Pattern::Cpu,
+        Pattern::Counter,
+        Pattern::Constant,
+        Pattern::Noise,
+        Pattern::Saw,
+        Pattern::Oscillating,
+    ];
+
+    println!(
+        "codec-bench: {points} points per pattern, block size {block_size}; payload bytes only"
+    );
+    println!(
+        "{:<10} {:<14} {:>9} {:>8} {:>11} {:>11}",
+        "pattern", "codec", "b/pt", "ratio", "encode ns/pt", "decode ns/pt"
+    );
+
+    for pattern in patterns {
+        let batch = generate(pattern, points, start, interval);
+        let n = batch.len();
+        // (name, bits/point, encode ns/point, decode ns/point)
+        let mut rows: Vec<(&'static str, f64, f64, f64)> = Vec::new();
+        for codec in Codec::ALL {
+            let t0 = Instant::now();
+            let mut encoded: Vec<Vec<u8>> = Vec::new();
+            let mut applicable = true;
+            for chunk in batch.chunks(block_size) {
+                match codec.encode(chunk) {
+                    Some(bytes) => encoded.push(bytes),
+                    None => {
+                        applicable = false;
+                        break;
+                    }
+                }
+            }
+            let encode = t0.elapsed();
+            if !applicable {
+                continue;
+            }
+            let total: usize = encoded.iter().map(|b| b.len()).sum();
+
+            let t1 = Instant::now();
+            let mut decoded = 0usize;
+            for (chunk, bytes) in batch.chunks(block_size).zip(&encoded) {
+                match codec.decode(bytes, chunk.len()) {
+                    Ok(points) => decoded += points.len(),
+                    Err(e) => return Err(format!("{} decode failed: {e}", codec.name())),
+                }
+            }
+            let decode = t1.elapsed();
+            std::hint::black_box(decoded);
+
+            let bits = (total * 8) as f64 / n as f64;
+            rows.push((
+                codec.name(),
+                bits,
+                encode.as_secs_f64() * 1e9 / n as f64,
+                decode.as_secs_f64() * 1e9 / n as f64,
+            ));
+        }
+        let best_bits = rows.iter().map(|r| r.1).fold(f64::INFINITY, f64::min);
+        for (name, bits, encode_ns, decode_ns) in rows {
+            let marker = if (bits - best_bits).abs() < 1e-9 {
+                " *"
+            } else {
+                ""
+            };
+            println!(
+                "{:<10} {:<14} {:>9.2} {:>7.1}x {:>11.1} {:>11.1}{}",
+                pattern.name(),
+                name,
+                bits,
+                128.0 / bits,
+                encode_ns,
+                decode_ns,
+                marker
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Leading-zero counts of adjacent XORs, used as the local-fluctuation signal
+/// for the WZS-style segmentation prototype.
+fn leading_zeros(points: &[Point]) -> Vec<f64> {
+    let mut out = Vec::with_capacity(points.len());
+    out.push(64.0);
+    let mut prev = points[0].value.to_bits();
+    for p in &points[1..] {
+        let bits = p.value.to_bits();
+        let xor = prev ^ bits;
+        out.push(if xor == 0 {
+            64.0
+        } else {
+            xor.leading_zeros() as f64
+        });
+        prev = bits;
+    }
+    out
+}
+
+/// Greedy variance segmentation: grow a segment until adding the next point
+/// would push the leading-zero variance above `threshold`, bounded by
+/// `min_len`/`max_len`.
+fn variance_segments(
+    lz: &[f64],
+    min_len: usize,
+    max_len: usize,
+    threshold: f64,
+) -> Vec<(usize, usize)> {
+    let mut segments = Vec::new();
+    let mut start = 0usize;
+    while start < lz.len() {
+        let mut end = (start + min_len).min(lz.len());
+        let mut sum = 0.0;
+        let mut sumsq = 0.0;
+        for v in &lz[start..end] {
+            sum += *v;
+            sumsq += *v * *v;
+        }
+        while end < lz.len() && end - start < max_len {
+            let v = lz[end];
+            let next_sum = sum + v;
+            let next_sumsq = sumsq + v * v;
+            let len = (end - start + 1) as f64;
+            let mean = next_sum / len;
+            let variance = (next_sumsq / len - mean * mean).max(0.0);
+            if variance > threshold {
+                break;
+            }
+            sum = next_sum;
+            sumsq = next_sumsq;
+            end += 1;
+        }
+        segments.push((start, end));
+        start = end;
+    }
+    segments
+}
+
+fn cmd_segment_bench(args: &[String]) -> Result<(), String> {
+    let points: usize = number(flag(args, "--points"), "--points", 1_000_000)?;
+    let block_size: usize = number(flag(args, "--block-size"), "--block-size", 1024)?;
+    let min_seg: usize = number(flag(args, "--min-seg"), "--min-seg", 128)?;
+    let max_seg: usize = number(flag(args, "--max-seg"), "--max-seg", 4096)?;
+    let threshold: f64 = number(flag(args, "--lz-variance"), "--lz-variance", 16.0)?;
+    let start = 1_700_000_000_000i64;
+    let interval = 1000i64;
+    let patterns = [
+        Pattern::Cpu,
+        Pattern::Counter,
+        Pattern::Constant,
+        Pattern::Noise,
+        Pattern::Saw,
+        Pattern::Oscillating,
+    ];
+
+    println!(
+        "segment-bench: {points} points per pattern, fixed block {block_size}, \
+         variance segments {min_seg}..={max_seg} (threshold {threshold}); includes block headers"
+    );
+    println!(
+        "{:<12} {:>10} {:>11} {:>10} {:>9} {:>9} {:>10}",
+        "pattern", "fixed b/pt", "fixed@avg", "seg b/pt", "change", "segments", "avg len"
+    );
+
+    for pattern in patterns {
+        let batch = generate(pattern, points, start, interval);
+
+        let fixed: usize = batch
+            .chunks(block_size)
+            .map(|chunk| Block::build(chunk).stored_bytes())
+            .sum();
+
+        let lz = leading_zeros(&batch);
+        let segments =
+            variance_segments(&lz, min_seg.max(1), max_seg.max(min_seg.max(1)), threshold);
+        let segmented: usize = segments
+            .iter()
+            .map(|&(a, b)| Block::build(&batch[a..b]).stored_bytes())
+            .sum();
+
+        // Fair baseline: fixed blocks with the same average length as the
+        // variance segments, so the comparison isolates segmentation from the
+        // block-header savings of simply using larger blocks.
+        let avg_len = (batch.len() / segments.len().max(1)).max(1);
+        let fixed_avg: usize = batch
+            .chunks(avg_len)
+            .map(|chunk| Block::build(chunk).stored_bytes())
+            .sum();
+
+        let bits = |n: usize| (n * 8) as f64 / batch.len() as f64;
+        let change = (segmented as f64 / fixed_avg as f64 - 1.0) * 100.0;
+        println!(
+            "{:<12} {:>10.2} {:>11.2} {:>10.2} {:>8.2}% {:>9} {:>10.1}",
+            pattern.name(),
+            bits(fixed),
+            bits(fixed_avg),
+            bits(segmented),
+            change,
+            segments.len(),
+            avg_len as f64
+        );
+    }
     Ok(())
 }
 

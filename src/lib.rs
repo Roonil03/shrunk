@@ -19,14 +19,16 @@
 pub mod bits;
 pub mod block;
 pub mod codec;
+mod crc;
 pub mod db;
 pub mod gen;
+mod wal;
 
 pub use block::Block;
 pub use codec::Codec;
 pub use db::{
     Agg, AggResult, CodecStat, Db, Error, Predicate, Query, QueryResult, QueryStats, Result,
-    SeriesSummary,
+    SeriesSummary, FORMAT_MAGIC, FORMAT_VERSION,
 };
 
 /// One sample: a millisecond timestamp and a value.
