@@ -344,6 +344,7 @@ impl Db {
         if self.wal.is_some() {
             return self.write_many(series, &[Point { ts, value }]);
         }
+        validate_series_write(series, !self.series.contains_key(series), self.series.len())?;
         let block_size = self.block_size;
         let s = self
             .series
@@ -381,6 +382,8 @@ impl Db {
         if points.is_empty() {
             return Ok(());
         }
+
+        validate_series_write(series, !self.series.contains_key(series), self.series.len())?;
 
         let existing_last = self.series.get(series).and_then(|s| s.last_ts);
         let mut prev = existing_last;
@@ -722,10 +725,15 @@ impl Db {
             .collect()
     }
 
-    /// Flush pending points and write a complete v2 snapshot atomically
+    /// Flush pending points and write a complete v3 snapshot atomically
     /// (temp file, fsync, rename, directory fsync). Legacy v1 files are
-    /// upgraded in memory and become v2 after the first save.
+    /// upgraded in memory and become v3 after the first save.
     pub fn save(&mut self, path: &Path) -> Result<()> {
+        if self.wal.is_some() && self.path.as_deref() != Some(path) {
+            return Err(Error::Format(
+                "cannot save a WAL-bound database to a different path".into(),
+            ));
+        }
         self.flush_all();
         let bytes = encode_db(self)?;
         let file_name = path
@@ -794,18 +802,18 @@ impl Db {
         let wal_path = wal::wal_path(path);
         let mut db = if path.exists() {
             let mut db = open_snapshot(path)?;
-            replay_wal_into(&mut db, &wal_path)?;
+            replay_wal_into_repair(&mut db, &wal_path)?;
             db
         } else if wal_path.exists() {
             if fs::metadata(&wal_path)?.len() < wal::WAL_HEADER_BYTES {
                 Db::with_block_size(block_size)
             } else {
-                recover_from_wal(&wal_path)?
+                recover_from_wal_repair(&wal_path)?
             }
         } else {
             Db::with_block_size(block_size)
         };
-        let wal = Wal::open(&wal_path, db.block_size)?;
+        let wal = Wal::open_repaired(&wal_path, db.block_size)?;
         db.wal = Some(wal);
         db.path = Some(path.to_path_buf());
         Ok(db)
@@ -826,6 +834,7 @@ impl Db {
             None => 0,
         };
         if start < points.len() {
+            validate_series_write(series, !self.series.contains_key(series), self.series.len())?;
             self.write_many(series, &points[start..])?;
         }
         Ok(())
@@ -879,6 +888,26 @@ fn replay_wal_into(db: &mut Db, wal_path: &Path) -> Result<()> {
     })
 }
 
+fn replay_wal_into_repair(db: &mut Db, wal_path: &Path) -> Result<()> {
+    if !wal_path.exists() {
+        return Ok(());
+    }
+    let len = fs::metadata(wal_path)?.len();
+    if len < wal::WAL_HEADER_BYTES {
+        return Ok(());
+    }
+    let block_size = wal::read_block_size(wal_path)?;
+    if block_size != db.block_size {
+        return Err(Error::Format(format!(
+            "WAL block size {block_size} does not match database block size {}",
+            db.block_size
+        )));
+    }
+    wal::replay_repair(wal_path, &mut |series, points| {
+        db.replay_record(series, points)
+    })
+}
+
 fn recover_from_wal(wal_path: &Path) -> Result<Db> {
     if fs::metadata(wal_path)?.len() < wal::WAL_HEADER_BYTES {
         return Ok(Db::new());
@@ -886,6 +915,18 @@ fn recover_from_wal(wal_path: &Path) -> Result<Db> {
     let block_size = wal::read_block_size(wal_path)?;
     let mut db = Db::with_block_size(block_size);
     wal::replay(wal_path, &mut |series, points| {
+        db.replay_record(series, points)
+    })?;
+    Ok(db)
+}
+
+fn recover_from_wal_repair(wal_path: &Path) -> Result<Db> {
+    if fs::metadata(wal_path)?.len() < wal::WAL_HEADER_BYTES {
+        return Ok(Db::new());
+    }
+    let block_size = wal::read_block_size(wal_path)?;
+    let mut db = Db::with_block_size(block_size);
+    wal::replay_repair(wal_path, &mut |series, points| {
         db.replay_record(series, points)
     })?;
     Ok(db)
@@ -927,6 +968,20 @@ fn fold(
 }
 
 fn encode_db(db: &Db) -> Result<Vec<u8>> {
+    if db.series.len() > MAX_SERIES {
+        return Err(Error::Format(format!(
+            "series count {} exceeds limit {MAX_SERIES}",
+            db.series.len()
+        )));
+    }
+    for s in db.series.values() {
+        if s.name.len() > MAX_SERIES_NAME {
+            return Err(Error::Format(format!(
+                "series name length {} exceeds limit {MAX_SERIES_NAME}",
+                s.name.len()
+            )));
+        }
+    }
     let mut out = Vec::new();
     out.extend_from_slice(&FORMAT_MAGIC);
     out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
@@ -979,19 +1034,31 @@ fn encode_db(db: &Db) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+fn validate_series_write(series: &str, is_new: bool, current_count: usize) -> Result<()> {
+    if series.len() > MAX_SERIES_NAME {
+        return Err(Error::Format(format!(
+            "series name length {} exceeds limit {MAX_SERIES_NAME}",
+            series.len()
+        )));
+    }
+    if is_new && current_count >= MAX_SERIES {
+        return Err(Error::Format(format!(
+            "series count limit {MAX_SERIES} reached"
+        )));
+    }
+    Ok(())
+}
+
 fn decode_db(data: &[u8]) -> Result<Db> {
     if data.len() < 8 {
         return Err(Error::Format("truncated file header".into()));
     }
     match &data[..8] {
-        m if m == &MAGIC_V1 => decode_v1(data),
-        m if m == &MAGIC_V2 => decode_v2(data),
-        _ => Err(Error::Format(
-            format!(
-                "bad magic; not a shrunk database (current format is SHRUNK{FORMAT_VERSION:02})"
-            )
-            .into(),
-        )),
+        m if m == MAGIC_V1 => decode_v1(data),
+        m if m == MAGIC_V2 => decode_v2(data),
+        _ => Err(Error::Format(format!(
+            "bad magic; not a shrunk database (current format is SHRUNK{FORMAT_VERSION:02})"
+        ))),
     }
 }
 
@@ -1434,5 +1501,46 @@ mod tests {
         db.flush("s").unwrap();
         let s = db.summaries();
         assert_eq!(s[0].blocks, 1);
+    }
+
+    #[test]
+    fn write_rejects_overlong_series_name_without_mutation() {
+        let mut db = Db::new();
+        let name = "x".repeat(MAX_SERIES_NAME + 1);
+        assert!(matches!(db.write(&name, 1, 1.0), Err(Error::Format(_))));
+        assert!(db.series.is_empty());
+    }
+
+    #[test]
+    fn series_limit_applies_to_new_names_only() {
+        assert!(validate_series_write("new", true, MAX_SERIES).is_err());
+        assert!(validate_series_write("existing", false, MAX_SERIES).is_ok());
+    }
+
+    #[test]
+    fn encode_rejects_overlong_series_name() {
+        let mut db = Db::new();
+        let name = "x".repeat(MAX_SERIES_NAME + 1);
+        db.series.insert(name.clone(), Series::new(&name));
+        assert!(matches!(encode_db(&db), Err(Error::Format(_))));
+    }
+
+    #[test]
+    fn wal_bound_database_cannot_save_to_another_path() {
+        let base = std::env::temp_dir().join(format!("shrunk-save-path-{}", std::process::id()));
+        let path = base.with_extension("db");
+        let other = base.with_extension("other.db");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&other);
+        let _ = std::fs::remove_file(wal::wal_path(&path));
+
+        let mut db = Db::open_rw(&path).unwrap();
+        assert!(matches!(db.save(&other), Err(Error::Format(_))));
+        assert!(!other.exists());
+        db.write("s", 1, 2.0).unwrap();
+        db.save(&path).unwrap();
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(wal::wal_path(&path));
     }
 }

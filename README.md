@@ -173,7 +173,7 @@ Every block header also stores:
 - `sum`: total when all values are finite
 - `has_nan`: disables value and min/max shortcuts when NaN is present
 
-The header costs 54 bytes plus the payload. That is negligible for a 1024-point
+The block costs 58 bytes of header and checksum plus the payload. That is negligible for a 1024-point
 block and noticeable for a three-point series.
 
 ### Query path
@@ -347,7 +347,7 @@ or payload is rejected instead of being interpreted as data.
 Incremental appends use a sidecar file `<db>.wal`:
 
 ```text
-"WAL" magic (8 bytes), u16 version, u16 flags, u32 block_size
+"SHRUNKWL" magic (8 bytes), u16 version, u16 flags, u32 block_size
 repeated:
   u32 payload_len
   payload:

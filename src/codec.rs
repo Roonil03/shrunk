@@ -886,10 +886,15 @@ fn rle_decode(bytes: &[u8], count: usize) -> Result<Vec<Point>, String> {
         let bits = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap());
         pos += 8;
         let value = f64::from_bits(bits);
-        if out.len() + (len as usize) > count {
+        let remaining = count
+            .checked_sub(out.len())
+            .ok_or_else(|| "rle: decoded points exceed point count".to_string())?;
+        if len > u64::try_from(remaining).unwrap_or(u64::MAX) {
             return Err("rle: runs exceed point count".to_string());
         }
-        for k in 0..len {
+        let run_len = usize::try_from(len)
+            .map_err(|_| "rle: run length exceeds platform limits".to_string())?;
+        for k in 0..run_len {
             let ts = start.wrapping_add((k as i64).wrapping_mul(step));
             out.push(Point { ts, value });
         }
@@ -935,7 +940,7 @@ mod tests {
 
     #[test]
     fn gorilla_roundtrip_specials() {
-        let pts = vec![
+        let pts = [
             Point { ts: -5, value: 0.0 },
             Point {
                 ts: -4,
@@ -1061,7 +1066,7 @@ mod tests {
 
     #[test]
     fn gorilla_rle_roundtrip_specials_and_short() {
-        let pts = vec![
+        let pts = [
             Point { ts: -5, value: 0.0 },
             Point {
                 ts: -5,

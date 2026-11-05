@@ -23,6 +23,7 @@ pub(crate) const WAL_HEADER_BYTES: u64 = 16;
 const RECORD_KIND_POINTS: u8 = 1;
 const MAX_WAL_POINTS: usize = 16_000_000;
 const MAX_WAL_RECORD_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_SERIES_NAME: usize = 1024;
 
 pub(crate) fn wal_path(db: &Path) -> PathBuf {
     let mut name = db.as_os_str().to_os_string();
@@ -41,12 +42,31 @@ impl Wal {
     /// Open or create a WAL and validate its header. The block size is stored
     /// in the header so a database can be recovered even before its first
     /// snapshot exists.
+    #[cfg(test)]
     pub fn open(path: &Path, block_size: usize) -> Result<Wal> {
-        let mut file = OpenOptions::new()
-            .create(true)
+        Self::open_inner(path, block_size, false)
+    }
+
+    /// Open a WAL whose records were already replayed and its torn suffix
+    /// repaired by `replay_repair`.
+    pub fn open_repaired(path: &Path, block_size: usize) -> Result<Wal> {
+        Self::open_inner(path, block_size, true)
+    }
+
+    fn open_inner(path: &Path, block_size: usize, already_repaired: bool) -> Result<Wal> {
+        let (mut file, created) = match OpenOptions::new()
+            .create_new(true)
             .read(true)
             .append(true)
-            .open(path)?;
+            .open(path)
+        {
+            Ok(file) => (file, true),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => (
+                OpenOptions::new().read(true).append(true).open(path)?,
+                false,
+            ),
+            Err(e) => return Err(e.into()),
+        };
         let len = file.metadata()?.len();
         if len < WAL_HEADER_BYTES {
             // A crash while creating the header leaves a short file. Treat it
@@ -54,6 +74,9 @@ impl Wal {
             file.set_len(0)?;
             write_header(&mut file, block_size)?;
             file.sync_data()?;
+            if created {
+                sync_parent_dir(path)?;
+            }
             return Ok(Wal {
                 file,
                 header_written: true,
@@ -65,6 +88,16 @@ impl Wal {
             return Err(Error::Format(format!(
                 "WAL block size {found} does not match database block size {block_size}"
             )));
+        }
+        if !already_repaired {
+            let valid_end = scan_records(&mut file, len, false, &mut |_, _| Ok(()))?;
+            if valid_end != len {
+                file.set_len(valid_end)?;
+                file.sync_data()?;
+            }
+        }
+        if created {
+            sync_parent_dir(path)?;
         }
         Ok(Wal {
             file,
@@ -79,9 +112,10 @@ impl Wal {
         if points.is_empty() {
             return Ok(());
         }
+        let payload_len = checked_payload_len(series.len(), points.len())?;
         let block_size = self.block_size;
         self.ensure_header(block_size)?;
-        let mut payload = Vec::with_capacity(12 + series.len() + points.len() * 16);
+        let mut payload = Vec::with_capacity(payload_len);
         payload.push(RECORD_KIND_POINTS);
         put_u32(&mut payload, series.len() as u32);
         put_u32(&mut payload, points.len() as u32);
@@ -94,8 +128,17 @@ impl Wal {
         put_u32(&mut record, payload.len() as u32);
         record.extend_from_slice(&payload);
         put_u32(&mut record, crc32(&payload));
-        self.file.write_all(&record)?;
-        self.file.sync_data()?;
+        let old_len = self.file.metadata()?.len();
+        if let Err(error) = self.file.write_all(&record) {
+            self.file.set_len(old_len)?;
+            self.file.sync_data()?;
+            return Err(error.into());
+        }
+        if let Err(error) = self.file.sync_data() {
+            self.file.set_len(old_len)?;
+            self.file.sync_data()?;
+            return Err(error.into());
+        }
         Ok(())
     }
 
@@ -125,6 +168,21 @@ fn write_header(file: &mut File, block_size: usize) -> Result<()> {
     header.extend_from_slice(&0u16.to_le_bytes());
     put_u32(&mut header, block_size as u32);
     file.write_all(&header)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_parent_dir(path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_path: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -173,37 +231,81 @@ where
     if block_size == 0 {
         return Err(Error::Format("WAL has zero block size".into()));
     }
+    scan_records(&mut file, len, true, apply)?;
+    Ok(())
+}
+
+/// Replay complete records and truncate any torn terminal suffix before the
+/// file is reopened for append.
+pub(crate) fn replay_repair<F>(path: &Path, apply: &mut F) -> Result<()>
+where
+    F: FnMut(&str, &[Point]) -> Result<()>,
+{
+    let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+    let len = file.metadata()?.len();
+    if len < WAL_HEADER_BYTES {
+        file.set_len(0)?;
+        file.sync_data()?;
+        return Ok(());
+    }
+    let block_size = read_header(&mut file)?;
+    if block_size == 0 {
+        return Err(Error::Format("WAL has zero block size".into()));
+    }
+    let valid_end = scan_records(&mut file, len, true, apply)?;
+    if valid_end != len {
+        file.set_len(valid_end)?;
+        file.sync_data()?;
+    }
+    Ok(())
+}
+
+/// Walk complete records. An incomplete or checksum-invalid terminal record
+/// is a torn suffix; equivalent damage before later bytes is corruption.
+/// Returns the byte offset after the last complete record.
+fn scan_records<F>(file: &mut File, len: u64, decode: bool, apply: &mut F) -> Result<u64>
+where
+    F: FnMut(&str, &[Point]) -> Result<()>,
+{
     file.seek(SeekFrom::Start(WAL_HEADER_BYTES))?;
     let mut pos = WAL_HEADER_BYTES;
     while pos < len {
-        if len - pos < 4 {
+        let remaining = len - pos;
+        if remaining < 4 {
             break;
         }
         let mut len_buf = [0u8; 4];
-        if file.read_exact(&mut len_buf).is_err() {
-            break;
-        }
+        file.read_exact(&mut len_buf)?;
         let record_len = u32::from_le_bytes(len_buf) as u64;
-        if record_len > MAX_WAL_RECORD_BYTES || record_len + 8 > len - pos {
+        if record_len > MAX_WAL_RECORD_BYTES {
+            return Err(Error::Format(format!(
+                "WAL record size {record_len} exceeds limit {MAX_WAL_RECORD_BYTES}"
+            )));
+        }
+        let total = record_len + 8;
+        if total > remaining {
             break;
         }
         let mut payload = vec![0u8; record_len as usize];
-        if file.read_exact(&mut payload).is_err() {
-            break;
-        }
+        file.read_exact(&mut payload)?;
         let mut crc_buf = [0u8; 4];
-        if file.read_exact(&mut crc_buf).is_err() {
-            break;
-        }
+        file.read_exact(&mut crc_buf)?;
         let stored = u32::from_le_bytes(crc_buf);
         if crc32(&payload) != stored {
+            if total < remaining {
+                return Err(Error::Format(format!(
+                    "WAL checksum mismatch at byte {pos} before trailing records"
+                )));
+            }
             break;
         }
-        let (series, points) = decode_payload(&payload)?;
-        apply(&series, &points)?;
-        pos += 4 + record_len + 4;
+        if decode {
+            let (series, points) = decode_payload(&payload)?;
+            apply(&series, &points)?;
+        }
+        pos += total;
     }
-    Ok(())
+    Ok(pos)
 }
 
 fn decode_payload(payload: &[u8]) -> Result<(String, Vec<Point>)> {
@@ -218,6 +320,11 @@ fn decode_payload(payload: &[u8]) -> Result<(String, Vec<Point>)> {
     }
     let name_len = u32::from_le_bytes(payload[1..5].try_into().unwrap()) as usize;
     let count = u32::from_le_bytes(payload[5..9].try_into().unwrap()) as usize;
+    if name_len > MAX_SERIES_NAME {
+        return Err(Error::Format(format!(
+            "series name length {name_len} exceeds limit {MAX_SERIES_NAME}"
+        )));
+    }
     if count > MAX_WAL_POINTS {
         return Err(Error::Format(format!(
             "WAL record has {count} points, limit is {MAX_WAL_POINTS}"
@@ -254,9 +361,59 @@ fn put_u32(out: &mut Vec<u8>, v: u32) {
     out.extend_from_slice(&v.to_le_bytes());
 }
 
+fn checked_payload_len(name_len: usize, count: usize) -> Result<usize> {
+    if name_len > MAX_SERIES_NAME {
+        return Err(Error::Format(format!(
+            "series name length {name_len} exceeds limit {MAX_SERIES_NAME}"
+        )));
+    }
+    if count > MAX_WAL_POINTS {
+        return Err(Error::Format(format!(
+            "WAL record has {count} points, limit is {MAX_WAL_POINTS}"
+        )));
+    }
+    let payload_len = 9usize
+        .checked_add(name_len)
+        .and_then(|n| n.checked_add(count.checked_mul(16)?))
+        .ok_or_else(|| Error::Format("WAL record size overflow".into()))?;
+    if payload_len as u64 > MAX_WAL_RECORD_BYTES || payload_len > u32::MAX as usize {
+        return Err(Error::Format(format!(
+            "WAL record size {payload_len} exceeds limit {MAX_WAL_RECORD_BYTES}"
+        )));
+    }
+    Ok(payload_len)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "shrunk-wal-unit-{}-{label}.wal",
+            std::process::id()
+        ))
+    }
+
+    fn encoded_record(series: &str, points: &[Point]) -> Vec<u8> {
+        let mut payload = vec![RECORD_KIND_POINTS];
+        put_u32(&mut payload, series.len() as u32);
+        put_u32(&mut payload, points.len() as u32);
+        payload.extend_from_slice(series.as_bytes());
+        for point in points {
+            payload.extend_from_slice(&point.ts.to_le_bytes());
+            payload.extend_from_slice(&point.value.to_bits().to_le_bytes());
+        }
+        let mut record = Vec::new();
+        put_u32(&mut record, payload.len() as u32);
+        record.extend_from_slice(&payload);
+        put_u32(&mut record, crc32(&payload));
+        record
+    }
+
+    fn remove(path: &Path) {
+        let _ = std::fs::remove_file(path);
+    }
 
     #[test]
     fn payload_roundtrip() {
@@ -280,5 +437,76 @@ mod tests {
         assert_eq!(back.len(), 2);
         assert_eq!(back[0], points[0]);
         assert_eq!(back[1].value.to_bits(), points[1].value.to_bits());
+    }
+
+    #[test]
+    fn open_repairs_torn_suffix_before_future_append() {
+        let path = test_path("repair");
+        remove(&path);
+        let first = Point { ts: 1, value: 2.0 };
+        let second = Point { ts: 2, value: 3.0 };
+        let mut bytes = Vec::new();
+        write_header_to_vec(&mut bytes, 64);
+        bytes.extend_from_slice(&encoded_record("cpu", &[first]));
+        bytes.extend_from_slice(&[9, 0, 0]); // torn length prefix
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut wal = Wal::open(&path, 64).unwrap();
+        wal.append("cpu", &[second]).unwrap();
+        drop(wal);
+
+        let mut replayed = Vec::new();
+        replay(&path, &mut |name, points| {
+            replayed.extend(points.iter().map(|p| (name.to_owned(), p.ts)));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(replayed, vec![("cpu".into(), 1), ("cpu".into(), 2)]);
+        remove(&path);
+    }
+
+    #[test]
+    fn replay_rejects_corruption_before_later_records() {
+        let path = test_path("mid-corruption");
+        remove(&path);
+        let record = encoded_record("cpu", &[Point { ts: 1, value: 2.0 }]);
+        let mut bytes = Vec::new();
+        write_header_to_vec(&mut bytes, 64);
+        bytes.extend_from_slice(&record);
+        bytes.extend_from_slice(&encoded_record("cpu", &[Point { ts: 2, value: 3.0 }]));
+        bytes[WAL_HEADER_BYTES as usize + record.len() - 1] ^= 1;
+        std::fs::write(&path, bytes).unwrap();
+
+        let error = replay(&path, &mut |_, _| Ok(())).unwrap_err();
+        assert!(error.to_string().contains("checksum mismatch"));
+        remove(&path);
+    }
+
+    #[test]
+    fn append_and_decode_enforce_name_and_point_limits() {
+        let path = test_path("limits");
+        remove(&path);
+        let mut wal = Wal::open(&path, 64).unwrap();
+        let long_name = "x".repeat(MAX_SERIES_NAME + 1);
+        assert!(wal
+            .append(&long_name, &[Point { ts: 1, value: 1.0 }])
+            .is_err());
+        assert!(checked_payload_len(3, MAX_WAL_POINTS + 1).is_err());
+        assert!(checked_payload_len(3, usize::MAX).is_err());
+
+        let mut payload = vec![RECORD_KIND_POINTS];
+        put_u32(&mut payload, (MAX_SERIES_NAME + 1) as u32);
+        put_u32(&mut payload, 0);
+        payload.extend(std::iter::repeat_n(b'x', MAX_SERIES_NAME + 1));
+        assert!(decode_payload(&payload).is_err());
+        drop(wal);
+        remove(&path);
+    }
+
+    fn write_header_to_vec(out: &mut Vec<u8>, block_size: usize) {
+        out.extend_from_slice(WAL_MAGIC);
+        out.extend_from_slice(&WAL_VERSION.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        put_u32(out, block_size as u32);
     }
 }
