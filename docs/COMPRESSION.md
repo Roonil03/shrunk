@@ -132,8 +132,9 @@ Codec ids are persisted and must never be renumbered.
 ### GR / fixed-step timestamp RLE — implemented
 
 The GR idea (delta-of-delta runs) collapses a fixed-step timestamp column to a
-single run. It is a 1-2% payload win over Gorilla on every non-constant pattern
-and costs about 5% more decode time. Kept as codec id 4.
+single run. In the payload-only benchmark, gorilla-rle is 1.5-1.9% smaller
+than Gorilla on cpu, noise, saw, and oscillating patterns, and 8.5% smaller on
+counter. It costs about 5% more decode time. Kept as codec id 4.
 
 ### Dolphin — implemented, gated
 
@@ -173,8 +174,9 @@ seen in it, DFCM maps a context to the last bit-pattern delta, and the predictor
 with the longer zero prefix wins. We implemented that idea independently as codec
 id 6.
 
-The result is the largest win in this work: 2.63 bits/point on a counter versus
-11.72 before (48.8x versus 10.9x). A 128-point sample encode gates the codec, so
+The result is the largest win in this work: the whole-file counter size is 2.63
+bits/point versus the 12.72 bits/point baseline. Its raw-data compression ratio
+is 48.8x, compared with 10.1x before. A 128-point sample encode gates the codec, so
 unpredictable blocks pay about 12% extra ingest time instead of a full predictor
 pass.
 
