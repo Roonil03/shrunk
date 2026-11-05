@@ -886,10 +886,18 @@ fn rle_decode(bytes: &[u8], count: usize) -> Result<Vec<Point>, String> {
         let bits = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap());
         pos += 8;
         let value = f64::from_bits(bits);
-        if out.len() + (len as usize) > count {
+        // Validate the run length before converting it to usize or iterating.
+        // Casting u64::MAX to usize and adding it to out.len() can wrap (or
+        // panic in debug builds), after which the decoder may emit an
+        // attacker-controlled number of points.
+        let remaining = count - out.len();
+        let remaining_u64 = u64::try_from(remaining).unwrap_or(u64::MAX);
+        if len > remaining_u64 {
             return Err("rle: runs exceed point count".to_string());
         }
-        for k in 0..len {
+        let run_len = usize::try_from(len)
+            .map_err(|_| "rle: run length does not fit platform size".to_string())?;
+        for k in 0..run_len {
             let ts = start.wrapping_add((k as i64).wrapping_mul(step));
             out.push(Point { ts, value });
         }
