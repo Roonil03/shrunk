@@ -160,16 +160,11 @@ pub(crate) fn read_block_size(path: &Path) -> Result<usize> {
 
 /// Replay complete records. A short or CRC-failing record at the tail is
 /// treated as a torn write and ignored; earlier records are still applied.
-pub(crate) fn replay<F>(path: &Path, truncate_torn_tail: bool, apply: &mut F) -> Result<()>
+pub(crate) fn replay<F>(path: &Path, apply: &mut F) -> Result<()>
 where
     F: FnMut(&str, &[Point]) -> Result<()>,
 {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    if truncate_torn_tail {
-        options.write(true);
-    }
-    let mut file = options.open(path)?;
+    let mut file = File::open(path)?;
     let len = file.metadata()?.len();
     if len < WAL_HEADER_BYTES {
         return Ok(());
@@ -207,13 +202,6 @@ where
         let (series, points) = decode_payload(&payload)?;
         apply(&series, &points)?;
         pos += 4 + record_len + 4;
-    }
-    // Read-only opens stop at the last complete record without changing the
-    // WAL. A read/write opener must remove the unusable suffix before it can
-    // append, otherwise every later record would remain hidden behind it.
-    if truncate_torn_tail && pos < len {
-        file.set_len(pos)?;
-        file.sync_all()?;
     }
     Ok(())
 }

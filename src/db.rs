@@ -773,14 +773,14 @@ impl Db {
         let wal_path = wal::wal_path(path);
         if !path.exists() {
             if wal_path.exists() {
-                return recover_from_wal(&wal_path, false);
+                return recover_from_wal(&wal_path);
             }
             return Err(Error::Io(std::io::Error::from(
                 std::io::ErrorKind::NotFound,
             )));
         }
         let mut db = open_snapshot(path)?;
-        replay_wal_into(&mut db, &wal_path, false)?;
+        replay_wal_into(&mut db, &wal_path)?;
         Ok(db)
     }
 
@@ -794,13 +794,13 @@ impl Db {
         let wal_path = wal::wal_path(path);
         let mut db = if path.exists() {
             let mut db = open_snapshot(path)?;
-            replay_wal_into(&mut db, &wal_path, true)?;
+            replay_wal_into(&mut db, &wal_path)?;
             db
         } else if wal_path.exists() {
             if fs::metadata(&wal_path)?.len() < wal::WAL_HEADER_BYTES {
                 Db::with_block_size(block_size)
             } else {
-                recover_from_wal(&wal_path, true)?
+                recover_from_wal(&wal_path)?
             }
         } else {
             Db::with_block_size(block_size)
@@ -859,7 +859,7 @@ fn open_snapshot(path: &Path) -> Result<Db> {
     }
 }
 
-fn replay_wal_into(db: &mut Db, wal_path: &Path, truncate_torn_tail: bool) -> Result<()> {
+fn replay_wal_into(db: &mut Db, wal_path: &Path) -> Result<()> {
     if !wal_path.exists() {
         return Ok(());
     }
@@ -874,18 +874,18 @@ fn replay_wal_into(db: &mut Db, wal_path: &Path, truncate_torn_tail: bool) -> Re
             db.block_size
         )));
     }
-    wal::replay(wal_path, truncate_torn_tail, &mut |series, points| {
+    wal::replay(wal_path, &mut |series, points| {
         db.replay_record(series, points)
     })
 }
 
-fn recover_from_wal(wal_path: &Path, truncate_torn_tail: bool) -> Result<Db> {
+fn recover_from_wal(wal_path: &Path) -> Result<Db> {
     if fs::metadata(wal_path)?.len() < wal::WAL_HEADER_BYTES {
         return Ok(Db::new());
     }
     let block_size = wal::read_block_size(wal_path)?;
     let mut db = Db::with_block_size(block_size);
-    wal::replay(wal_path, truncate_torn_tail, &mut |series, points| {
+    wal::replay(wal_path, &mut |series, points| {
         db.replay_record(series, points)
     })?;
     Ok(db)
