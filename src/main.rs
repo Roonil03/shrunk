@@ -758,6 +758,15 @@ fn human_bytes(n: u64) -> String {
 
 fn temp_path(tag: &str) -> PathBuf {
     let mut p = env::temp_dir();
-    p.push(format!("shrunk-{tag}-{}.db", std::process::id()));
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    // Include time + pid so concurrent bench/demo runs do not share a
+    // predictable path that another local user could pre-create as a symlink.
+    p.push(format!(
+        "shrunk-{tag}-{}-{nanos}.db",
+        std::process::id()
+    ));
     p
 }
