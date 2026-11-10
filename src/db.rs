@@ -10,10 +10,11 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::block::{Block, Payload, BLOCK_HEADER_BYTES};
 use crate::codec::Codec;
@@ -739,14 +740,59 @@ impl Db {
         let file_name = path
             .file_name()
             .ok_or_else(|| Error::Format(format!("invalid path: {}", path.display())))?;
-        let tmp = path.with_file_name(format!("{}.tmp", file_name.to_string_lossy()));
-
-        {
-            let mut f = File::create(&tmp)?;
+        let file_name = file_name.to_string_lossy();
+        // Secure temp file: unique name + O_EXCL (create_new) so a pre-planted
+        // symlink or file at the tmp path fails closed instead of being
+        // followed/truncated. The temp lives in the same directory so that
+        // rename(2) stays atomic.
+        static SAVE_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let mut tmp_path = None;
+        let mut tmp_file = None;
+        for _ in 0..100 {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let ctr = SAVE_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let candidate = path.with_file_name(format!(
+                "{}.tmp.{}.{}.{}",
+                file_name,
+                std::process::id(),
+                nanos ^ ((ctr as u128 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15)),
+                ctr
+            ));
+            let mut opts = OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            match opts.open(&candidate) {
+                Ok(f) => {
+                    tmp_path = Some(candidate);
+                    tmp_file = Some(f);
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        let tmp = tmp_path.ok_or_else(|| {
+            Error::Format("could not create a unique temp file for save".into())
+        })?;
+        let write_res: Result<()> = (|| {
+            let mut f = tmp_file.unwrap();
             f.write_all(&bytes)?;
             f.sync_all()?;
+            drop(f);
+            fs::rename(&tmp, path)?;
+            Ok(())
+        })();
+        if write_res.is_err() {
+            let _ = fs::remove_file(&tmp);
+            write_res?;
         }
-        fs::rename(&tmp, path)?;
         #[cfg(unix)]
         {
             if let Some(parent) = path.parent() {
@@ -1068,8 +1114,86 @@ fn decode_v1(data: &[u8]) -> Result<Db> {
     let block_size = c.u32()? as usize;
     let series_count = c.u32()? as usize;
     let mut db = decode_body(&mut c, data, block_size, series_count, false)?;
+    // v1 CRCs cover the payload only, so header fields (sum, v_min/v_max,
+    // t_min/t_max) are unauthenticated. A tampered header would otherwise
+    // cause wrong query skips and wrong fast-path aggregates without any
+    // error. Re-derive metadata from the decoded payload so a tampered
+    // header cannot cause silent wrong answers. Count tampering is still
+    // rejected by decode/validate below (truncation or trailing bytes).
+    reverify_v1_metadata(&mut db)?;
     db.format_version = VERSION_V1;
     Ok(db)
+}
+
+/// Recompute v1 block metadata from payload contents. v1 has no header CRC,
+/// so header values must not be trusted for query planning or aggregates.
+fn reverify_v1_metadata(db: &mut Db) -> Result<()> {
+    for (name, series) in db.series.iter_mut() {
+        for b in series.blocks.iter_mut() {
+            let points = b.decode().map_err(|e| {
+                Error::Format(format!("series {name:?}: v1 payload invalid: {e}"))
+            })?;
+            if points.is_empty() {
+                return Err(Error::Format(format!(
+                    "series {name:?}: v1 block with zero points"
+                )));
+            }
+            let mut t_min = points[0].ts;
+            let mut t_max = points[0].ts;
+            let mut v_min = f64::INFINITY;
+            let mut v_max = f64::NEG_INFINITY;
+            let mut has_nan = false;
+            let mut all_finite = true;
+            let mut sum = 0.0f64;
+            for p in &points {
+                t_min = t_min.min(p.ts);
+                t_max = t_max.max(p.ts);
+                if p.value.is_nan() {
+                    has_nan = true;
+                    all_finite = false;
+                } else {
+                    v_min = v_min.min(p.value);
+                    v_max = v_max.max(p.value);
+                    if p.value.is_finite() {
+                        sum += p.value;
+                    } else {
+                        all_finite = false;
+                    }
+                }
+            }
+            b.t_min = t_min;
+            b.t_max = t_max;
+            b.v_min = v_min;
+            b.v_max = v_max;
+            b.has_nan = has_nan;
+            b.sum = if all_finite && sum.is_finite() {
+                Some(sum)
+            } else {
+                None
+            };
+            // Re-validate the corrected header so any structural violation
+            // (e.g. count mismatch already checked by decode) is reported.
+            b.validate_meta()
+                .map_err(|e| Error::Format(format!("series {name:?}: {e}")))?;
+        }
+        // Cross-block ordering uses corrected bounds; legacy files that
+        // violate strict increase are rejected rather than silently
+        // mis-queried.
+        let mut prev_t_max: Option<i64> = None;
+        for b in series.blocks.iter() {
+            if let Some(prev) = prev_t_max {
+                if b.t_min <= prev {
+                    return Err(Error::Format(format!(
+                        "series {name:?}: block starting at {} overlaps previous block ending at {prev}",
+                        b.t_min
+                    )));
+                }
+            }
+            prev_t_max = Some(b.t_max);
+        }
+        series.last_ts = series.blocks.last().map(|b| b.t_max);
+    }
+    Ok(())
 }
 
 fn decode_v2(data: &[u8]) -> Result<Db> {
@@ -1148,7 +1272,9 @@ fn decode_current_file(file: File, len: u64) -> Result<Db> {
         for _ in 0..block_count {
             let block = read_current_block(&mut c, &name)?;
             if let Some(prev) = prev_t_max {
-                if block.t_min < prev {
+                // Timestamps are strictly increasing, so equality would be a
+                // duplicate timestamp shared across blocks.
+                if block.t_min <= prev {
                     return Err(Error::Format(format!(
                         "series {name:?}: block starting at {} overlaps previous block ending at {prev}",
                         block.t_min
@@ -1283,7 +1409,9 @@ fn decode_body(
         for _ in 0..block_count {
             let block = read_block(c, data, &name, v2_crc)?;
             if let Some(prev) = prev_t_max {
-                if block.t_min < prev {
+                // Timestamps are strictly increasing, so equality would be a
+                // duplicate timestamp shared across blocks.
+                if block.t_min <= prev {
                     return Err(Error::Format(format!(
                         "series {name:?}: block starting at {} overlaps previous block ending at {prev}",
                         block.t_min
