@@ -320,7 +320,14 @@ fn read_header(file: &mut File) -> Result<usize> {
     if flags != 0 {
         return Err(Error::Format(format!("unsupported WAL flags {flags:#x}")));
     }
-    Ok(u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize)
+    let block_size = u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
+    let max_block_size = crate::block::MAX_BLOCK_POINTS as usize;
+    if !(1..=max_block_size).contains(&block_size) {
+        return Err(Error::Format(format!(
+            "WAL block size {block_size} outside 1..={max_block_size}"
+        )));
+    }
+    Ok(block_size)
 }
 
 /// Block size recorded in a WAL header, used when recovering without a
@@ -653,6 +660,19 @@ mod tests {
             .to_string()
             .contains("recovery limit"));
         drop(wal);
+        remove(&path);
+    }
+
+    #[test]
+    fn wal_header_rejects_out_of_range_block_size() {
+        let path = test_path("bad-block-size");
+        remove(&path);
+        let mut bytes = Vec::new();
+        write_header_to_vec(&mut bytes, 64);
+        bytes[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        let error = replay_repair(&path, &mut |_, _| Ok(())).unwrap_err();
+        assert!(error.to_string().contains("block size"), "{error}");
         remove(&path);
     }
 
