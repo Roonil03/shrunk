@@ -41,10 +41,11 @@ git remote add upstream git@github.com:vee1e/shrunk.git
 git fetch upstream
 ```
 
-Build and run the test suite:
+Build, lint, and test:
 
 ```sh
 cargo build
+cargo clippy --all-targets --locked -- -D warnings
 cargo test --all-targets
 cargo test --doc
 ```
@@ -79,7 +80,7 @@ safer to merge.
 
 ### Follow the existing style
 
-- Run `cargo fmt` before committing.
+- Run `cargo fmt` and `cargo clippy` before committing.
 - Keep public APIs and error messages consistent with the surrounding code.
 - Prefer clear code over clever code. This is a small, readable project.
 - Do not add runtime dependencies without discussing it first. The crate is
@@ -166,7 +167,9 @@ change is needed, not just what changed. Reference issues when relevant.
 1. Rebase on the latest upstream `main`.
 2. Run the full check suite:
    ```sh
-   cargo fmt --check
+   cargo fmt --all --check
+   cargo clippy --all-targets --locked -- -D warnings
+   RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --locked
    cargo test --all-targets
    cargo test --doc
    cargo build --release
@@ -203,8 +206,10 @@ comments and any sections that genuinely do not apply.
 
 <!-- Describe the commands run and the results. -->
 
-- [ ] `cargo fmt --check`
+- [ ] `cargo fmt --all --check`
+- [ ] `cargo clippy --all-targets --locked -- -D warnings`
 - [ ] `cargo test --all-targets`
+- [ ] `cargo test --doc`
 
 ## Notes
 

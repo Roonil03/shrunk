@@ -1,0 +1,3 @@
+[default.extend-words]
+# Journal abbreviation in docs/COMPRESSION.md citations.
+Comput = "Comput"
