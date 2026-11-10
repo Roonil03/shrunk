@@ -75,10 +75,13 @@ impl Wal {
         lock_exclusive(&file)?;
         let len = file.metadata()?.len();
         check_wal_size(len)?;
-        if len == 0 {
+        if len < WAL_HEADER_BYTES {
+            // A partial header cannot contain a committed record. Recreate it
+            // instead of blocking recovery on a torn header write.
             let block_size = expected_block_size.ok_or_else(|| {
                 Error::Format("cannot initialize WAL without a block size".into())
             })?;
+            file.set_len(0)?;
             write_header(&mut file, block_size)?;
             file.sync_data()?;
             if created {
@@ -91,11 +94,6 @@ impl Wal {
                     block_size,
                 },
                 block_size,
-            ));
-        }
-        if len < WAL_HEADER_BYTES {
-            return Err(Error::Format(
-                "truncated WAL header; preserving damaged WAL".into(),
             ));
         }
         let block_size = read_header(&mut file)?;
@@ -141,7 +139,8 @@ impl Wal {
         lock_exclusive(&file)?;
         let len = file.metadata()?.len();
         check_wal_size(len)?;
-        if len == 0 {
+        if len < WAL_HEADER_BYTES {
+            file.set_len(0)?;
             write_header(&mut file, block_size)?;
             file.sync_data()?;
             if created {
@@ -152,11 +151,6 @@ impl Wal {
                 header_written: true,
                 block_size,
             });
-        }
-        if len < WAL_HEADER_BYTES {
-            return Err(Error::Format(
-                "truncated WAL header; preserving damaged WAL".into(),
-            ));
         }
         let found = read_header(&mut file)?;
         if found != block_size {
@@ -227,15 +221,23 @@ impl Wal {
     /// recreates the header.
     pub fn truncate(&mut self) -> Result<()> {
         self.file.set_len(0)?;
-        self.file.sync_all()?;
+        // Reflect the truncated file even if the durability sync fails, so a
+        // later append does not write a record without a header.
         self.header_written = false;
+        self.file.sync_all()?;
         Ok(())
     }
 
     pub fn ensure_header(&mut self, block_size: usize) -> Result<()> {
         if !self.header_written {
             write_header(&mut self.file, block_size)?;
-            self.file.sync_data()?;
+            if let Err(error) = self.file.sync_data() {
+                // The header write may have reached the file without being
+                // durable. Drop it so a retry rewrites instead of appending a
+                // second header.
+                let _ = self.file.set_len(0);
+                return Err(error.into());
+            }
             self.header_written = true;
         }
         Ok(())
@@ -264,6 +266,8 @@ fn open_wal(path: &Path, writable: bool, create_new: bool, append: bool) -> std:
     }
     #[cfg(any(target_os = "linux", target_os = "android"))]
     options.custom_flags(0x20000); // O_NOFOLLOW
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    options.custom_flags(0x100); // O_NOFOLLOW (Darwin)
     let file = options.open(path)?;
     if !file.metadata()?.file_type().is_file() {
         return Err(std::io::Error::new(
@@ -351,13 +355,9 @@ where
     let mut file = open_wal(path, false, false, false)?;
     let len = file.metadata()?.len();
     check_wal_size(len)?;
-    if len == 0 {
-        return Ok(());
-    }
     if len < WAL_HEADER_BYTES {
-        return Err(Error::Format(
-            "truncated WAL header; preserving damaged WAL".into(),
-        ));
+        // A partial header cannot hold a record; treat it as an empty WAL.
+        return Ok(());
     }
     let block_size = read_header(&mut file)?;
     if block_size == 0 {
@@ -378,13 +378,10 @@ where
     lock_exclusive(&file)?;
     let len = file.metadata()?.len();
     check_wal_size(len)?;
-    if len == 0 {
-        return Ok(());
-    }
     if len < WAL_HEADER_BYTES {
-        return Err(Error::Format(
-            "truncated WAL header; preserving damaged WAL".into(),
-        ));
+        file.set_len(0)?;
+        file.sync_data()?;
+        return Ok(());
     }
     let block_size = read_header(&mut file)?;
     if block_size == 0 {
@@ -676,6 +673,31 @@ mod tests {
         remove(&path);
     }
 
+    #[test]
+    fn partial_wal_header_is_recreated() {
+        let path = test_path("partial-header");
+        remove(&path);
+        std::fs::write(&path, &WAL_MAGIC[..8]).unwrap();
+
+        let (mut wal, block_size) =
+            Wal::recover_and_open(&path, Some(64), &mut |_, _, _| Ok(())).unwrap();
+        assert_eq!(block_size, 64);
+        wal.append("cpu", &[Point { ts: 1, value: 2.0 }]).unwrap();
+        drop(wal);
+
+        let mut replayed = Vec::new();
+        replay(&path, &mut |series, points| {
+            replayed.push((series.to_string(), points.to_vec()));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            replayed,
+            vec![("cpu".into(), vec![Point { ts: 1, value: 2.0 }])]
+        );
+        remove(&path);
+    }
+
     #[cfg(unix)]
     #[test]
     fn wal_creation_is_private_and_symlinks_are_rejected() {
@@ -687,9 +709,13 @@ mod tests {
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
-        // O_NOFOLLOW is only set on Linux and Android, so the symlink check
-        // only applies there.
-        #[cfg(any(target_os = "linux", target_os = "android"))]
+        // O_NOFOLLOW is set on Linux, Android, and Darwin targets.
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios"
+        ))]
         {
             use std::os::unix::fs::symlink;
             let link = test_path("symlink");

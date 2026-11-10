@@ -212,6 +212,9 @@ impl Block {
                 self.payload.len()
             ));
         }
+        if self.v_min.is_nan() || self.v_max.is_nan() {
+            return Err("block value bounds are NaN".into());
+        }
         if !self.has_nan && self.v_min > self.v_max {
             return Err(format!(
                 "block value bounds inverted: v_min {} > v_max {}",
@@ -278,6 +281,13 @@ impl Block {
         }
         let bounded_values = !self.has_nan || self.v_min <= self.v_max;
         for (i, p) in points.iter().enumerate() {
+            if i > 0 && p.ts <= points[i - 1].ts {
+                return Err(format!(
+                    "point {i} timestamp {} is not after {}",
+                    p.ts,
+                    points[i - 1].ts
+                ));
+            }
             if p.ts < self.t_min || p.ts > self.t_max {
                 return Err(format!(
                     "point {i} timestamp {} outside block bounds [{}, {}]",
@@ -311,6 +321,34 @@ impl Block {
 mod tests {
     use super::*;
     use crate::gen::{generate, Pattern};
+
+    #[test]
+    fn nan_value_bounds_are_rejected_without_nan_flag() {
+        let points = [Point { ts: 1, value: 1.0 }];
+        let mut block = Block::build(&points);
+        block.v_min = f64::NAN;
+        assert!(block.validate_meta().is_err());
+    }
+
+    #[test]
+    fn decode_rejects_out_of_order_timestamps() {
+        let payload = Codec::Gorilla
+            .encode(&[Point { ts: 20, value: 1.0 }, Point { ts: 10, value: 2.0 }])
+            .unwrap();
+        let block = Block {
+            codec: Codec::Gorilla,
+            count: 2,
+            t_min: 10,
+            t_max: 20,
+            v_min: 1.0,
+            v_max: 2.0,
+            has_nan: false,
+            sum: Some(3.0),
+            payload: Payload::Memory(payload),
+            payload_crc: None,
+        };
+        assert!(block.decode().is_err());
+    }
 
     #[test]
     fn dolphin_is_selected_only_for_oscillating_blocks() {
