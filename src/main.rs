@@ -1,8 +1,10 @@
 use std::env;
 use std::fmt::Display;
 use std::fs;
+use std::io::Read;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use shrunk::gen::{generate, Pattern};
@@ -57,7 +59,27 @@ notes:
 "
 }
 
+fn write_generated(db: &mut Db, series: &str, points: &[Point]) -> Result<(), String> {
+    for chunk in points.chunks(1_000_000) {
+        db.write_many(series, chunk).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 fn cmd_seed(args: &[String]) -> Result<(), String> {
+    validate_options(
+        args,
+        1,
+        &[
+            "--series",
+            "--pattern",
+            "--points",
+            "--interval",
+            "--start",
+            "--block-size",
+        ],
+        &[],
+    )?;
     let path = db_arg(args)?;
     if path.exists() {
         return Err(format!(
@@ -74,11 +96,12 @@ fn cmd_seed(args: &[String]) -> Result<(), String> {
     let interval: i64 = number(flag(args, "--interval"), "--interval", 1000)?;
     let start: i64 = number(flag(args, "--start"), "--start", 1_700_000_000_000)?;
     let block_size: usize = number(flag(args, "--block-size"), "--block-size", 1024)?;
+    require_positive(block_size, "--block-size")?;
 
     let batch = generate(pattern, points, start, interval);
     let mut db = Db::with_block_size(block_size);
     let t0 = Instant::now();
-    db.write_many(series, &batch).map_err(|e| e.to_string())?;
+    write_generated(&mut db, series, &batch)?;
     let ingest = t0.elapsed();
     let t1 = Instant::now();
     db.save(&path).map_err(|e| e.to_string())?;
@@ -99,40 +122,31 @@ fn cmd_seed(args: &[String]) -> Result<(), String> {
 }
 
 fn cmd_ingest(args: &[String]) -> Result<(), String> {
+    validate_options(args, 1, &["--series", "--file"], &[])?;
     let path = db_arg(args)?;
     let series = require_flag(args, "--series")?;
     let file = require_flag(args, "--file")?;
-    let text = fs::read_to_string(file).map_err(|e| format!("read {file}: {e}"))?;
+    const MAX_CSV_BYTES: u64 = 64 * 1024 * 1024;
+    let input = fs::File::open(file).map_err(|e| format!("open {file}: {e}"))?;
+    let meta = input.metadata().map_err(|e| format!("stat {file}: {e}"))?;
+    if !meta.is_file() || meta.len() > MAX_CSV_BYTES {
+        return Err(format!(
+            "input must be a regular CSV file of at most {MAX_CSV_BYTES} bytes"
+        ));
+    }
+    let mut text = String::new();
+    input
+        .take(MAX_CSV_BYTES + 1)
+        .read_to_string(&mut text)
+        .map_err(|e| format!("read {file}: {e}"))?;
+    if text.len() as u64 > MAX_CSV_BYTES {
+        return Err(format!("CSV exceeds {MAX_CSV_BYTES} byte limit"));
+    }
+    let points = parse_ingest_csv(&text)?;
 
     let mut db = Db::load_or_new(&path).map_err(|e| e.to_string())?;
     let before = db.point_count();
     let t0 = Instant::now();
-    let mut points = Vec::new();
-    for (lineno, line) in text.lines().enumerate() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let fields: Vec<&str> = line
-            .split(|c: char| c == ',' || c == '\t' || c.is_whitespace())
-            .filter(|s| !s.is_empty())
-            .collect();
-        if fields.len() < 2 {
-            continue;
-        }
-        let (ts, value) = match (fields[0].parse::<i64>(), fields[1].parse::<f64>()) {
-            (Ok(ts), Ok(value)) => (ts, value),
-            _ if lineno == 0 => continue, // header row
-            _ => {
-                return Err(format!(
-                    "line {}: expected integer_ms,value (got {:?})",
-                    lineno + 1,
-                    line
-                ));
-            }
-        };
-        points.push(shrunk::Point { ts, value });
-    }
     // One atomic batch: a duplicate or out-of-order line cannot leave a
     // partially ingested file behind.
     db.write_many(series, &points).map_err(|e| e.to_string())?;
@@ -150,6 +164,15 @@ fn cmd_ingest(args: &[String]) -> Result<(), String> {
 }
 
 fn cmd_query(args: &[String]) -> Result<(), String> {
+    validate_options(
+        args,
+        1,
+        &[
+            "--series", "--from", "--to", "--agg", "--limit", "--gt", "--ge", "--lt", "--le",
+            "--eq", "--ne",
+        ],
+        &["--csv", "--explain"],
+    )?;
     let path = db_arg(args)?;
     let series = require_flag(args, "--series")?;
     let from: i64 = number(flag(args, "--from"), "--from", i64::MIN)?;
@@ -206,6 +229,7 @@ fn cmd_query(args: &[String]) -> Result<(), String> {
 }
 
 fn cmd_stats(args: &[String]) -> Result<(), String> {
+    validate_options(args, 1, &[], &[])?;
     let path = db_arg(args)?;
     let db = Db::open(&path).map_err(|e| e.to_string())?;
     let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
@@ -215,11 +239,14 @@ fn cmd_stats(args: &[String]) -> Result<(), String> {
 }
 
 fn cmd_bench(args: &[String]) -> Result<(), String> {
+    validate_options(args, 0, &["--points", "--pattern", "--block-size"], &[])?;
     let points: usize = number(flag(args, "--points"), "--points", 1_000_000)?;
+    require_positive(points, "--points")?;
     let pattern_s = flag(args, "--pattern").unwrap_or("cpu");
     let pattern =
         Pattern::parse(pattern_s).ok_or_else(|| format!("unknown pattern {pattern_s:?}"))?;
     let block_size: usize = number(flag(args, "--block-size"), "--block-size", 1024)?;
+    require_positive(block_size, "--block-size")?;
     let series = "bench";
     let start = 1_700_000_000_000i64;
     let interval = 1000i64;
@@ -230,7 +257,7 @@ fn cmd_bench(args: &[String]) -> Result<(), String> {
     let batch = generate(pattern, points, start, interval);
     let mut db = Db::with_block_size(block_size);
     let t0 = Instant::now();
-    db.write_many(series, &batch).map_err(|e| e.to_string())?;
+    write_generated(&mut db, series, &batch)?;
     let ingest = t0.elapsed();
     let t1 = Instant::now();
     db.save(&path).map_err(|e| e.to_string())?;
@@ -302,8 +329,11 @@ fn cmd_bench(args: &[String]) -> Result<(), String> {
 }
 
 fn cmd_codec_bench(args: &[String]) -> Result<(), String> {
+    validate_options(args, 0, &["--points", "--block-size"], &[])?;
     let points: usize = number(flag(args, "--points"), "--points", 1_000_000)?;
+    require_positive(points, "--points")?;
     let block_size: usize = number(flag(args, "--block-size"), "--block-size", 1024)?;
+    require_positive(block_size, "--block-size")?;
     let start = 1_700_000_000_000i64;
     let interval = 1000i64;
     let patterns = [
@@ -447,8 +477,22 @@ fn variance_segments(
 }
 
 fn cmd_segment_bench(args: &[String]) -> Result<(), String> {
+    validate_options(
+        args,
+        0,
+        &[
+            "--points",
+            "--block-size",
+            "--min-seg",
+            "--max-seg",
+            "--lz-variance",
+        ],
+        &[],
+    )?;
     let points: usize = number(flag(args, "--points"), "--points", 1_000_000)?;
+    require_positive(points, "--points")?;
     let block_size: usize = number(flag(args, "--block-size"), "--block-size", 1024)?;
+    require_positive(block_size, "--block-size")?;
     let min_seg: usize = number(flag(args, "--min-seg"), "--min-seg", 128)?;
     let max_seg: usize = number(flag(args, "--max-seg"), "--max-seg", 4096)?;
     let threshold: f64 = number(flag(args, "--lz-variance"), "--lz-variance", 16.0)?;
@@ -514,7 +558,9 @@ fn cmd_segment_bench(args: &[String]) -> Result<(), String> {
 }
 
 fn cmd_demo(args: &[String]) -> Result<(), String> {
+    validate_options(args, 0, &["--points"], &[])?;
     let points: usize = number(flag(args, "--points"), "--points", 200_000)?;
+    require_positive(points, "--points")?;
     let path = temp_path("demo");
     let _ = fs::remove_file(&path);
 
@@ -530,7 +576,7 @@ fn cmd_demo(args: &[String]) -> Result<(), String> {
     let t0 = Instant::now();
     for (name, pattern) in specs {
         let batch = generate(pattern, points, start, interval);
-        db.write_many(name, &batch).map_err(|e| e.to_string())?;
+        write_generated(&mut db, name, &batch)?;
     }
     let ingest = t0.elapsed();
     db.save(&path).map_err(|e| e.to_string())?;
@@ -709,6 +755,115 @@ fn db_arg(args: &[String]) -> Result<PathBuf, String> {
         .ok_or_else(|| "missing database path".to_string())
 }
 
+/// Parse the intentionally small numeric CSV format used by `ingest`.
+/// Blank lines and comment lines are ignored; a single conventional header is
+/// accepted only as the first non-comment record. Every data row must contain
+/// exactly two comma-separated fields.
+fn parse_ingest_csv(text: &str) -> Result<Vec<Point>, String> {
+    const MAX_CSV_POINTS: usize = 1_000_000;
+    let mut points = Vec::new();
+    let mut first_record = true;
+    for (index, raw_line) in text.lines().enumerate() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if first_record {
+            first_record = false;
+            if line == "timestamp,value" {
+                continue;
+            }
+        }
+        let fields: Vec<&str> = line.split(',').collect();
+        if fields.len() != 2 {
+            return Err(format!(
+                "line {}: expected exactly two CSV fields: integer_ms,value (got {:?})",
+                index + 1,
+                line
+            ));
+        }
+        let ts_text = fields[0].trim();
+        let value_text = fields[1].trim();
+        let ts = ts_text.parse::<i64>().map_err(|_| {
+            format!(
+                "line {}: invalid integer timestamp {:?}",
+                index + 1,
+                ts_text
+            )
+        })?;
+        let value = value_text
+            .parse::<f64>()
+            .map_err(|_| format!("line {}: invalid numeric value {:?}", index + 1, value_text))?;
+        if points.len() >= MAX_CSV_POINTS {
+            return Err(format!(
+                "line {}: CSV exceeds {MAX_CSV_POINTS} point limit",
+                index + 1
+            ));
+        }
+        if points.len() == points.capacity() {
+            points
+                .try_reserve(1024)
+                .map_err(|_| format!("line {}: CSV allocation failed", index + 1))?;
+        }
+        points.push(Point { ts, value });
+    }
+    Ok(points)
+}
+
+/// Ensure command arguments contain only declared positional arguments and
+/// options, and reject repeated, missing, or valueless option arguments.
+fn validate_options(
+    args: &[String],
+    positional_count: usize,
+    valued: &[&str],
+    switches: &[&str],
+) -> Result<(), String> {
+    if args.len() < positional_count {
+        return Err("missing database path".into());
+    }
+    for (index, arg) in args.iter().take(positional_count).enumerate() {
+        if arg.starts_with('-') {
+            return Err(format!(
+                "unexpected option {arg:?} where positional argument {} is required",
+                index + 1
+            ));
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut index = positional_count;
+    while index < args.len() {
+        let option = &args[index];
+        if !option.starts_with('-') {
+            return Err(format!("unexpected positional argument {option:?}"));
+        }
+        if !seen.insert(option.as_str()) {
+            return Err(format!("option {option} specified more than once"));
+        }
+        if valued.contains(&option.as_str()) {
+            let value = args
+                .get(index + 1)
+                .ok_or_else(|| format!("missing value for {option}"))?;
+            if value.starts_with("--") {
+                return Err(format!("missing value for {option}"));
+            }
+            index += 2;
+        } else if switches.contains(&option.as_str()) {
+            index += 1;
+        } else {
+            return Err(format!("unknown option {option}"));
+        }
+    }
+    Ok(())
+}
+
+fn require_positive(value: usize, name: &str) -> Result<(), String> {
+    if value == 0 {
+        Err(format!("{name} must be greater than zero"))
+    } else {
+        Ok(())
+    }
+}
+
 fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
     args.iter()
         .position(|a| a == name)
@@ -757,7 +912,73 @@ fn human_bytes(n: u64) -> String {
 }
 
 fn temp_path(tag: &str) -> PathBuf {
+    static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
     let mut p = env::temp_dir();
-    p.push(format!("shrunk-{tag}-{}.db", std::process::id()));
+    p.push(format!(
+        "shrunk-{tag}-{}-{nanos}-{}.db",
+        std::process::id(),
+        TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
     p
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    fn strings(items: &[&str]) -> Vec<String> {
+        items.iter().map(|item| (*item).to_string()).collect()
+    }
+
+    #[test]
+    fn ingest_csv_accepts_header_and_reports_physical_line_numbers() {
+        let points = parse_ingest_csv("# generated\ntimestamp,value\n10,1.25\n11,-2\n").unwrap();
+        assert_eq!(points, vec![Point::new(10, 1.25), Point::new(11, -2.0)]);
+
+        let err = parse_ingest_csv("timestamp,value\n10,1\n11,2,extra\n").unwrap_err();
+        assert!(err.contains("line 3"), "{err}");
+    }
+
+    #[test]
+    fn ingest_csv_rejects_missing_fields_and_non_header_text() {
+        let err = parse_ingest_csv("timestamp,value\n12\n").unwrap_err();
+        assert!(err.contains("line 2"), "{err}");
+        let err = parse_ingest_csv("oops\n12,3\n").unwrap_err();
+        assert!(err.contains("line 1"), "{err}");
+        assert!(parse_ingest_csv("1,2\t3\n").is_err());
+    }
+
+    #[test]
+    fn cli_rejects_unknown_duplicate_and_missing_options() {
+        assert!(
+            validate_options(&strings(&["db", "--wat"]), 1, &["--series"], &[])
+                .unwrap_err()
+                .contains("unknown option")
+        );
+        assert!(
+            validate_options(&strings(&["db", "--series"]), 1, &["--series"], &[])
+                .unwrap_err()
+                .contains("missing value")
+        );
+        assert!(validate_options(
+            &strings(&["db", "--series", "x", "--series", "y"]),
+            1,
+            &["--series"],
+            &[]
+        )
+        .unwrap_err()
+        .contains("more than once"));
+    }
+
+    #[test]
+    fn benchmark_rejects_empty_workloads() {
+        assert!(require_positive(0, "--points")
+            .unwrap_err()
+            .contains("greater than zero"));
+        assert!(require_positive(4, "--points").is_ok());
+    }
 }

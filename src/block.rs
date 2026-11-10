@@ -3,7 +3,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
 
-use crate::codec::{dolphin_skip_rate, predictor_is_promising, Codec};
+use crate::codec::{dolphin_skip_rate, predictor_is_promising, Codec, MAX_DECODE_POINTS};
 use crate::crc::crc32;
 use crate::Point;
 
@@ -16,7 +16,7 @@ pub const BLOCK_HEADER_BYTES: usize = 54;
 /// Upper bounds used when parsing untrusted files. They are deliberately
 /// generous for real workloads but stop a corrupt length field from causing
 /// unbounded allocation.
-pub const MAX_BLOCK_POINTS: u32 = 1_048_576;
+pub const MAX_BLOCK_POINTS: u32 = MAX_DECODE_POINTS as u32;
 pub const MAX_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 
 /// Where a block's compressed bytes live.
@@ -48,9 +48,18 @@ impl Payload {
     /// decoded, which keeps open and query memory bounded.
     pub fn bytes(&self) -> Result<Vec<u8>, String> {
         match self {
-            Payload::Memory(bytes) => Ok(bytes.clone()),
+            Payload::Memory(bytes) => {
+                let mut copy = Vec::new();
+                copy.try_reserve_exact(bytes.len())
+                    .map_err(|e| format!("cannot allocate {} payload bytes: {e}", bytes.len()))?;
+                copy.extend_from_slice(bytes);
+                Ok(copy)
+            }
             Payload::File { file, offset, len } => {
-                let mut buf = vec![0u8; *len as usize];
+                let mut buf = Vec::new();
+                buf.try_reserve_exact(*len as usize)
+                    .map_err(|e| format!("cannot allocate {len} payload bytes: {e}"))?;
+                buf.resize(*len as usize, 0);
                 read_at(file, *offset, &mut buf)?;
                 Ok(buf)
             }
@@ -240,6 +249,7 @@ impl Block {
     }
 
     pub fn decode(&self) -> Result<Vec<Point>, String> {
+        self.validate_meta()?;
         let points = self.payload.with_bytes(|bytes| {
             if let Some(expected) = self.payload_crc {
                 let actual = crc32(bytes);

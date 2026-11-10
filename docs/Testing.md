@@ -11,8 +11,13 @@ The suite covers bit-level IO, round trips for every codec (including NaN,
 infinities, -0.0, and negative timestamps), randomized round trips, codec-id
 stability, codec selection, time and value block skipping, aggregate results
 checked against a naive fold, limits, persistence, append after reopen, lazy
-payload checksums, v1/v2 migration, atomic batches, WAL recovery, torn WAL
-tails, idempotent replay after a checkpoint, and snapshot-safe readers.
+payload checksums, v1/v2 migration, atomic batches, WAL recovery, short length
+prefix repair, rejection of ambiguous truncation and corrupt lengths,
+idempotent replay after a checkpoint, and snapshot-safe readers. Bounded
+synthetic cases also cover float-bit preservation, varint boundaries, sparse
+WALs, WAL symlinks and permissions, writer locking, stale destination WALs,
+and injected snapshot failures before write, sync, rename, directory sync,
+and WAL truncation.
 
 Run one test while iterating:
 
