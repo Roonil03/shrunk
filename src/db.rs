@@ -841,7 +841,12 @@ impl Db {
             hook(SaveStage::Rename)?;
             fs::rename(&tmp, path)?;
             hook(SaveStage::DirectorySync)?;
+            // Opening and syncing a directory is a Unix operation. On other
+            // platforms rename alone is the durability boundary.
+            #[cfg(unix)]
             File::open(parent)?.sync_all()?;
+            #[cfg(not(unix))]
+            let _ = parent;
             Ok(())
         })();
         if write_result.is_err() {

@@ -659,19 +659,25 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn wal_creation_is_private_and_symlinks_are_rejected() {
-        use std::os::unix::fs::{symlink, PermissionsExt};
+        use std::os::unix::fs::PermissionsExt;
         let path = test_path("permissions");
-        let link = test_path("symlink");
         remove(&path);
-        remove(&link);
         drop(Wal::open(&path, 64).unwrap());
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
-        symlink(&path, &link).unwrap();
-        assert!(Wal::open(&link, 64).is_err());
-        remove(&link);
+        // O_NOFOLLOW is only set on Linux and Android, so the symlink check
+        // only applies there.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            use std::os::unix::fs::symlink;
+            let link = test_path("symlink");
+            remove(&link);
+            symlink(&path, &link).unwrap();
+            assert!(Wal::open(&link, 64).is_err());
+            remove(&link);
+        }
         remove(&path);
     }
 
