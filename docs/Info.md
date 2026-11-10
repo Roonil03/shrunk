@@ -183,11 +183,12 @@ Each batch is fsynced before the in-memory series is updated. WAL version 1
 framing and codec IDs are unchanged. Replay repairs only a terminal fragment
 shorter than the four-byte length prefix. Other damage errors out and is
 preserved. WAL creation uses mode `0600` on Unix; reads and writes reject
-non-regular WAL files and final-component symlinks on Linux/Android. Recovery
-and appends have a 1 GiB WAL size ceiling. A checkpoint writes a snapshot, then truncates the WAL; replay skips
-points already present in the snapshot, so a crash between those two steps is
-safe. Readers that already opened a snapshot keep the old inode across a
-checkpoint rename and continue to see a stable view.
+non-regular WAL files and final-component symlinks on Linux, Android, and
+Darwin targets. Recovery and appends have a 1 GiB WAL size ceiling. A
+checkpoint writes a snapshot, then truncates the WAL; replay skips points
+already present in the snapshot, so a crash between those two steps is safe.
+Readers that already opened a snapshot keep the old inode across a checkpoint
+rename and continue to see a stable view.
 
 ## See also
 

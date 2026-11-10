@@ -913,7 +913,7 @@ impl Db {
             Some(db.block_size)
         } else {
             match wal_path.symlink_metadata() {
-                Ok(meta) if meta.len() > 0 => None,
+                Ok(meta) if meta.len() >= wal::WAL_HEADER_BYTES => None,
                 Ok(_) => Some(db.block_size),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(db.block_size),
                 Err(e) => return Err(e.into()),
@@ -1047,7 +1047,7 @@ fn replay_wal_into(db: &mut Db, wal_path: &Path) -> Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e.into()),
     };
-    if len == 0 {
+    if len < wal::WAL_HEADER_BYTES {
         return Ok(());
     }
     let block_size = wal::read_block_size(wal_path)?;
@@ -1063,7 +1063,7 @@ fn replay_wal_into(db: &mut Db, wal_path: &Path) -> Result<()> {
 }
 
 fn recover_from_wal(wal_path: &Path) -> Result<Db> {
-    if wal_path.symlink_metadata()?.len() == 0 {
+    if wal_path.symlink_metadata()?.len() < wal::WAL_HEADER_BYTES {
         return Ok(Db::new());
     }
     let block_size = wal::read_block_size(wal_path)?;
@@ -1888,6 +1888,31 @@ mod tests {
         assert!(Db::open_rw(&alias).is_err());
         fs::remove_file(&alias).unwrap();
         fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn partial_wal_header_does_not_block_open() {
+        let path =
+            std::env::temp_dir().join(format!("shrunk-partial-wal-{}.db", std::process::id()));
+        let wal_path = wal::wal_path(&path);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&wal_path);
+        let mut db = Db::new();
+        db.write("s", 1, 1.0).unwrap();
+        db.save(&path).unwrap();
+        fs::write(&wal_path, b"SHRUNKWL").unwrap();
+
+        let read = Db::open(&path).unwrap();
+        assert_eq!(read.point_count(), 1);
+
+        let mut rw = Db::open_rw(&path).unwrap();
+        rw.append("s", &[Point { ts: 2, value: 2.0 }]).unwrap();
+        drop(rw);
+        let read = Db::open(&path).unwrap();
+        assert_eq!(read.point_count(), 2);
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&wal_path);
     }
 
     #[test]

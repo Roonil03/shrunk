@@ -59,11 +59,23 @@ notes:
 "
 }
 
+const GENERATED_BATCH_POINTS: usize = 1_000_000;
+const MAX_GENERATED_POINTS: usize = 16_000_000;
+
 fn write_generated(db: &mut Db, series: &str, points: &[Point]) -> Result<(), String> {
-    for chunk in points.chunks(1_000_000) {
+    for chunk in points.chunks(GENERATED_BATCH_POINTS) {
         db.write_many(series, chunk).map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+fn points_arg(args: &[String], default: usize) -> Result<usize, String> {
+    let points: usize = number(flag(args, "--points"), "--points", default)?;
+    require_positive(points, "--points")?;
+    if points > MAX_GENERATED_POINTS {
+        return Err(format!("--points must be at most {MAX_GENERATED_POINTS}"));
+    }
+    Ok(points)
 }
 
 fn cmd_seed(args: &[String]) -> Result<(), String> {
@@ -92,7 +104,7 @@ fn cmd_seed(args: &[String]) -> Result<(), String> {
     let pattern = Pattern::parse(pattern_s).ok_or_else(|| {
         format!("unknown pattern {pattern_s:?} (cpu, counter, constant, noise, saw, oscillating)")
     })?;
-    let points: usize = number(flag(args, "--points"), "--points", 100_000)?;
+    let points = points_arg(args, 100_000)?;
     let interval: i64 = number(flag(args, "--interval"), "--interval", 1000)?;
     let start: i64 = number(flag(args, "--start"), "--start", 1_700_000_000_000)?;
     let block_size: usize = number(flag(args, "--block-size"), "--block-size", 1024)?;
@@ -240,8 +252,7 @@ fn cmd_stats(args: &[String]) -> Result<(), String> {
 
 fn cmd_bench(args: &[String]) -> Result<(), String> {
     validate_options(args, 0, &["--points", "--pattern", "--block-size"], &[])?;
-    let points: usize = number(flag(args, "--points"), "--points", 1_000_000)?;
-    require_positive(points, "--points")?;
+    let points = points_arg(args, 1_000_000)?;
     let pattern_s = flag(args, "--pattern").unwrap_or("cpu");
     let pattern =
         Pattern::parse(pattern_s).ok_or_else(|| format!("unknown pattern {pattern_s:?}"))?;
@@ -330,8 +341,7 @@ fn cmd_bench(args: &[String]) -> Result<(), String> {
 
 fn cmd_codec_bench(args: &[String]) -> Result<(), String> {
     validate_options(args, 0, &["--points", "--block-size"], &[])?;
-    let points: usize = number(flag(args, "--points"), "--points", 1_000_000)?;
-    require_positive(points, "--points")?;
+    let points = points_arg(args, 1_000_000)?;
     let block_size: usize = number(flag(args, "--block-size"), "--block-size", 1024)?;
     require_positive(block_size, "--block-size")?;
     let start = 1_700_000_000_000i64;
@@ -489,8 +499,7 @@ fn cmd_segment_bench(args: &[String]) -> Result<(), String> {
         ],
         &[],
     )?;
-    let points: usize = number(flag(args, "--points"), "--points", 1_000_000)?;
-    require_positive(points, "--points")?;
+    let points = points_arg(args, 1_000_000)?;
     let block_size: usize = number(flag(args, "--block-size"), "--block-size", 1024)?;
     require_positive(block_size, "--block-size")?;
     let min_seg: usize = number(flag(args, "--min-seg"), "--min-seg", 128)?;
@@ -559,8 +568,7 @@ fn cmd_segment_bench(args: &[String]) -> Result<(), String> {
 
 fn cmd_demo(args: &[String]) -> Result<(), String> {
     validate_options(args, 0, &["--points"], &[])?;
-    let points: usize = number(flag(args, "--points"), "--points", 200_000)?;
-    require_positive(points, "--points")?;
+    let points = points_arg(args, 200_000)?;
     let path = temp_path("demo");
     let _ = fs::remove_file(&path);
 
@@ -774,16 +782,17 @@ fn parse_ingest_csv(text: &str) -> Result<Vec<Point>, String> {
                 continue;
             }
         }
-        let fields: Vec<&str> = line.split(',').collect();
-        if fields.len() != 2 {
-            return Err(format!(
-                "line {}: expected exactly two CSV fields: integer_ms,value (got {:?})",
-                index + 1,
-                line
-            ));
-        }
-        let ts_text = fields[0].trim();
-        let value_text = fields[1].trim();
+        let mut fields = line.split(',');
+        let (ts_text, value_text) = match (fields.next(), fields.next(), fields.next()) {
+            (Some(ts), Some(value), None) => (ts.trim(), value.trim()),
+            _ => {
+                return Err(format!(
+                    "line {}: expected exactly two CSV fields: integer_ms,value (got {:?})",
+                    index + 1,
+                    line
+                ))
+            }
+        };
         let ts = ts_text.parse::<i64>().map_err(|_| {
             format!(
                 "line {}: invalid integer timestamp {:?}",
@@ -980,5 +989,17 @@ mod cli_tests {
             .unwrap_err()
             .contains("greater than zero"));
         assert!(require_positive(4, "--points").is_ok());
+    }
+
+    #[test]
+    fn generated_points_are_capped() {
+        let too_many = (MAX_GENERATED_POINTS + 1).to_string();
+        let args = strings(&["--points", too_many.as_str()]);
+        assert!(points_arg(&args, 1_000).unwrap_err().contains("at most"));
+        assert!(points_arg(&strings(&["--points", "0"]), 1_000).is_err());
+        assert_eq!(
+            points_arg(&strings(&["--points", "1000"]), 10).unwrap(),
+            1000
+        );
     }
 }
