@@ -61,7 +61,7 @@ impl BitWriter {
 }
 
 pub struct BitReader<'a> {
-    buf: &'a [u8],
+    pub(crate) buf: &'a [u8],
     bit: usize,
     overrun: bool,
 }

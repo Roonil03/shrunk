@@ -17,6 +17,30 @@
 use crate::bits::{BitReader, BitWriter};
 use crate::Point;
 
+/// Keep public codec decoding bounded even when called outside `Block`.
+pub(crate) const MAX_DECODE_POINTS: usize = 1_048_576;
+
+fn point_vec(capacity: usize, codec: &str) -> Result<Vec<Point>, String> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(capacity)
+        .map_err(|e| format!("{codec}: cannot allocate output for {capacity} points: {e}"))?;
+    Ok(out)
+}
+
+fn value_vec(capacity: usize, codec: &str) -> Result<Vec<f64>, String> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(capacity)
+        .map_err(|e| format!("{codec}: cannot allocate values for {capacity} points: {e}"))?;
+    Ok(out)
+}
+
+fn timestamp_vec(capacity: usize, codec: &str) -> Result<Vec<i64>, String> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(capacity)
+        .map_err(|e| format!("{codec}: cannot allocate timestamps for {capacity} points: {e}"))?;
+    Ok(out)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(u8)]
 pub enum Codec {
@@ -45,14 +69,13 @@ impl Codec {
     ];
 
     /// Order matters: on a size tie the earlier codec wins.
-    pub const CANDIDATES: [Codec; 7] = [
+    pub const CANDIDATES: [Codec; 6] = [
         Codec::GorillaRle,
         Codec::Dolphin,
         Codec::Predictor,
         Codec::Gorilla,
         Codec::Delta,
         Codec::Rle,
-        Codec::Raw,
     ];
 
     pub fn from_u8(v: u8) -> Option<Codec> {
@@ -98,7 +121,20 @@ impl Codec {
 
     pub fn decode(self, bytes: &[u8], count: usize) -> Result<Vec<Point>, String> {
         if count == 0 {
-            return Ok(Vec::new());
+            return if bytes.is_empty() {
+                Ok(Vec::new())
+            } else {
+                Err(format!(
+                    "{}: payload for zero points is not empty",
+                    self.name()
+                ))
+            };
+        }
+        if count > MAX_DECODE_POINTS {
+            return Err(format!(
+                "{}: point count {count} exceeds limit {MAX_DECODE_POINTS}",
+                self.name()
+            ));
         }
         match self {
             Codec::Raw => raw_decode(bytes, count),
@@ -131,7 +167,7 @@ fn raw_decode(bytes: &[u8], count: usize) -> Result<Vec<Point>, String> {
             bytes.len()
         ));
     }
-    let mut out = Vec::with_capacity(count);
+    let mut out = point_vec(count, "raw")?;
     for i in 0..count {
         let off = i * 16;
         let ts = i64::from_le_bytes(bytes[off..off + 8].try_into().unwrap());
@@ -252,7 +288,7 @@ fn gorilla_decode(bytes: &[u8], count: usize) -> Result<Vec<Point>, String> {
     let mut r = BitReader::new(bytes);
     let ts0 = r.read_bits(64) as i64;
     let v0 = f64::from_bits(r.read_bits(64));
-    let mut out = Vec::with_capacity(count);
+    let mut out = point_vec(count, "gorilla")?;
     out.push(Point { ts: ts0, value: v0 });
     if count == 1 {
         check_bit_padding(&r, bytes.len())?;
@@ -314,6 +350,13 @@ fn check_bit_padding(r: &BitReader<'_>, byte_len: usize) -> Result<(), String> {
             (total - consumed) / 8
         ));
     }
+    let padding_bits = total - consumed;
+    if padding_bits > 0 {
+        let mask = (1u8 << padding_bits) - 1;
+        if r.buf[byte_len - 1] & mask != 0 {
+            return Err("gorilla: nonzero padding bits".to_string());
+        }
+    }
     Ok(())
 }
 
@@ -365,7 +408,7 @@ fn decode_ts_rle(
     codec: &str,
 ) -> Result<Vec<i64>, String> {
     let ts0 = unzigzag(get_uvarint(bytes, pos)?);
-    let mut timestamps = Vec::with_capacity(count);
+    let mut timestamps = timestamp_vec(count, codec)?;
     timestamps.push(ts0);
 
     if count >= 2 {
@@ -379,7 +422,8 @@ fn decode_ts_rle(
         for _ in 0..run_count {
             let dod = unzigzag(get_uvarint(bytes, pos)?);
             let len = get_uvarint(bytes, pos)?;
-            if len == 0 || timestamps.len() as u64 + len > count as u64 {
+            let remaining = count - timestamps.len();
+            if len == 0 || len > remaining as u64 {
                 return Err(format!("{codec}: timestamp runs exceed point count"));
             }
             for _ in 0..len {
@@ -422,7 +466,7 @@ fn gorilla_rle_decode(bytes: &[u8], count: usize) -> Result<Vec<Point>, String> 
         return Err("gorilla-rle: missing value stream".to_string());
     }
     let values = gorilla_values_decode(&bytes[pos..], count)?;
-    let mut out = Vec::with_capacity(count);
+    let mut out = point_vec(count, "gorilla-rle")?;
     for (ts, value) in timestamps.into_iter().zip(values) {
         out.push(Point { ts, value });
     }
@@ -431,7 +475,7 @@ fn gorilla_rle_decode(bytes: &[u8], count: usize) -> Result<Vec<Point>, String> 
 
 fn gorilla_values_decode(bytes: &[u8], count: usize) -> Result<Vec<f64>, String> {
     let mut r = BitReader::new(bytes);
-    let mut out = Vec::with_capacity(count);
+    let mut out = value_vec(count, "gorilla values")?;
     let mut prev_bits = r.read_bits(64);
     out.push(f64::from_bits(prev_bits));
     let mut window: Option<(u32, u32)> = None;
@@ -598,7 +642,7 @@ fn dolphin_decode(bytes: &[u8], count: usize) -> Result<Vec<Point>, String> {
         return Err("dolphin: missing value stream".to_string());
     }
     let mut r = BitReader::new(&bytes[pos..]);
-    let mut values = Vec::with_capacity(count);
+    let mut values = value_vec(count, "dolphin")?;
     let mut prev_bits = r.read_bits(64);
     values.push(f64::from_bits(prev_bits));
     let mut window: Option<(u32, u32)> = None;
@@ -609,7 +653,7 @@ fn dolphin_decode(bytes: &[u8], count: usize) -> Result<Vec<Point>, String> {
     }
     check_bit_padding(&r, bytes.len() - pos)?;
 
-    let mut out = Vec::with_capacity(count);
+    let mut out = point_vec(count, "dolphin")?;
     for (ts, value) in timestamps.into_iter().zip(values) {
         out.push(Point { ts, value });
     }
@@ -697,7 +741,7 @@ fn predictor_decode(bytes: &[u8], count: usize) -> Result<Vec<Point>, String> {
     }
     let mut r = BitReader::new(&bytes[pos..]);
     let mut prev = r.read_bits(64);
-    let mut values = Vec::with_capacity(count);
+    let mut values = value_vec(count, "predictor")?;
     values.push(f64::from_bits(prev));
 
     let mut fcm = vec![0u64; PREDICTOR_TABLE_SIZE];
@@ -727,7 +771,7 @@ fn predictor_decode(bytes: &[u8], count: usize) -> Result<Vec<Point>, String> {
     }
     check_bit_padding(&r, bytes.len() - pos)?;
 
-    let mut out = Vec::with_capacity(count);
+    let mut out = point_vec(count, "predictor")?;
     for (ts, value) in timestamps.into_iter().zip(values) {
         out.push(Point { ts, value });
     }
@@ -746,6 +790,8 @@ fn delta_encode(points: &[Point]) -> Option<Vec<u8>> {
         if !p.value.is_finite()
             || p.value.fract() != 0.0
             || !(p.value >= -I64_LIMIT && p.value < I64_LIMIT)
+            // Integer conversion would canonicalize negative zero to +0.
+            || p.value.to_bits() == (-0.0f64).to_bits()
         {
             return None;
         }
@@ -769,7 +815,7 @@ fn delta_decode(bytes: &[u8], count: usize) -> Result<Vec<Point>, String> {
     let mut pos = 0usize;
     let mut ts = unzigzag(get_uvarint(bytes, &mut pos)?);
     let mut val = unzigzag(get_uvarint(bytes, &mut pos)?);
-    let mut out = Vec::with_capacity(count);
+    let mut out = point_vec(count, "delta-varint")?;
     out.push(Point {
         ts,
         value: val as f64,
@@ -809,22 +855,26 @@ fn put_uvarint(out: &mut Vec<u8>, mut v: u64) {
 
 fn get_uvarint(bytes: &[u8], pos: &mut usize) -> Result<u64, String> {
     let mut v = 0u64;
-    let mut shift = 0u32;
-    loop {
+    for index in 0..10 {
         if *pos >= bytes.len() {
             return Err("varint truncated".to_string());
         }
         let b = bytes[*pos];
         *pos += 1;
-        v |= ((b & 0x7f) as u64) << shift;
-        if b & 0x80 == 0 {
-            return Ok(v);
-        }
-        shift += 7;
-        if shift >= 64 {
+        // A u64 has only one payload bit in its tenth byte. Rejecting excess
+        // high bits avoids silent truncation in shifts at bit 63.
+        if index == 9 && b > 1 {
             return Err("varint overflow".to_string());
         }
+        v |= ((b & 0x7f) as u64) << (index * 7);
+        if b & 0x80 == 0 {
+            if index > 0 && b == 0 {
+                return Err("varint is not minimally encoded".to_string());
+            }
+            return Ok(v);
+        }
     }
+    Err("varint overflow".to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -873,18 +923,21 @@ fn rle_decode(bytes: &[u8], count: usize) -> Result<Vec<Point>, String> {
     if run_count > count as u64 {
         return Err("rle: more runs than points".to_string());
     }
-    let mut out = Vec::with_capacity(count);
+    let mut out = point_vec(count, "rle")?;
     let mut prev_start = 0i64;
     for _ in 0..run_count {
         let start = prev_start.wrapping_add(unzigzag(get_uvarint(bytes, &mut pos)?));
         prev_start = start;
         let step = unzigzag(get_uvarint(bytes, &mut pos)?);
         let len = get_uvarint(bytes, &mut pos)?;
-        if pos + 8 > bytes.len() {
+        let value_end = pos
+            .checked_add(8)
+            .ok_or_else(|| "rle: value offset overflow".to_string())?;
+        if value_end > bytes.len() {
             return Err("rle: truncated value".to_string());
         }
-        let bits = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap());
-        pos += 8;
+        let bits = u64::from_le_bytes(bytes[pos..value_end].try_into().unwrap());
+        pos = value_end;
         let value = f64::from_bits(bits);
         let remaining = count
             .checked_sub(out.len())
@@ -1100,6 +1153,89 @@ mod tests {
         }
         for x in [i64::MIN, -1000, -1, 0, 1, 1000, i64::MAX] {
             assert_eq!(unzigzag(zigzag(x)), x);
+        }
+    }
+
+    #[test]
+    fn varints_reject_overflow_and_noncanonical_forms() {
+        for bad in [
+            vec![0xff; 9].into_iter().chain([0x02]).collect::<Vec<_>>(),
+            vec![0xff; 10],
+            vec![0x80, 0x00],
+        ] {
+            let mut pos = 0;
+            assert!(get_uvarint(&bad, &mut pos).is_err(), "accepted {bad:?}");
+        }
+        let mut pos = 0;
+        assert_eq!(
+            get_uvarint(
+                &[0xff; 9].into_iter().chain([1]).collect::<Vec<_>>(),
+                &mut pos
+            )
+            .unwrap(),
+            u64::MAX
+        );
+        assert!(Codec::Delta
+            .decode(
+                &[0xff; 9].into_iter().chain([2, 0, 0]).collect::<Vec<_>>(),
+                1
+            )
+            .is_err());
+        assert!(Codec::Delta.decode(&[0x80, 0, 0], 1).is_err());
+    }
+
+    #[test]
+    fn public_decode_rejects_unbounded_counts_and_nonempty_empty_frames() {
+        assert!(Codec::Raw.decode(&[], MAX_DECODE_POINTS + 1).is_err());
+        assert!(Codec::Raw.decode(&[0], 0).is_err());
+    }
+
+    #[test]
+    fn gorilla_rejects_nonzero_padding() {
+        let points = [Point { ts: 10, value: 1.0 }, Point { ts: 11, value: 1.0 }];
+        let mut bytes = Codec::Gorilla.encode(&points).unwrap();
+        assert_ne!(bytes.last().unwrap() & 1, 1);
+        *bytes.last_mut().unwrap() |= 1;
+        assert!(Codec::Gorilla.decode(&bytes, points.len()).is_err());
+    }
+
+    /// The source points are the independent oracle: codec round trips must
+    /// preserve timestamps and all 64 value bits, including NaN payloads and
+    /// signed zero. The fixed corpus is intentionally small and deterministic.
+    #[test]
+    fn bounded_codec_oracle_preserves_every_float_bit() {
+        let value_bits = [
+            0x0000_0000_0000_0000,
+            0x8000_0000_0000_0000,
+            0x7ff0_0000_0000_0000,
+            0xfff0_0000_0000_0000,
+            0x7ff8_0000_0000_0042,
+            0x0000_0000_0000_0001,
+            0x3ff0_0000_0000_0001,
+            0xbff0_0000_0000_0000,
+        ];
+        let points: Vec<Point> = value_bits
+            .iter()
+            .enumerate()
+            .map(|(i, bits)| Point {
+                ts: i as i64 - 4,
+                value: f64::from_bits(*bits),
+            })
+            .collect();
+
+        for codec in Codec::ALL {
+            if let Some(encoded) = codec.encode(&points) {
+                let decoded = codec.decode(&encoded, points.len()).unwrap();
+                assert_eq!(decoded.len(), points.len(), "{codec:?}");
+                for (expected, actual) in points.iter().zip(decoded.iter()) {
+                    assert_eq!(actual.ts, expected.ts, "{codec:?} timestamp");
+                    assert_eq!(
+                        actual.value.to_bits(),
+                        expected.value.to_bits(),
+                        "{codec:?} value"
+                    );
+                }
+            }
         }
     }
 

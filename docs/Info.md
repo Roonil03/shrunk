@@ -21,7 +21,10 @@ shrunk demo [--points N]
 ```
 
 Timestamps are milliseconds and time bounds are inclusive. `ingest` accepts
-`timestamp_ms,value` lines and skips a header row.
+strict two-column `timestamp,value` rows, with an optional exact header on the
+first non-comment line. Blank lines and lines beginning with `#` are ignored;
+invalid rows report their physical line number. Input is limited to 64 MiB and
+one million points and is parsed before any database write.
 
 Example:
 
@@ -67,7 +70,9 @@ println!("avg = {:?}", avg.value);
 Writes must be strictly increasing per series. A point older than the last one
 is rejected with `Error::OutOfOrder`; an equal timestamp is rejected with
 `Error::Duplicate`. `write_many` validates the whole batch before applying it,
-so a bad point leaves the series unchanged.
+so a bad point leaves the series unchanged. A batch is limited to one million
+points; generated CLI workloads are written in chunks of that size. A query
+returning more than 16 million points errors rather than growing without bound.
 
 For durable incremental appends, open the database with `Db::open_rw` (or
 `Db::open_rw_with_block_size`). Each `append`/`write_many` is written to a
@@ -88,16 +93,32 @@ db.append(
 db.checkpoint().unwrap();
 ```
 
-If the process dies before a checkpoint, `Db::open` replays complete WAL records
-and ignores a torn or bad-CRC tail. A checkpoint writes the snapshot to a temp
-file, fsyncs it, renames it, then truncates the WAL. If the crash happens
-between the rename and the truncate, replay skips points already covered by the
+If the process dies before a checkpoint, `Db::open` replays complete WAL records.
+Legacy WAL v1 can safely repair an incomplete terminal length prefix. A complete
+length that extends beyond EOF, an invalid record, or a checksum mismatch is
+ambiguous damage: open fails and leaves the WAL intact for inspection. A
+checkpoint writes the snapshot to a new private temp file, fsyncs it, renames
+it, syncs the parent directory, then truncates the WAL. If a crash happens
+between rename and truncation, replay skips points already covered by the
 snapshot, so recovery is idempotent.
+
+`Db::new` followed by `save` creates or replaces a snapshot only when its
+destination has no WAL. An unbound handle can also export its current contents
+to another WAL-free path; the original path is left intact. It refuses a
+destination WAL, including WAL-only data;
+use `Db::open_rw` and `checkpoint` to persist recovered appends. A WAL-bound
+handle can save only to its bound destination. The CLI `seed` requires an unused
+snapshot path and also refuses an existing WAL. `open_rw` holds an exclusive WAL
+file lock from recovery through append and checkpoint, so a second writer to
+the same WAL fails. Snapshot symlinks and hard-link aliases are rejected for
+writes. This is a single-writer API; separate names referring to the same
+storage through other alias mechanisms are outside its coordination contract.
 
 ## On-disk format
 
-A database snapshot is one file. `save`/`checkpoint` writes a temp file,
-fsyncs it, renames it, then fsyncs the directory. The current format is v3.
+A database snapshot is one file. `save`/`checkpoint` streams its blocks to an
+exclusive same-directory temp file, fsyncs it, renames it, then fsyncs the
+directory. The current format is v3.
 `FORMAT_VERSION` is the single source of truth: the magic (`SHRUNK03`), the
 writer, and the reader all derive from it. v1 and v2 files are still readable
 and are upgraded on the next save.
@@ -130,10 +151,16 @@ per series:
     u32 crc32(payload)
 ```
 
-The separate header and payload checksums are what make lazy open safe. `open`
+The separate header and payload checksums make lazy open safe. `open`
 reads and validates every block header without touching payloads. A query reads
 one payload with `pread` and checks its CRC before decoding. A corrupt header
-or payload is rejected instead of being interpreted as data.
+or payload is rejected instead of being interpreted as data. These checksums
+detect accidental corruption; they do not authenticate files. Legacy v1
+headers have no checksum, so v1 query metadata is re-derived from decoded
+payloads before queries can use it. Legacy v1/v2 snapshots remain readable;
+v1 whole-file loading has a 256 MiB read budget. Current snapshots have a
+one-million-block index budget and a 64 GiB file-size ceiling; each block's
+payload is limited to 64 MiB.
 
 ### Write-ahead log
 
@@ -152,9 +179,12 @@ repeated:
   u32 crc32(payload)
 ```
 
-Each batch is fsynced before the in-memory series is updated. Replay stops at
-the first short or bad-CRC record, which is how a torn tail from a crash is
-ignored. A checkpoint writes a snapshot, then truncates the WAL; replay skips
+Each batch is fsynced before the in-memory series is updated. WAL version 1
+framing and codec IDs are unchanged. Replay repairs only a terminal fragment
+shorter than the four-byte length prefix. Other damage errors out and is
+preserved. WAL creation uses mode `0600` on Unix; reads and writes reject
+non-regular WAL files and final-component symlinks on Linux/Android. Recovery
+and appends have a 1 GiB WAL size ceiling. A checkpoint writes a snapshot, then truncates the WAL; replay skips
 points already present in the snapshot, so a crash between those two steps is
 safe. Readers that already opened a snapshot keep the old inode across a
 checkpoint rename and continue to see a stable view.

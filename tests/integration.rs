@@ -483,7 +483,7 @@ fn wal_append_does_not_rewrite_the_snapshot_and_checkpoint_truncates() {
 }
 
 #[test]
-fn wal_ignores_a_torn_tail() {
+fn wal_preserves_an_ambiguous_truncated_record() {
     let dir = std::env::temp_dir().join(format!("shrunk-wal3-{}", std::process::id()));
     let _ = fs::create_dir_all(&dir);
     let path = dir.join("db.shrunk");
@@ -501,15 +501,9 @@ fn wal_ignores_a_torn_tail() {
     f.set_len(len - 3).unwrap();
     drop(f);
 
-    let reopened = Db::open(&path).unwrap();
-    assert_eq!(reopened.point_count(), 10);
-    assert_eq!(
-        reopened
-            .query(&Query::new("m", i64::MIN, i64::MAX))
-            .unwrap()
-            .points,
-        series(10, 1_000, 10)
-    );
+    let error = Db::open(&path).unwrap_err();
+    assert!(error.to_string().contains("damaged data preserved"));
+    assert_eq!(fs::metadata(&wal).unwrap().len(), len - 3);
 
     let _ = fs::remove_dir_all(&dir);
 }
