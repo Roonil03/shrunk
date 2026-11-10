@@ -3,6 +3,7 @@ name = "shrunk"
 version = "0.1.0"
 edition = "2021"
 description = "A tiny time series database that stores compressed blocks and queries them without fully decoding"
+license = "GPL-3.0-or-later"
 
 [[bin]]
 name = "shrunk"
@@ -13,3 +14,12 @@ opt-level = 3
 lto = true
 codegen-units = 1
 panic = "abort"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "deny"
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
