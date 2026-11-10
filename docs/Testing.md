@@ -34,10 +34,42 @@ Legacy format fixtures live in `tests/fixtures/`:
 Before opening a pull request, run the full check suite:
 
 ```sh
-cargo fmt --check
+cargo fmt --all --check
+cargo clippy --all-targets --locked -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --locked
 cargo test --all-targets
 cargo test --doc
 cargo build --release
+```
+
+## Linters
+
+CI runs these linters on every pull request:
+
+- `rustfmt` checks formatting.
+- `clippy` runs the Rust lints. `Cargo.toml` denies `clippy::all` and forbids
+  `unsafe` code.
+- `rustdoc` treats warnings as errors, so broken doc links fail the job.
+- `typos` checks spelling. Valid words that look misspelled, such as the
+  `Comput.` journal abbreviation in [COMPRESSION.md](COMPRESSION.md), are listed
+  in `typos.toml`.
+- `actionlint` checks the workflow files in `.github/workflows/`.
+
+Install the two tools that Rust does not ship:
+
+```sh
+cargo install typos-cli
+brew install actionlint
+```
+
+Then run the linters locally:
+
+```sh
+cargo fmt --all --check
+cargo clippy --all-targets --locked -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --locked
+typos
+actionlint
 ```
 
 ## Reproducible compression benchmarks
