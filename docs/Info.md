@@ -94,13 +94,19 @@ db.checkpoint().unwrap();
 ```
 
 If the process dies before a checkpoint, `Db::open` replays complete WAL records.
-Legacy WAL v1 can safely repair an incomplete terminal length prefix. A complete
-length that extends beyond EOF, an invalid record, or a checksum mismatch is
-ambiguous damage: open fails and leaves the WAL intact for inspection. A
-checkpoint writes the snapshot to a new private temp file, fsyncs it, renames
-it, syncs the parent directory, then truncates the WAL. If a crash happens
-between rename and truncation, replay skips points already covered by the
-snapshot, so recovery is idempotent.
+An invalid record is treated as a torn crash tail only when a resync of the
+suffix finds no later CRC-valid record: `open` ignores that tail and leaves
+the file alone, and `open_rw` copies it to `<db>.wal.torn` before truncating
+and appending. A length or CRC failure of the last record is indistinguishable
+from a crash mid-append and may drop that last record. Damage with a later
+valid record, including a corrupted length field, is still a hard error and is
+preserved for inspection. `open` retries if the snapshot changes, or if the
+WAL is replaced or shrinks, so a concurrent checkpoint cannot produce a mixed
+view. Growth of an existing WAL is a consistent prefix and does not fail the
+open. A checkpoint writes the snapshot to a new private temp file, fsyncs it,
+renames it, syncs the parent directory, then truncates the WAL. If a crash
+happens between rename and truncation, replay skips points already covered by
+the snapshot, so recovery is idempotent.
 
 `Db::new` followed by `save` creates or replaces a snapshot only when its
 destination has no WAL. An unbound handle can also export its current contents
@@ -179,16 +185,19 @@ repeated:
   u32 crc32(payload)
 ```
 
-Each batch is fsynced before the in-memory series is updated. WAL version 1
-framing and codec IDs are unchanged. Replay repairs only a terminal fragment
-shorter than the four-byte length prefix. Other damage errors out and is
-preserved. WAL creation uses mode `0600` on Unix; reads and writes reject
-non-regular WAL files and final-component symlinks on Linux, Android, and
-Darwin targets. Recovery and appends have a 1 GiB WAL size ceiling. A
-checkpoint writes a snapshot, then truncates the WAL; replay skips points
-already present in the snapshot, so a crash between those two steps is safe.
-Readers that already opened a snapshot keep the old inode across a checkpoint
-rename and continue to see a stable view.
+Each batch is fsynced before the in-memory series is updated. There is no group
+commit. WAL version 1 framing and codec IDs are unchanged. Replay ignores a
+torn terminal record after a suffix resync finds no later valid record, and
+`open_rw` copies that tail to `<db>.wal.torn` before truncating. Damage with
+a later valid record errors out and is preserved. WAL creation uses mode
+`0600` on Unix; reads and writes reject non-regular WAL files and
+final-component symlinks. `O_NOFOLLOW` uses the correct architecture-specific
+value, and the opened descriptor is checked against the path on Unix.
+Recovery and appends have a 1 GiB WAL size ceiling. A checkpoint writes a
+snapshot, then truncates the WAL; replay skips points already present in the
+snapshot, so a crash between those two steps is safe. Readers that already
+opened a snapshot keep the old inode across a checkpoint rename and continue
+to see a stable view.
 
 ## See also
 

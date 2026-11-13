@@ -2,12 +2,18 @@
 //!
 //! A WAL is a sidecar file next to the database snapshot. It contains a small
 //! header and a sequence of point-batch records. Each record carries its own
-//! length and CRC. Replay repairs only an incomplete terminal length prefix. A
-//! complete checksum failure is ambiguous corruption and is preserved.
+//! length and CRC. An invalid *final* record (a short length prefix, a length
+//! that runs past EOF, a bad CRC with no valid record after it, or a
+//! zero-filled tail) is treated as a torn crash tail: readers ignore it and
+//! writers truncate it. Damage followed by a later valid record is still a
+//! hard error and is preserved.
 //!
-//! Checkpoints write a normal snapshot atomically and truncate the WAL. If a
-//! crash happens after the snapshot rename but before the truncate, replay is
-//! idempotent: points at or before the snapshot's last timestamp are skipped.
+//! Writers take the exclusive WAL lock before the snapshot is opened, so a
+//! stale writer cannot replay onto an old snapshot and overwrite a newer
+//! checkpoint. Checkpoints write a normal snapshot atomically and truncate
+//! the WAL. If a crash happens after the snapshot rename but before the
+//! truncate, replay is idempotent: points at or before the snapshot's last
+//! timestamp are skipped.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -44,48 +50,53 @@ pub(crate) struct Wal {
     block_size: usize,
 }
 
-impl Wal {
-    /// Open or create a WAL and validate its header. The block size is stored
-    /// in the header so a database can be recovered even before its first
-    /// snapshot exists.
-    #[cfg(test)]
-    pub fn open(path: &Path, block_size: usize) -> Result<Wal> {
-        Self::open_inner(path, block_size)
+/// A WAL that is exclusively locked but has not yet been replayed.
+///
+/// Holding this keeps another writer out while the caller opens the snapshot.
+#[derive(Debug)]
+pub(crate) struct LockedWal {
+    file: File,
+    created: bool,
+    path: PathBuf,
+    len: u64,
+}
+
+impl LockedWal {
+    pub(crate) fn len(&self) -> u64 {
+        self.len
     }
 
-    /// Lock the WAL before replay, repair a short terminal length prefix only
-    /// after replay succeeds, and return the still-locked writer. This closes
-    /// the gap between replay and append where another process could otherwise
-    /// append data that the caller never applied to memory.
-    pub(crate) fn recover_and_open<F>(
-        path: &Path,
+    pub(crate) fn created(&self) -> bool {
+        self.created
+    }
+
+    /// Validate or recreate the header, replay complete records, and truncate
+    /// a torn terminal record. Returns a still-locked writer ready to append.
+    pub(crate) fn recover<F>(
+        self,
         expected_block_size: Option<usize>,
         apply: &mut F,
     ) -> Result<(Wal, usize)>
     where
         F: FnMut(usize, &str, &[Point]) -> Result<()>,
     {
-        let (mut file, created) = match open_wal(path, true, true, true) {
-            Ok(file) => (file, true),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                (open_wal(path, true, false, true)?, false)
-            }
-            Err(e) => return Err(e.into()),
-        };
-        lock_exclusive(&file)?;
-        let len = file.metadata()?.len();
-        check_wal_size(len)?;
+        let LockedWal {
+            mut file,
+            created,
+            path,
+            len,
+        } = self;
         if len < WAL_HEADER_BYTES {
             // A partial header cannot contain a committed record. Recreate it
             // instead of blocking recovery on a torn header write.
             let block_size = expected_block_size.ok_or_else(|| {
-                Error::Format("cannot initialize WAL without a block size".into())
+                Error::InvalidInput("cannot initialize WAL without a block size".into())
             })?;
             file.set_len(0)?;
             write_header(&mut file, block_size)?;
             file.sync_data()?;
             if created {
-                sync_parent_dir(path)?;
+                sync_parent_dir(&path)?;
             }
             return Ok((
                 Wal {
@@ -111,11 +122,12 @@ impl Wal {
             apply(block_size, series, points)
         })?;
         if valid_end != len {
+            preserve_torn_tail(&path, &file, valid_end, len)?;
             file.set_len(valid_end)?;
             file.sync_data()?;
         }
         if created {
-            sync_parent_dir(path)?;
+            sync_parent_dir(&path)?;
         }
         Ok((
             Wal {
@@ -126,10 +138,14 @@ impl Wal {
             block_size,
         ))
     }
+}
 
-    #[cfg(test)]
-    fn open_inner(path: &Path, block_size: usize) -> Result<Wal> {
-        let (mut file, created) = match open_wal(path, true, true, true) {
+impl Wal {
+    /// Open or create the WAL and take the exclusive lock before the caller
+    /// reads the snapshot. Replay and torn-tail repair happen afterwards in
+    /// [`LockedWal::recover`].
+    pub(crate) fn lock_writer(path: &Path) -> Result<LockedWal> {
+        let (file, created) = match open_wal(path, true, true, true) {
             Ok(file) => (file, true),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 (open_wal(path, true, false, true)?, false)
@@ -139,38 +155,27 @@ impl Wal {
         lock_exclusive(&file)?;
         let len = file.metadata()?.len();
         check_wal_size(len)?;
-        if len < WAL_HEADER_BYTES {
-            file.set_len(0)?;
-            write_header(&mut file, block_size)?;
-            file.sync_data()?;
-            if created {
-                sync_parent_dir(path)?;
-            }
-            return Ok(Wal {
-                file,
-                header_written: true,
-                block_size,
-            });
-        }
-        let found = read_header(&mut file)?;
-        if found != block_size {
-            return Err(Error::Format(format!(
-                "WAL block size {found} does not match database block size {block_size}"
-            )));
-        }
-        let valid_end = scan_records(&mut file, len, false, &mut |_, _| Ok(()))?;
-        if valid_end != len {
-            file.set_len(valid_end)?;
-            file.sync_data()?;
-        }
-        if created {
-            sync_parent_dir(path)?;
-        }
-        Ok(Wal {
+        Ok(LockedWal {
             file,
-            header_written: true,
-            block_size,
+            created,
+            path: path.to_path_buf(),
+            len,
         })
+    }
+
+    /// Lock the WAL, repair a torn terminal record after replay succeeds, and
+    /// return the still-locked writer. Prefer [`Self::lock_writer`] then
+    /// [`LockedWal::recover`] when the snapshot must be opened under the lock.
+    #[cfg(test)]
+    pub(crate) fn recover_and_open<F>(
+        path: &Path,
+        expected_block_size: Option<usize>,
+        apply: &mut F,
+    ) -> Result<(Wal, usize)>
+    where
+        F: FnMut(usize, &str, &[Point]) -> Result<()>,
+    {
+        Self::lock_writer(path)?.recover(expected_block_size, apply)
     }
 
     /// Append one durable batch. The record is fsynced before the caller
@@ -198,9 +203,9 @@ impl Wal {
         let old_len = self.file.metadata()?.len();
         let new_len = old_len
             .checked_add(record.len() as u64)
-            .ok_or_else(|| Error::Format("WAL size overflow".into()))?;
+            .ok_or_else(|| Error::Limit("WAL size overflow".into()))?;
         if new_len > MAX_WAL_BYTES {
-            return Err(Error::Format(format!(
+            return Err(Error::Limit(format!(
                 "appending would exceed WAL recovery limit {MAX_WAL_BYTES}"
             )));
         }
@@ -254,6 +259,29 @@ fn write_header(file: &mut File, block_size: usize) -> Result<()> {
     Ok(())
 }
 
+/// Linux/Android `O_NOFOLLOW`. The value is architecture-specific: 0x8000 on
+/// arm, aarch64, and powerpc; 0x20000 (asm-generic) elsewhere.
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    any(
+        target_arch = "arm",
+        target_arch = "aarch64",
+        target_arch = "powerpc",
+        target_arch = "powerpc64"
+    )
+))]
+const LINUX_O_NOFOLLOW: i32 = 0o100000;
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    not(any(
+        target_arch = "arm",
+        target_arch = "aarch64",
+        target_arch = "powerpc",
+        target_arch = "powerpc64"
+    ))
+))]
+const LINUX_O_NOFOLLOW: i32 = 0o400000;
+
 /// Open a WAL without following a final-component symlink, and reject special
 /// files. New WALs are private to their owner on Unix (subject to umask).
 fn open_wal(path: &Path, writable: bool, create_new: bool, append: bool) -> std::io::Result<File> {
@@ -265,7 +293,7 @@ fn open_wal(path: &Path, writable: bool, create_new: bool, append: bool) -> std:
         options.mode(0o600);
     }
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    options.custom_flags(0x20000); // O_NOFOLLOW
+    options.custom_flags(LINUX_O_NOFOLLOW);
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     options.custom_flags(0x100); // O_NOFOLLOW (Darwin)
     let file = options.open(path)?;
@@ -275,21 +303,70 @@ fn open_wal(path: &Path, writable: bool, create_new: bool, append: bool) -> std:
             "WAL path is not a regular file",
         ));
     }
+    reject_wal_alias(path, &file)?;
     Ok(file)
+}
+
+/// Reject a final-component symlink even when `O_NOFOLLOW` is unavailable or
+/// has the wrong value for this architecture. On Unix, also require the
+/// opened descriptor to be the same inode as the path.
+fn reject_wal_alias(path: &Path, file: &File) -> std::io::Result<()> {
+    let path_meta = std::fs::symlink_metadata(path)?;
+    if path_meta.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "WAL path is a symlink",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let file_meta = file.metadata()?;
+        if path_meta.dev() != file_meta.dev() || path_meta.ino() != file_meta.ino() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "WAL path changed during open",
+            ));
+        }
+    }
+    let _ = file;
+    Ok(())
 }
 
 fn check_wal_size(len: u64) -> Result<()> {
     if len > MAX_WAL_BYTES {
-        return Err(Error::Format(format!(
+        return Err(Error::Limit(format!(
             "WAL size {len} exceeds recovery limit {MAX_WAL_BYTES}"
         )));
     }
     Ok(())
 }
 
+fn preserve_torn_tail(path: &Path, file: &File, valid_end: u64, len: u64) -> Result<()> {
+    let mut tail = path.as_os_str().to_os_string();
+    tail.push(".torn");
+    let torn_path = PathBuf::from(tail);
+    let mut buf = vec![0u8; (len - valid_end) as usize];
+    let mut reader = file.try_clone()?;
+    reader.seek(SeekFrom::Start(valid_end))?;
+    reader.read_exact(&mut buf)?;
+    let mut out = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&torn_path)?;
+    out.write_all(&buf)?;
+    out.sync_data()?;
+    Ok(())
+}
+
 fn lock_exclusive(file: &File) -> Result<()> {
-    file.try_lock()
-        .map_err(|error| std::io::Error::other(error.to_string()).into())
+    file.try_lock().map_err(|error| match error {
+        std::fs::TryLockError::WouldBlock => {
+            Error::Locked("database is locked by another writer".into())
+        }
+        std::fs::TryLockError::Error(e) => e.into(),
+    })
 }
 
 #[cfg(unix)]
@@ -346,8 +423,8 @@ pub(crate) fn read_block_size(path: &Path) -> Result<usize> {
     read_header(&mut file)
 }
 
-/// Replay complete records. A short terminal length prefix is ignored;
-/// complete-length damage or a checksum failure is reported and preserved.
+/// Replay complete records. A torn terminal record is ignored; damage
+/// followed by a later valid record is reported and preserved.
 pub(crate) fn replay<F>(path: &Path, apply: &mut F) -> Result<()>
 where
     F: FnMut(&str, &[Point]) -> Result<()>,
@@ -367,38 +444,11 @@ where
     Ok(())
 }
 
-/// Replay complete records and truncate any torn terminal suffix before the
-/// file is reopened for append.
-#[cfg(test)]
-pub(crate) fn replay_repair<F>(path: &Path, apply: &mut F) -> Result<()>
-where
-    F: FnMut(&str, &[Point]) -> Result<()>,
-{
-    let mut file = open_wal(path, true, false, false)?;
-    lock_exclusive(&file)?;
-    let len = file.metadata()?.len();
-    check_wal_size(len)?;
-    if len < WAL_HEADER_BYTES {
-        file.set_len(0)?;
-        file.sync_data()?;
-        return Ok(());
-    }
-    let block_size = read_header(&mut file)?;
-    if block_size == 0 {
-        return Err(Error::Format("WAL has zero block size".into()));
-    }
-    let valid_end = scan_records(&mut file, len, true, apply)?;
-    if valid_end != len {
-        file.set_len(valid_end)?;
-        file.sync_data()?;
-    }
-    Ok(())
-}
-
-/// Walk complete records. Only a short terminal length prefix is safely
-/// repairable in the legacy format. A complete length that exceeds the file
-/// could be a corrupted length field, so preserve it and report an error.
-/// Returns the byte offset after the last complete record.
+/// Walk complete records. An invalid record is treated as a torn crash
+/// tail only when no later CRC-valid, decodable record can be found, even
+/// after a byte-by-byte resync of the suffix. Mid-file damage that still
+/// has a later valid record is a hard error. Returns the byte offset after
+/// the last complete record.
 fn scan_records<F>(file: &mut File, len: u64, decode: bool, apply: &mut F) -> Result<u64>
 where
     F: FnMut(&str, &[Point]) -> Result<()>,
@@ -414,34 +464,81 @@ where
         let mut len_buf = [0u8; 4];
         file.read_exact(&mut len_buf)?;
         let record_len = u32::from_le_bytes(len_buf) as u64;
-        if record_len > MAX_WAL_RECORD_BYTES {
-            return Err(Error::Format(format!(
-                "WAL record size {record_len} exceeds limit {MAX_WAL_RECORD_BYTES}"
-            )));
-        }
         let total = record_len + 8;
-        if total > remaining {
-            return Err(Error::Format(format!(
-                "WAL record length {record_len} at byte {pos} exceeds remaining {remaining} bytes; damaged data preserved"
-            )));
+        if record_len > MAX_WAL_RECORD_BYTES || total > remaining {
+            if suffix_has_valid_record(file, pos, len)? {
+                return Err(Error::Format(format!(
+                    "WAL record length {record_len} at byte {pos} is followed by a later valid record; damaged data preserved"
+                )));
+            }
+            break;
         }
         let mut payload = vec![0u8; record_len as usize];
         file.read_exact(&mut payload)?;
         let mut crc_buf = [0u8; 4];
         file.read_exact(&mut crc_buf)?;
         let stored = u32::from_le_bytes(crc_buf);
-        if crc32(&payload) != stored {
-            return Err(Error::Format(format!(
-                "WAL checksum mismatch at byte {pos}; damaged data preserved"
-            )));
+        let crc_ok = crc32(&payload) == stored;
+        if !crc_ok {
+            if suffix_has_valid_record(file, pos, len)? {
+                return Err(Error::Format(format!(
+                    "WAL checksum mismatch at byte {pos}; damaged data preserved"
+                )));
+            }
+            break;
         }
         if decode {
-            let (series, points) = decode_payload(&payload)?;
-            apply(&series, &points)?;
+            match decode_payload(&payload) {
+                Ok((series, points)) => apply(&series, &points)?,
+                Err(error) => {
+                    if suffix_has_valid_record(file, pos, len)? {
+                        return Err(error);
+                    }
+                    break;
+                }
+            }
         }
         pos += total;
     }
     Ok(pos)
+}
+
+/// True if a CRC-valid, decodable record exists at any byte offset in
+/// `[start, len)`. Used to tell a torn tail from mid-file corruption
+/// whose length prefix no longer points at the next record.
+fn suffix_has_valid_record(file: &mut File, start: u64, len: u64) -> Result<bool> {
+    if start >= len || len - start < 8 {
+        return Ok(false);
+    }
+    let suffix_len = (len - start) as usize;
+    let mut suffix = vec![0u8; suffix_len];
+    file.seek(SeekFrom::Start(start))?;
+    file.read_exact(&mut suffix)?;
+    if suffix.iter().all(|&b| b == 0) {
+        return Ok(false);
+    }
+    let mut offset = 0usize;
+    while offset + 8 <= suffix.len() {
+        let record_len =
+            u32::from_le_bytes(suffix[offset..offset + 4].try_into().unwrap()) as usize;
+        let total = record_len.saturating_add(8);
+        if record_len > 0
+            && record_len as u64 <= MAX_WAL_RECORD_BYTES
+            && offset + total <= suffix.len()
+        {
+            let payload = &suffix[offset + 4..offset + 4 + record_len];
+            let stored = u32::from_le_bytes(
+                suffix[offset + 4 + record_len..offset + total]
+                    .try_into()
+                    .unwrap(),
+            );
+            if crc32(payload) == stored && decode_payload(payload).is_ok() {
+                return Ok(true);
+            }
+        }
+        offset += 1;
+    }
+    Ok(false)
 }
 
 fn decode_payload(payload: &[u8]) -> Result<(String, Vec<Point>)> {
@@ -551,6 +648,12 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    fn open_writer(path: &Path, block_size: usize) -> Wal {
+        Wal::recover_and_open(path, Some(block_size), &mut |_, _, _| Ok(()))
+            .expect("open writer")
+            .0
+    }
+
     #[test]
     fn payload_roundtrip() {
         let points = vec![
@@ -587,7 +690,7 @@ mod tests {
         bytes.extend_from_slice(&[9, 0, 0]); // torn length prefix
         std::fs::write(&path, &bytes).unwrap();
 
-        let mut wal = Wal::open(&path, 64).unwrap();
+        let mut wal = open_writer(&path, 64);
         wal.append("cpu", &[second]).unwrap();
         drop(wal);
 
@@ -619,18 +722,58 @@ mod tests {
     }
 
     #[test]
-    fn replay_preserves_a_complete_checksum_failure_at_eof() {
+    fn recover_and_open_truncates_a_bad_crc_at_eof() {
         let path = test_path("bad-tail-crc");
         remove(&path);
+        let first = Point { ts: 1, value: 2.0 };
+        let second = Point { ts: 2, value: 3.0 };
         let mut bytes = Vec::new();
         write_header_to_vec(&mut bytes, 64);
-        bytes.extend_from_slice(&encoded_record("cpu", &[Point { ts: 1, value: 2.0 }]));
+        bytes.extend_from_slice(&encoded_record("cpu", &[first]));
+        bytes.extend_from_slice(&encoded_record("cpu", &[second]));
         *bytes.last_mut().unwrap() ^= 0x80;
         std::fs::write(&path, &bytes).unwrap();
 
-        let error = replay_repair(&path, &mut |_, _| Ok(())).unwrap_err();
-        assert!(error.to_string().contains("checksum mismatch"));
-        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        let mut replayed = Vec::new();
+        let (wal, _) = Wal::recover_and_open(&path, Some(64), &mut |_, series, points| {
+            replayed.extend(points.iter().map(|p| (series.to_owned(), *p)));
+            Ok(())
+        })
+        .unwrap();
+        drop(wal);
+        assert_eq!(replayed, vec![("cpu".into(), first)]);
+        assert!(std::fs::read(&path).unwrap().len() < bytes.len());
+
+        let mut points_only = Vec::new();
+        replay(&path, &mut |_, points| {
+            points_only.extend(points.iter().copied());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(points_only, vec![first]);
+        remove(&path);
+    }
+
+    #[test]
+    fn replay_ignores_a_zero_filled_tail() {
+        let path = test_path("zero-tail");
+        remove(&path);
+        let first = Point { ts: 1, value: 2.0 };
+        let mut bytes = Vec::new();
+        write_header_to_vec(&mut bytes, 64);
+        bytes.extend_from_slice(&encoded_record("cpu", &[first]));
+        bytes.extend_from_slice(&[0u8; 16]);
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut replayed = Vec::new();
+        replay(&path, &mut |_, points| {
+            replayed.extend(points.iter().copied());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(replayed, vec![first]);
+        // Readers leave the torn tail in place.
+        assert_eq!(std::fs::read(&path).unwrap().len(), bytes.len());
         remove(&path);
     }
 
@@ -638,10 +781,10 @@ mod tests {
     fn wal_lock_rejects_a_second_writer() {
         let path = test_path("single-writer");
         remove(&path);
-        let wal = Wal::open(&path, 64).unwrap();
-        assert!(Wal::open(&path, 64).is_err());
+        let wal = open_writer(&path, 64);
+        assert!(Wal::recover_and_open(&path, Some(64), &mut |_, _, _| Ok(())).is_err());
         drop(wal);
-        assert!(Wal::open(&path, 64).is_ok());
+        assert!(Wal::recover_and_open(&path, Some(64), &mut |_, _, _| Ok(())).is_ok());
         remove(&path);
     }
 
@@ -649,7 +792,7 @@ mod tests {
     fn append_cannot_create_a_wal_that_recovery_will_reject() {
         let path = test_path("append-recovery-bound");
         remove(&path);
-        let mut wal = Wal::open(&path, 64).unwrap();
+        let mut wal = open_writer(&path, 64);
         wal.file.set_len(MAX_WAL_BYTES).unwrap();
         assert!(wal
             .append("cpu", &[Point { ts: 1, value: 2.0 }])
@@ -668,7 +811,7 @@ mod tests {
         write_header_to_vec(&mut bytes, 64);
         bytes[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
         std::fs::write(&path, &bytes).unwrap();
-        let error = replay_repair(&path, &mut |_, _| Ok(())).unwrap_err();
+        let error = Wal::recover_and_open(&path, None, &mut |_, _, _| Ok(())).unwrap_err();
         assert!(error.to_string().contains("block size"), "{error}");
         remove(&path);
     }
@@ -704,7 +847,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let path = test_path("permissions");
         remove(&path);
-        drop(Wal::open(&path, 64).unwrap());
+        drop(open_writer(&path, 64));
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
@@ -721,7 +864,7 @@ mod tests {
             let link = test_path("symlink");
             remove(&link);
             symlink(&path, &link).unwrap();
-            assert!(Wal::open(&link, 64).is_err());
+            assert!(Wal::recover_and_open(&link, Some(64), &mut |_, _, _| Ok(())).is_err());
             remove(&link);
         }
         remove(&path);
@@ -731,7 +874,7 @@ mod tests {
     fn append_and_decode_enforce_name_and_point_limits() {
         let path = test_path("limits");
         remove(&path);
-        let mut wal = Wal::open(&path, 64).unwrap();
+        let mut wal = open_writer(&path, 64);
         let long_name = "x".repeat(MAX_SERIES_NAME + 1);
         assert!(wal
             .append(&long_name, &[Point { ts: 1, value: 1.0 }])

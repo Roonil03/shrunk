@@ -11,7 +11,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -66,12 +66,28 @@ const MAX_QUERY_POINTS: usize = 16_000_000;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Error {
     Io(std::io::Error),
+    /// On-disk data that failed validation.
     Format(String),
+    /// A caller-supplied argument or operation is not allowed.
+    InvalidInput(String),
+    /// A size, count, or allocation budget was exceeded.
+    Limit(String),
+    /// The database could not be opened because a writer holds the exclusive
+    /// WAL lock, or because a concurrent checkpoint kept changing the files.
+    Locked(String),
     UnknownSeries(String),
-    OutOfOrder { series: String, last: i64, got: i64 },
-    Duplicate { series: String, ts: i64 },
+    OutOfOrder {
+        series: String,
+        last: i64,
+        got: i64,
+    },
+    Duplicate {
+        series: String,
+        ts: i64,
+    },
 }
 
 impl fmt::Display for Error {
@@ -79,6 +95,7 @@ impl fmt::Display for Error {
         match self {
             Error::Io(e) => write!(f, "io error: {e}"),
             Error::Format(m) => write!(f, "corrupt database: {m}"),
+            Error::InvalidInput(m) | Error::Limit(m) | Error::Locked(m) => write!(f, "{m}"),
             Error::UnknownSeries(s) => write!(f, "unknown series: {s}"),
             Error::OutOfOrder { series, last, got } => write!(
                 f,
@@ -283,12 +300,53 @@ impl Series {
         }
     }
 
-    fn flush(&mut self) {
+    fn flush(&mut self, block_size: usize) -> Result<()> {
         if self.pending.is_empty() {
-            return;
+            return Ok(());
+        }
+        let should_merge = self
+            .blocks
+            .last()
+            .is_some_and(|last| (last.count as usize) < block_size);
+        if should_merge {
+            // Decode first so a failure leaves the trailing block in place.
+            let mut merged = self
+                .blocks
+                .last()
+                .unwrap()
+                .decode()
+                .map_err(Error::Format)?;
+            merged.append(&mut self.pending);
+            self.blocks.pop();
+            let mut rest = merged.as_slice();
+            while rest.len() >= block_size {
+                self.blocks.push(Block::build(&rest[..block_size]));
+                rest = &rest[block_size..];
+            }
+            if !rest.is_empty() {
+                self.blocks.push(Block::build(rest));
+            }
+            return Ok(());
         }
         self.blocks.push(Block::build(&self.pending));
         self.pending.clear();
+        Ok(())
+    }
+
+    /// Extra blocks `flush` would add for the current pending buffer.
+    fn flush_block_delta(&self, block_size: usize) -> usize {
+        if self.pending.is_empty() {
+            return 0;
+        }
+        if let Some(last) = self.blocks.last() {
+            let last_count = last.count as usize;
+            if last_count < block_size {
+                let total = last_count + self.pending.len();
+                // The short trailing block is replaced by one or more new blocks.
+                return total.div_ceil(block_size).saturating_sub(1);
+            }
+        }
+        1
     }
 
     fn point_count(&self) -> u64 {
@@ -352,6 +410,8 @@ impl Db {
         }
         validate_series_write(series, !self.series.contains_key(series), self.series.len())?;
         let block_size = self.block_size;
+        let pending_len = self.series.get(series).map_or(0, |s| s.pending.len());
+        self.ensure_block_budget(self.write_block_delta(series, pending_len, 1))?;
         let s = self
             .series
             .entry(series.to_string())
@@ -389,7 +449,7 @@ impl Db {
             return Ok(());
         }
         if points.len() > MAX_BATCH_POINTS {
-            return Err(Error::Format(format!(
+            return Err(Error::Limit(format!(
                 "batch exceeds {MAX_BATCH_POINTS} point limit"
             )));
         }
@@ -417,45 +477,43 @@ impl Db {
             prev = Some(p.ts);
         }
 
-        // Only a partial block needs a scratch allocation. Full blocks can be
-        // built directly from the caller's slice without copying the batch.
+        self.apply_points(series, points, true)
+    }
+
+    fn apply_points(&mut self, series: &str, points: &[Point], enforce_budget: bool) -> Result<()> {
         let pending_len = self.series.get(series).map_or(0, |s| s.pending.len());
-        let scratch_capacity = if pending_len > 0 {
-            self.block_size.min(pending_len + points.len())
-        } else {
-            points.len() % self.block_size
-        };
-        let mut scratch = Vec::new();
-        scratch
-            .try_reserve_exact(scratch_capacity)
-            .map_err(|_| Error::Format("batch allocation failed".into()))?;
+        let block_size = self.block_size;
+        if enforce_budget {
+            self.ensure_block_budget(self.write_block_delta(series, pending_len, points.len()))?;
+        }
         if let Some(wal) = self.wal.as_mut() {
             wal.append(series, points)?;
         }
 
-        let block_size = self.block_size;
         let s = self
             .series
             .entry(series.to_string())
             .or_insert_with(|| Series::new(series));
-        s.last_ts = prev;
+        s.last_ts = points.last().map(|p| p.ts);
         let mut remaining = points;
         if !s.pending.is_empty() {
-            scratch.extend_from_slice(&s.pending);
-            let take = (block_size - scratch.len()).min(remaining.len());
-            scratch.extend_from_slice(&remaining[..take]);
-            remaining = &remaining[take..];
-            if scratch.len() == block_size {
-                s.blocks.push(Block::build(&scratch));
-                scratch.clear();
+            let room = block_size - s.pending.len();
+            let take = room.min(remaining.len());
+            if s.pending.len() + take == block_size {
+                let mut chunk = std::mem::take(&mut s.pending);
+                chunk.extend_from_slice(&remaining[..take]);
+                s.blocks.push(Block::build(&chunk));
+                remaining = &remaining[take..];
+            } else {
+                s.pending.extend_from_slice(remaining);
+                remaining = &[];
             }
         }
         while remaining.len() >= block_size {
             s.blocks.push(Block::build(&remaining[..block_size]));
             remaining = &remaining[block_size..];
         }
-        scratch.extend_from_slice(remaining);
-        s.pending = scratch;
+        s.pending.extend_from_slice(remaining);
         Ok(())
     }
 
@@ -463,7 +521,7 @@ impl Db {
     /// the database is not bound to a WAL path.
     pub fn append(&mut self, series: &str, points: &[Point]) -> Result<()> {
         if self.wal.is_none() {
-            return Err(Error::Format(
+            return Err(Error::InvalidInput(
                 "append requires Db::open_rw or Db::open_rw_with_block_size".into(),
             ));
         }
@@ -471,18 +529,81 @@ impl Db {
     }
 
     pub fn flush(&mut self, series: &str) -> Result<()> {
-        let s = self
+        let block_size = self.block_size;
+        let extra = self
             .series
+            .get(series)
+            .ok_or_else(|| Error::UnknownSeries(series.to_string()))?
+            .flush_block_delta(block_size);
+        self.ensure_block_budget(extra)?;
+        self.series
             .get_mut(series)
-            .ok_or_else(|| Error::UnknownSeries(series.to_string()))?;
-        s.flush();
+            .ok_or_else(|| Error::UnknownSeries(series.to_string()))?
+            .flush(block_size)
+    }
+
+    pub fn flush_all(&mut self) -> Result<()> {
+        let extra = self
+            .series
+            .values()
+            .map(|s| s.flush_block_delta(self.block_size))
+            .sum();
+        self.ensure_block_budget(extra)?;
+        let block_size = self.block_size;
+        for s in self.series.values_mut() {
+            s.flush(block_size)?;
+        }
         Ok(())
     }
 
-    pub fn flush_all(&mut self) {
-        for s in self.series.values_mut() {
-            s.flush();
+    fn total_blocks(&self) -> usize {
+        self.series.values().map(|s| s.blocks.len()).sum()
+    }
+
+    fn ensure_block_budget(&self, additional: usize) -> Result<()> {
+        let total = self
+            .total_blocks()
+            .checked_add(additional)
+            .ok_or_else(|| Error::Limit("block count overflow".into()))?;
+        if total > MAX_TOTAL_BLOCKS {
+            return Err(Error::Limit("snapshot block budget exceeded".into()));
         }
+        Ok(())
+    }
+
+    /// Extra blocks this write would add, including the trailing block each
+    /// series will need at flush, so an acknowledged write can be checkpointed.
+    fn write_block_delta(&self, series: &str, pending_len: usize, new_points: usize) -> usize {
+        let mut projected = 0usize;
+        let mut seen = false;
+        for (name, s) in &self.series {
+            if name.as_str() == series {
+                seen = true;
+                projected = projected.saturating_add(projected_series_blocks(
+                    self.block_size,
+                    s.blocks.len(),
+                    s.blocks.last().map(|b| b.count as usize).unwrap_or(0),
+                    pending_len,
+                    new_points,
+                ));
+            } else {
+                projected = projected.saturating_add(
+                    s.blocks
+                        .len()
+                        .saturating_add(s.flush_block_delta(self.block_size)),
+                );
+            }
+        }
+        if !seen {
+            projected = projected.saturating_add(projected_series_blocks(
+                self.block_size,
+                0,
+                0,
+                0,
+                new_points,
+            ));
+        }
+        projected.saturating_sub(self.total_blocks())
     }
 
     /// Full scan. Time bounds are inclusive.
@@ -532,13 +653,13 @@ impl Db {
                         }
                     }
                     if out.len() >= MAX_QUERY_POINTS {
-                        return Err(Error::Format(format!(
+                        return Err(Error::Limit(format!(
                             "query exceeds {MAX_QUERY_POINTS} point limit"
                         )));
                     }
                     if out.len() == out.capacity() {
                         out.try_reserve(1024)
-                            .map_err(|_| Error::Format("query allocation failed".into()))?;
+                            .map_err(|_| Error::Limit("query allocation failed".into()))?;
                     }
                     out.push(p);
                     if out.len() >= limit {
@@ -561,13 +682,13 @@ impl Db {
                         }
                     }
                     if out.len() >= MAX_QUERY_POINTS {
-                        return Err(Error::Format(format!(
+                        return Err(Error::Limit(format!(
                             "query exceeds {MAX_QUERY_POINTS} point limit"
                         )));
                     }
                     if out.len() == out.capacity() {
                         out.try_reserve(1024)
-                            .map_err(|_| Error::Format("query allocation failed".into()))?;
+                            .map_err(|_| Error::Limit("query allocation failed".into()))?;
                     }
                     out.push(*p);
                     if out.len() >= limit {
@@ -783,14 +904,14 @@ impl Db {
         mut hook: impl FnMut(SaveStage) -> Result<()>,
     ) -> Result<()> {
         if self.wal.is_some() && !same_destination(self.path.as_deref().unwrap(), path)? {
-            return Err(Error::Format(
+            return Err(Error::InvalidInput(
                 "cannot save a WAL-bound database to a different path".into(),
             ));
         }
         if self.wal.is_none() {
             match wal::wal_path(path).symlink_metadata() {
                 Ok(_) => {
-                    return Err(Error::Format(
+                    return Err(Error::InvalidInput(
                         "destination has a WAL; open it read/write and checkpoint instead".into(),
                     ))
                 }
@@ -799,10 +920,10 @@ impl Db {
             }
         }
         reject_symlink(path)?;
-        self.flush_all();
+        self.flush_all()?;
         let file_name = path
             .file_name()
-            .ok_or_else(|| Error::Format(format!("invalid path: {}", path.display())))?;
+            .ok_or_else(|| Error::InvalidInput(format!("invalid path: {}", path.display())))?;
         let parent = path
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
@@ -835,7 +956,11 @@ impl Db {
         };
         let write_result = (|| -> Result<()> {
             hook(SaveStage::Write)?;
-            write_db(self, &mut f)?;
+            {
+                let mut writer = BufWriter::with_capacity(64 * 1024, &mut f);
+                write_db(self, &mut writer)?;
+                writer.flush()?;
+            }
             hook(SaveStage::FileSync)?;
             f.sync_all()?;
             hook(SaveStage::Rename)?;
@@ -867,31 +992,50 @@ impl Db {
 
     /// Flush pending points, write an atomic snapshot, and truncate the WAL.
     pub fn checkpoint(&mut self) -> Result<()> {
-        let path = self
-            .path
-            .clone()
-            .ok_or_else(|| Error::Format("checkpoint requires a bound database path".into()))?;
+        let path = self.path.clone().ok_or_else(|| {
+            Error::InvalidInput("checkpoint requires a bound database path".into())
+        })?;
         self.save(&path)
     }
 
     /// Open a snapshot and replay any WAL. The returned handle is not bound
     /// for further appends; use [`Db::open_rw`] for that.
+    ///
+    /// The snapshot and WAL identities are re-checked after the read. If a
+    /// concurrent writer checkpoints or appends mid-open, the open is retried
+    /// so the handle is not assembled from a mixed generation.
     pub fn open(path: &Path) -> Result<Db> {
         reject_symlink(path)?;
         let wal_path = wal::wal_path(path);
-        match path.symlink_metadata() {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return match wal_path.symlink_metadata() {
-                    Ok(_) => recover_from_wal(&wal_path),
-                    Err(e) => Err(e.into()),
-                };
+        const OPEN_ATTEMPTS: u32 = 16;
+        for _ in 0..OPEN_ATTEMPTS {
+            let snap_id = file_identity(path)?;
+            let wal_id = file_identity(&wal_path)?;
+            let result = (|| -> Result<Db> {
+                match (&snap_id, &wal_id) {
+                    (None, None) => Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("no snapshot or WAL at {}", path.display()),
+                    )
+                    .into()),
+                    (None, Some(_)) => recover_from_wal(&wal_path),
+                    (Some(_), _) => {
+                        let mut db = open_snapshot(path)?;
+                        replay_wal_into(&mut db, &wal_path)?;
+                        Ok(db)
+                    }
+                }
+            })();
+            let snap_after = file_identity(path)?;
+            let wal_after = file_identity(&wal_path)?;
+            if open_generation_changed(snap_id, snap_after, wal_id, wal_after) {
+                continue;
             }
-            Err(e) => return Err(e.into()),
+            return result;
         }
-        let mut db = open_snapshot(path)?;
-        replay_wal_into(&mut db, &wal_path)?;
-        Ok(db)
+        Err(Error::Locked(
+            "database changed during open; retry later".into(),
+        ))
     }
 
     /// Open for durable incremental appends. A missing database is created
@@ -903,35 +1047,46 @@ impl Db {
     pub fn open_rw_with_block_size(path: &Path, block_size: usize) -> Result<Db> {
         reject_symlink(path)?;
         let wal_path = wal::wal_path(path);
-        let has_snapshot = path.symlink_metadata().is_ok();
-        let mut db = if has_snapshot {
-            open_snapshot(path)?
-        } else {
-            Db::with_block_size(block_size)
-        };
-        let expected = if has_snapshot {
-            Some(db.block_size)
-        } else {
-            match wal_path.symlink_metadata() {
-                Ok(meta) if meta.len() >= wal::WAL_HEADER_BYTES => None,
-                Ok(_) => Some(db.block_size),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(db.block_size),
+        // Take the exclusive lock before reading the snapshot so a stale
+        // writer cannot replay onto an old generation and overwrite a
+        // newer checkpoint.
+        let locked = Wal::lock_writer(&wal_path)?;
+        let created = locked.created();
+        let result = (|| -> Result<Db> {
+            let has_snapshot = match path.symlink_metadata() {
+                Ok(_) => true,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
                 Err(e) => return Err(e.into()),
-            }
-        };
-        let (wal, wal_block_size) =
-            Wal::recover_and_open(&wal_path, expected, &mut |size, series, points| {
+            };
+            let mut db = if has_snapshot {
+                open_snapshot(path)?
+            } else {
+                Db::with_block_size(block_size)
+            };
+            let expected = if has_snapshot {
+                Some(db.block_size)
+            } else if locked.len() >= wal::WAL_HEADER_BYTES {
+                None
+            } else {
+                Some(db.block_size)
+            };
+            let (wal, wal_block_size) = locked.recover(expected, &mut |size, series, points| {
                 if !has_snapshot {
                     db.block_size = size;
                 }
                 db.replay_record(series, points)
             })?;
-        if !has_snapshot {
-            db.block_size = wal_block_size;
+            if !has_snapshot {
+                db.block_size = wal_block_size;
+            }
+            db.wal = Some(wal);
+            db.path = Some(path.to_path_buf());
+            Ok(db)
+        })();
+        if result.is_err() && created {
+            let _ = fs::remove_file(&wal_path);
         }
-        db.wal = Some(wal);
-        db.path = Some(path.to_path_buf());
-        Ok(db)
+        result
     }
 
     pub fn load_or_new(path: &Path) -> Result<Db> {
@@ -950,7 +1105,7 @@ impl Db {
         };
         if start < points.len() {
             validate_series_write(series, !self.series.contains_key(series), self.series.len())?;
-            self.write_many(series, &points[start..])?;
+            self.apply_points(series, &points[start..], false)?;
         }
         Ok(())
     }
@@ -991,7 +1146,7 @@ fn open_snapshot(path: &Path) -> Result<Db> {
             }
             let mut data = Vec::new();
             data.try_reserve_exact(meta.len() as usize)
-                .map_err(|_| Error::Format("legacy snapshot allocation failed".into()))?;
+                .map_err(|_| Error::Limit("legacy snapshot allocation failed".into()))?;
             data.extend_from_slice(&magic);
             f.take(meta.len().saturating_sub(8))
                 .read_to_end(&mut data)?;
@@ -1003,9 +1158,110 @@ fn open_snapshot(path: &Path) -> Result<Db> {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileIdentity {
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+    len: u64,
+    #[cfg(not(unix))]
+    modified_nanos: Option<u128>,
+}
+
+impl FileIdentity {
+    fn from_meta(meta: &std::fs::Metadata) -> Self {
+        Self {
+            #[cfg(unix)]
+            dev: {
+                use std::os::unix::fs::MetadataExt;
+                meta.dev()
+            },
+            #[cfg(unix)]
+            ino: {
+                use std::os::unix::fs::MetadataExt;
+                meta.ino()
+            },
+            len: meta.len(),
+            #[cfg(not(unix))]
+            modified_nanos: meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos()),
+        }
+    }
+}
+
+fn file_identity(path: &Path) -> Result<Option<FileIdentity>> {
+    match path.symlink_metadata() {
+        Ok(meta) => Ok(Some(FileIdentity::from_meta(&meta))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Retry `open` only when the snapshot changed, or the WAL was replaced or
+/// shrunk. Growth of an existing WAL is a consistent prefix and must not
+/// starve readers under a live writer.
+fn open_generation_changed(
+    snap_before: Option<FileIdentity>,
+    snap_after: Option<FileIdentity>,
+    wal_before: Option<FileIdentity>,
+    wal_after: Option<FileIdentity>,
+) -> bool {
+    if snap_before != snap_after {
+        return true;
+    }
+    match (wal_before, wal_after) {
+        (None, None) => false,
+        (Some(before), Some(after)) => {
+            if wal_replaced(before, after) {
+                return true;
+            }
+            after.len < before.len
+        }
+        _ => true,
+    }
+}
+
+fn wal_replaced(before: FileIdentity, after: FileIdentity) -> bool {
+    #[cfg(unix)]
+    {
+        before.dev != after.dev || before.ino != after.ino
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (before, after);
+        false
+    }
+}
+
+fn projected_series_blocks(
+    block_size: usize,
+    existing_blocks: usize,
+    last_count: usize,
+    pending_len: usize,
+    new_points: usize,
+) -> usize {
+    let last_short = existing_blocks > 0 && last_count < block_size;
+    let points = pending_len + new_points + if last_short { last_count } else { 0 };
+    let base = if last_short {
+        existing_blocks - 1
+    } else {
+        existing_blocks
+    };
+    let extra = if points == 0 {
+        0
+    } else {
+        points.div_ceil(block_size)
+    };
+    base.saturating_add(extra)
+}
+
 fn reject_symlink(path: &Path) -> Result<()> {
     match fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_symlink() => Err(Error::Format(format!(
+        Ok(meta) if meta.file_type().is_symlink() => Err(Error::InvalidInput(format!(
             "snapshot path {} is a symlink",
             path.display()
         ))),
@@ -1016,7 +1272,7 @@ fn reject_symlink(path: &Path) -> Result<()> {
                 meta.nlink() > 1
             } =>
         {
-            Err(Error::Format(format!(
+            Err(Error::InvalidInput(format!(
                 "snapshot path {} has aliases",
                 path.display()
             )))
@@ -1031,7 +1287,7 @@ fn same_destination(a: &Path, b: &Path) -> Result<bool> {
     let key = |p: &Path| -> Result<PathBuf> {
         let name = p
             .file_name()
-            .ok_or_else(|| Error::Format("path has no filename".into()))?;
+            .ok_or_else(|| Error::InvalidInput("path has no filename".into()))?;
         let parent = p
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
@@ -1118,14 +1374,14 @@ fn encode_db(db: &Db) -> Result<Vec<u8>> {
 
 fn write_db(db: &Db, out: &mut impl Write) -> Result<()> {
     if db.series.len() > MAX_SERIES {
-        return Err(Error::Format(format!(
+        return Err(Error::Limit(format!(
             "series count {} exceeds limit {MAX_SERIES}",
             db.series.len()
         )));
     }
     for s in db.series.values() {
         if s.name.len() > MAX_SERIES_NAME {
-            return Err(Error::Format(format!(
+            return Err(Error::InvalidInput(format!(
                 "series name length {} exceeds limit {MAX_SERIES_NAME}",
                 s.name.len()
             )));
@@ -1135,10 +1391,10 @@ fn write_db(db: &Db, out: &mut impl Write) -> Result<()> {
     for s in db.series.values() {
         total_blocks = total_blocks
             .checked_add(s.blocks.len())
-            .ok_or_else(|| Error::Format("block count overflow".into()))?;
+            .ok_or_else(|| Error::Limit("block count overflow".into()))?;
     }
     if total_blocks > MAX_TOTAL_BLOCKS {
-        return Err(Error::Format("snapshot block budget exceeded".into()));
+        return Err(Error::Limit("snapshot block budget exceeded".into()));
     }
     out.write_all(&FORMAT_MAGIC)?;
     out.write_all(&FORMAT_VERSION.to_le_bytes())?;
@@ -1154,39 +1410,43 @@ fn write_db(db: &Db, out: &mut impl Write) -> Result<()> {
 
         for b in &s.blocks {
             b.validate_meta().map_err(Error::Format)?;
-            let payload = b.payload.bytes().map_err(Error::Format)?;
-            if let Some(expected) = b.payload_crc {
-                if crc32(&payload) != expected {
-                    return Err(Error::Format(format!(
-                        "series {:?}: payload changed before save",
-                        s.name
-                    )));
-                }
-            }
-            let mut header = Vec::with_capacity(50);
-            header.push(b.codec as u8);
-            let mut flags = 0u8;
-            if b.sum.is_some() {
-                flags |= 1;
-            }
-            if b.has_nan {
-                flags |= 2;
-            }
-            header.push(flags);
-            header.extend_from_slice(&b.count.to_le_bytes());
-            header.extend_from_slice(&b.t_min.to_le_bytes());
-            header.extend_from_slice(&b.t_max.to_le_bytes());
-            header.extend_from_slice(&b.v_min.to_le_bytes());
-            header.extend_from_slice(&b.v_max.to_le_bytes());
-            header.extend_from_slice(&b.sum.unwrap_or(f64::NAN).to_le_bytes());
-            header.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-            // Header CRC lets `open` validate query-planning metadata without
-            // reading any payload bytes.
-            let header_crc = crc32(&header);
-            out.write_all(&header)?;
-            out.write_all(&header_crc.to_le_bytes())?;
-            out.write_all(&payload)?;
-            out.write_all(&crc32(&payload).to_le_bytes())?;
+            b.payload
+                .with_bytes(|payload| -> Result<()> {
+                    if let Some(expected) = b.payload_crc {
+                        if crc32(payload) != expected {
+                            return Err(Error::Format(format!(
+                                "series {:?}: payload changed before save",
+                                s.name
+                            )));
+                        }
+                    }
+                    let mut header = Vec::with_capacity(50);
+                    header.push(b.codec as u8);
+                    let mut flags = 0u8;
+                    if b.sum.is_some() {
+                        flags |= 1;
+                    }
+                    if b.has_nan {
+                        flags |= 2;
+                    }
+                    header.push(flags);
+                    header.extend_from_slice(&b.count.to_le_bytes());
+                    header.extend_from_slice(&b.t_min.to_le_bytes());
+                    header.extend_from_slice(&b.t_max.to_le_bytes());
+                    header.extend_from_slice(&b.v_min.to_le_bytes());
+                    header.extend_from_slice(&b.v_max.to_le_bytes());
+                    header.extend_from_slice(&b.sum.unwrap_or(f64::NAN).to_le_bytes());
+                    header.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+                    // Header CRC lets `open` validate query-planning metadata without
+                    // reading any payload bytes.
+                    let header_crc = crc32(&header);
+                    out.write_all(&header)?;
+                    out.write_all(&header_crc.to_le_bytes())?;
+                    out.write_all(payload)?;
+                    out.write_all(&crc32(payload).to_le_bytes())?;
+                    Ok(())
+                })
+                .map_err(Error::Format)??;
         }
     }
     Ok(())
@@ -1194,13 +1454,13 @@ fn write_db(db: &Db, out: &mut impl Write) -> Result<()> {
 
 fn validate_series_write(series: &str, is_new: bool, current_count: usize) -> Result<()> {
     if series.len() > MAX_SERIES_NAME {
-        return Err(Error::Format(format!(
+        return Err(Error::InvalidInput(format!(
             "series name length {} exceeds limit {MAX_SERIES_NAME}",
             series.len()
         )));
     }
     if is_new && current_count >= MAX_SERIES {
-        return Err(Error::Format(format!(
+        return Err(Error::Limit(format!(
             "series count limit {MAX_SERIES} reached"
         )));
     }
@@ -1356,9 +1616,9 @@ fn decode_current_file(file: File, len: u64) -> Result<Db> {
         let block_count = c.u32()? as usize;
         total_blocks = total_blocks
             .checked_add(block_count)
-            .ok_or_else(|| Error::Format("block count overflow".into()))?;
+            .ok_or_else(|| Error::Limit("block count overflow".into()))?;
         if total_blocks > MAX_TOTAL_BLOCKS {
-            return Err(Error::Format("snapshot block budget exceeded".into()));
+            return Err(Error::Limit("snapshot block budget exceeded".into()));
         }
         if block_count as u64 > c.remaining() / BLOCK_HEADER_BYTES as u64 {
             return Err(Error::Format(format!(
@@ -1368,7 +1628,7 @@ fn decode_current_file(file: File, len: u64) -> Result<Db> {
         let mut blocks = Vec::new();
         blocks
             .try_reserve_exact(block_count)
-            .map_err(|_| Error::Format("block index allocation failed".into()))?;
+            .map_err(|_| Error::Limit("block index allocation failed".into()))?;
         let mut prev_t_max: Option<i64> = None;
         for _ in 0..block_count {
             let block = read_current_block(&mut c, &name)?;
@@ -1500,9 +1760,9 @@ fn decode_body(
         let block_count = c.u32()? as usize;
         total_blocks = total_blocks
             .checked_add(block_count)
-            .ok_or_else(|| Error::Format("block count overflow".into()))?;
+            .ok_or_else(|| Error::Limit("block count overflow".into()))?;
         if total_blocks > MAX_TOTAL_BLOCKS {
-            return Err(Error::Format("snapshot block budget exceeded".into()));
+            return Err(Error::Limit("snapshot block budget exceeded".into()));
         }
         if block_count > (data.len().saturating_sub(c.pos)) / BLOCK_HEADER_BYTES {
             return Err(Error::Format(format!(
@@ -1512,7 +1772,7 @@ fn decode_body(
         let mut blocks = Vec::new();
         blocks
             .try_reserve_exact(block_count)
-            .map_err(|_| Error::Format("block index allocation failed".into()))?;
+            .map_err(|_| Error::Limit("block index allocation failed".into()))?;
         let mut prev_t_max: Option<i64> = None;
 
         for _ in 0..block_count {
@@ -1611,36 +1871,78 @@ fn read_block(c: &mut Cursor<'_>, data: &[u8], name: &str, v2_crc: bool) -> Resu
     Ok(block)
 }
 
+const FILE_CURSOR_BUF: usize = 64 * 1024;
+
 struct FileCursor {
     file: Arc<File>,
     pos: u64,
     len: u64,
+    buf: Vec<u8>,
+    buf_off: u64,
 }
 
 impl FileCursor {
     fn new(file: Arc<File>, len: u64, pos: u64) -> Self {
-        Self { file, pos, len }
+        Self {
+            file,
+            pos,
+            len,
+            buf: Vec::new(),
+            buf_off: 0,
+        }
     }
 
     fn remaining(&self) -> u64 {
         self.len.saturating_sub(self.pos)
     }
 
+    fn fill(&mut self) -> Result<()> {
+        let start = self.pos;
+        let n = (self.len - start).min(FILE_CURSOR_BUF as u64) as usize;
+        self.buf.clear();
+        self.buf
+            .try_reserve_exact(n)
+            .map_err(|_| Error::Limit("file read allocation failed".into()))?;
+        self.buf.resize(n, 0);
+        crate::block::read_at(&self.file, start, &mut self.buf).map_err(Error::Format)?;
+        self.buf_off = start;
+        Ok(())
+    }
+
     fn take(&mut self, n: usize) -> Result<Vec<u8>> {
-        let n = n as u64;
-        if n > self.remaining() {
+        let want = n as u64;
+        if want > self.remaining() {
             return Err(Error::Format(format!(
-                "truncated at byte {} (wanted {n} more)",
+                "truncated at byte {} (wanted {want} more)",
                 self.pos
             )));
         }
-        let mut buf = Vec::new();
-        buf.try_reserve_exact(n as usize)
-            .map_err(|_| Error::Format("file read allocation failed".into()))?;
-        buf.resize(n as usize, 0);
-        crate::block::read_at(&self.file, self.pos, &mut buf).map_err(Error::Format)?;
-        self.pos += n;
-        Ok(buf)
+        let mut out = Vec::new();
+        out.try_reserve_exact(n)
+            .map_err(|_| Error::Limit("file read allocation failed".into()))?;
+        out.resize(n, 0);
+        let mut filled = 0;
+        while filled < n {
+            let in_buf =
+                self.pos >= self.buf_off && self.pos < self.buf_off + self.buf.len() as u64;
+            if !in_buf {
+                if n - filled >= FILE_CURSOR_BUF {
+                    crate::block::read_at(&self.file, self.pos, &mut out[filled..])
+                        .map_err(Error::Format)?;
+                    self.pos += (n - filled) as u64;
+                    self.buf.clear();
+                    return Ok(out);
+                }
+                self.fill()?;
+            }
+            let buf_pos = (self.pos - self.buf_off) as usize;
+            let avail = self.buf.len().saturating_sub(buf_pos);
+            let take = avail.min(n - filled);
+            out[filled..filled + take].copy_from_slice(&self.buf[buf_pos..buf_pos + take]);
+            self.pos += take as u64;
+            filled += take;
+        }
+        Ok(out)
     }
 
     fn skip(&mut self, n: u64) -> Result<()> {
@@ -1745,7 +2047,10 @@ mod tests {
     fn write_rejects_overlong_series_name_without_mutation() {
         let mut db = Db::new();
         let name = "x".repeat(MAX_SERIES_NAME + 1);
-        assert!(matches!(db.write(&name, 1, 1.0), Err(Error::Format(_))));
+        assert!(matches!(
+            db.write(&name, 1, 1.0),
+            Err(Error::InvalidInput(_))
+        ));
         assert!(db.series.is_empty());
     }
 
@@ -1760,7 +2065,7 @@ mod tests {
         let mut db = Db::new();
         let name = "x".repeat(MAX_SERIES_NAME + 1);
         db.series.insert(name.clone(), Series::new(&name));
-        assert!(matches!(encode_db(&db), Err(Error::Format(_))));
+        assert!(matches!(encode_db(&db), Err(Error::InvalidInput(_))));
     }
 
     #[test]
@@ -1773,7 +2078,7 @@ mod tests {
         let _ = std::fs::remove_file(wal::wal_path(&path));
 
         let mut db = Db::open_rw(&path).unwrap();
-        assert!(matches!(db.save(&other), Err(Error::Format(_))));
+        assert!(matches!(db.save(&other), Err(Error::InvalidInput(_))));
         assert!(!other.exists());
         db.write("s", 1, 2.0).unwrap();
         db.save(&path).unwrap();
@@ -1840,7 +2145,7 @@ mod tests {
         let before = fs::read(&wal_path).unwrap();
         let mut fresh = Db::new();
         fresh.write("new", 2, 8.0).unwrap();
-        assert!(matches!(fresh.save(&path), Err(Error::Format(_))));
+        assert!(matches!(fresh.save(&path), Err(Error::InvalidInput(_))));
         assert!(!path.exists());
         assert_eq!(fs::read(&wal_path).unwrap(), before);
         let _ = fs::remove_file(&wal_path);
@@ -1916,7 +2221,7 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_wal_length_is_rejected_and_preserved() {
+    fn torn_wal_length_at_eof_is_truncated_on_rw_open() {
         let path =
             std::env::temp_dir().join(format!("shrunk-bad-length-{}.db", std::process::id()));
         let wal_path = wal::wal_path(&path);
@@ -1928,8 +2233,36 @@ mod tests {
         let mut bytes = fs::read(&wal_path).unwrap();
         bytes[16..20].copy_from_slice(&1000u32.to_le_bytes());
         fs::write(&wal_path, &bytes).unwrap();
-        assert!(Db::open_rw(&path).is_err());
+        // Read-only open ignores the torn record and leaves the file alone.
+        // The only record is itself torn, so nothing is replayed.
+        assert_eq!(Db::open(&path).unwrap().point_count(), 0);
         assert_eq!(fs::read(&wal_path).unwrap(), bytes);
+        let rw = Db::open_rw(&path).unwrap();
+        assert_eq!(rw.point_count(), 0);
+        // Writer truncates back to a well-formed header.
+        assert!(fs::read(&wal_path).unwrap().len() < bytes.len());
+        drop(rw);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&wal_path);
+    }
+
+    #[test]
+    fn second_writer_is_rejected_while_lock_is_held() {
+        let path =
+            std::env::temp_dir().join(format!("shrunk-lock-order-{}.db", std::process::id()));
+        let wal_path = wal::wal_path(&path);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&wal_path);
+        let mut db = Db::open_rw(&path).unwrap();
+        db.append("s", &[Point { ts: 1, value: 1.0 }]).unwrap();
+        let err = Db::open_rw(&path).unwrap_err();
+        assert!(
+            matches!(err, Error::Locked(_)) || err.to_string().contains("locked"),
+            "{err}"
+        );
+        drop(db);
+        assert!(Db::open_rw(&path).is_ok());
+        let _ = fs::remove_file(&path);
         let _ = fs::remove_file(&wal_path);
     }
 }
