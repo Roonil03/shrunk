@@ -75,7 +75,8 @@ pub enum Error {
     InvalidInput(String),
     /// A size, count, or allocation budget was exceeded.
     Limit(String),
-    /// Another process holds the exclusive WAL lock.
+    /// The database could not be opened because a writer holds the exclusive
+    /// WAL lock, or because a concurrent checkpoint kept changing the files.
     Locked(String),
     UnknownSeries(String),
     OutOfOrder {
@@ -303,12 +304,20 @@ impl Series {
         if self.pending.is_empty() {
             return Ok(());
         }
-        if let Some(last) = self
+        let should_merge = self
             .blocks
-            .pop_if(|last| (last.count as usize) < block_size)
-        {
-            let mut merged = last.decode().map_err(Error::Format)?;
+            .last()
+            .is_some_and(|last| (last.count as usize) < block_size);
+        if should_merge {
+            // Decode first so a failure leaves the trailing block in place.
+            let mut merged = self
+                .blocks
+                .last()
+                .unwrap()
+                .decode()
+                .map_err(Error::Format)?;
             merged.append(&mut self.pending);
+            self.blocks.pop();
             let mut rest = merged.as_slice();
             while rest.len() >= block_size {
                 self.blocks.push(Block::build(&rest[..block_size]));
@@ -402,9 +411,7 @@ impl Db {
         validate_series_write(series, !self.series.contains_key(series), self.series.len())?;
         let block_size = self.block_size;
         let pending_len = self.series.get(series).map_or(0, |s| s.pending.len());
-        if pending_len + 1 >= block_size {
-            self.ensure_block_budget(1)?;
-        }
+        self.ensure_block_budget(self.write_block_delta(series, pending_len, 1))?;
         let s = self
             .series
             .entry(series.to_string())
@@ -470,11 +477,14 @@ impl Db {
             prev = Some(p.ts);
         }
 
+        self.apply_points(series, points, true)
+    }
+
+    fn apply_points(&mut self, series: &str, points: &[Point], enforce_budget: bool) -> Result<()> {
         let pending_len = self.series.get(series).map_or(0, |s| s.pending.len());
         let block_size = self.block_size;
-        let new_blocks = (pending_len + points.len()) / block_size;
-        if new_blocks > 0 {
-            self.ensure_block_budget(new_blocks)?;
+        if enforce_budget {
+            self.ensure_block_budget(self.write_block_delta(series, pending_len, points.len()))?;
         }
         if let Some(wal) = self.wal.as_mut() {
             wal.append(series, points)?;
@@ -484,7 +494,7 @@ impl Db {
             .series
             .entry(series.to_string())
             .or_insert_with(|| Series::new(series));
-        s.last_ts = prev;
+        s.last_ts = points.last().map(|p| p.ts);
         let mut remaining = points;
         if !s.pending.is_empty() {
             let room = block_size - s.pending.len();
@@ -559,6 +569,41 @@ impl Db {
             return Err(Error::Limit("snapshot block budget exceeded".into()));
         }
         Ok(())
+    }
+
+    /// Extra blocks this write would add, including the trailing block each
+    /// series will need at flush, so an acknowledged write can be checkpointed.
+    fn write_block_delta(&self, series: &str, pending_len: usize, new_points: usize) -> usize {
+        let mut projected = 0usize;
+        let mut seen = false;
+        for (name, s) in &self.series {
+            if name.as_str() == series {
+                seen = true;
+                projected = projected.saturating_add(projected_series_blocks(
+                    self.block_size,
+                    s.blocks.len(),
+                    s.blocks.last().map(|b| b.count as usize).unwrap_or(0),
+                    pending_len,
+                    new_points,
+                ));
+            } else {
+                projected = projected.saturating_add(
+                    s.blocks
+                        .len()
+                        .saturating_add(s.flush_block_delta(self.block_size)),
+                );
+            }
+        }
+        if !seen {
+            projected = projected.saturating_add(projected_series_blocks(
+                self.block_size,
+                0,
+                0,
+                0,
+                new_points,
+            ));
+        }
+        projected.saturating_sub(self.total_blocks())
     }
 
     /// Full scan. Time bounds are inclusive.
@@ -966,24 +1011,27 @@ impl Db {
         for _ in 0..OPEN_ATTEMPTS {
             let snap_id = file_identity(path)?;
             let wal_id = file_identity(&wal_path)?;
-            let db = match (&snap_id, &wal_id) {
-                (None, None) => {
-                    return Err(std::io::Error::new(
+            let result = (|| -> Result<Db> {
+                match (&snap_id, &wal_id) {
+                    (None, None) => Err(std::io::Error::new(
                         std::io::ErrorKind::NotFound,
                         format!("no snapshot or WAL at {}", path.display()),
                     )
-                    .into());
+                    .into()),
+                    (None, Some(_)) => recover_from_wal(&wal_path),
+                    (Some(_), _) => {
+                        let mut db = open_snapshot(path)?;
+                        replay_wal_into(&mut db, &wal_path)?;
+                        Ok(db)
+                    }
                 }
-                (None, Some(_)) => recover_from_wal(&wal_path)?,
-                (Some(_), _) => {
-                    let mut db = open_snapshot(path)?;
-                    replay_wal_into(&mut db, &wal_path)?;
-                    db
-                }
-            };
-            if file_identity(path)? == snap_id && file_identity(&wal_path)? == wal_id {
-                return Ok(db);
+            })();
+            let snap_after = file_identity(path)?;
+            let wal_after = file_identity(&wal_path)?;
+            if open_generation_changed(snap_id, snap_after, wal_id, wal_after) {
+                continue;
             }
+            return result;
         }
         Err(Error::Locked(
             "database changed during open; retry later".into(),
@@ -1003,35 +1051,42 @@ impl Db {
         // writer cannot replay onto an old generation and overwrite a
         // newer checkpoint.
         let locked = Wal::lock_writer(&wal_path)?;
-        let has_snapshot = match path.symlink_metadata() {
-            Ok(_) => true,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-            Err(e) => return Err(e.into()),
-        };
-        let mut db = if has_snapshot {
-            open_snapshot(path)?
-        } else {
-            Db::with_block_size(block_size)
-        };
-        let expected = if has_snapshot {
-            Some(db.block_size)
-        } else if locked.len() >= wal::WAL_HEADER_BYTES {
-            None
-        } else {
-            Some(db.block_size)
-        };
-        let (wal, wal_block_size) = locked.recover(expected, &mut |size, series, points| {
+        let created = locked.created();
+        let result = (|| -> Result<Db> {
+            let has_snapshot = match path.symlink_metadata() {
+                Ok(_) => true,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                Err(e) => return Err(e.into()),
+            };
+            let mut db = if has_snapshot {
+                open_snapshot(path)?
+            } else {
+                Db::with_block_size(block_size)
+            };
+            let expected = if has_snapshot {
+                Some(db.block_size)
+            } else if locked.len() >= wal::WAL_HEADER_BYTES {
+                None
+            } else {
+                Some(db.block_size)
+            };
+            let (wal, wal_block_size) = locked.recover(expected, &mut |size, series, points| {
+                if !has_snapshot {
+                    db.block_size = size;
+                }
+                db.replay_record(series, points)
+            })?;
             if !has_snapshot {
-                db.block_size = size;
+                db.block_size = wal_block_size;
             }
-            db.replay_record(series, points)
-        })?;
-        if !has_snapshot {
-            db.block_size = wal_block_size;
+            db.wal = Some(wal);
+            db.path = Some(path.to_path_buf());
+            Ok(db)
+        })();
+        if result.is_err() && created {
+            let _ = fs::remove_file(&wal_path);
         }
-        db.wal = Some(wal);
-        db.path = Some(path.to_path_buf());
-        Ok(db)
+        result
     }
 
     pub fn load_or_new(path: &Path) -> Result<Db> {
@@ -1050,7 +1105,7 @@ impl Db {
         };
         if start < points.len() {
             validate_series_write(series, !self.series.contains_key(series), self.series.len())?;
-            self.write_many(series, &points[start..])?;
+            self.apply_points(series, &points[start..], false)?;
         }
         Ok(())
     }
@@ -1144,6 +1199,64 @@ fn file_identity(path: &Path) -> Result<Option<FileIdentity>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e.into()),
     }
+}
+
+/// Retry `open` only when the snapshot changed, or the WAL was replaced or
+/// shrunk. Growth of an existing WAL is a consistent prefix and must not
+/// starve readers under a live writer.
+fn open_generation_changed(
+    snap_before: Option<FileIdentity>,
+    snap_after: Option<FileIdentity>,
+    wal_before: Option<FileIdentity>,
+    wal_after: Option<FileIdentity>,
+) -> bool {
+    if snap_before != snap_after {
+        return true;
+    }
+    match (wal_before, wal_after) {
+        (None, None) => false,
+        (Some(before), Some(after)) => {
+            if wal_replaced(before, after) {
+                return true;
+            }
+            after.len < before.len
+        }
+        _ => true,
+    }
+}
+
+fn wal_replaced(before: FileIdentity, after: FileIdentity) -> bool {
+    #[cfg(unix)]
+    {
+        before.dev != after.dev || before.ino != after.ino
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (before, after);
+        false
+    }
+}
+
+fn projected_series_blocks(
+    block_size: usize,
+    existing_blocks: usize,
+    last_count: usize,
+    pending_len: usize,
+    new_points: usize,
+) -> usize {
+    let last_short = existing_blocks > 0 && last_count < block_size;
+    let points = pending_len + new_points + if last_short { last_count } else { 0 };
+    let base = if last_short {
+        existing_blocks - 1
+    } else {
+        existing_blocks
+    };
+    let extra = if points == 0 {
+        0
+    } else {
+        points.div_ceil(block_size)
+    };
+    base.saturating_add(extra)
 }
 
 fn reject_symlink(path: &Path) -> Result<()> {

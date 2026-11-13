@@ -106,13 +106,16 @@ at least 8% of adjacent XORs can take the skip path.
   reading the snapshot, then bind the database for appends. `append`, `write`,
   and `write_many` fsync the WAL before applying to memory. There is no group
   commit: each batch is one `fsync`.
-- An invalid final WAL record (a short length prefix, a length that runs past
-  EOF, a bad CRC with no valid record after it, or a zero-filled tail) is
-  treated as a torn crash tail. `Db::open` ignores it; `open_rw` truncates it
-  before further appends. Damage followed by a later valid record is still a
-  hard error and is preserved.
-- `Db::open` re-checks the snapshot and WAL identities after the read and
-  retries if a concurrent checkpoint or append changed them mid-open.
+- An invalid WAL record is treated as a torn crash tail only when a resync of
+  the suffix finds no later CRC-valid record. `Db::open` ignores that tail;
+  `open_rw` copies it to `<db>.wal.torn` and then truncates it. Damage with a
+  later valid record, including a corrupted length that no longer points at
+  the next record, is still a hard error and is preserved. A length or CRC
+  failure of the last record is indistinguishable from a crash mid-append and
+  may drop that last record.
+- `Db::open` re-checks the snapshot and WAL after the read. It retries only
+  if the snapshot changed, or the WAL was replaced or shrunk. Growth of an
+  existing WAL is a consistent prefix and does not fail the open.
 - A checkpoint writes a snapshot atomically (temp file, fsync, rename, directory
   fsync) and then truncates the WAL.
 - Replay is idempotent: points already covered by the snapshot are skipped, so a

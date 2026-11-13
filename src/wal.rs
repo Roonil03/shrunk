@@ -66,6 +66,10 @@ impl LockedWal {
         self.len
     }
 
+    pub(crate) fn created(&self) -> bool {
+        self.created
+    }
+
     /// Validate or recreate the header, replay complete records, and truncate
     /// a torn terminal record. Returns a still-locked writer ready to append.
     pub(crate) fn recover<F>(
@@ -118,6 +122,7 @@ impl LockedWal {
             apply(block_size, series, points)
         })?;
         if valid_end != len {
+            preserve_torn_tail(&path, &file, valid_end, len)?;
             file.set_len(valid_end)?;
             file.sync_data()?;
         }
@@ -254,19 +259,15 @@ fn write_header(file: &mut File, block_size: usize) -> Result<()> {
     Ok(())
 }
 
-/// Open a WAL without following a final-component symlink, and reject special
-/// files. New WALs are private to their owner on Unix (subject to umask).
 /// Linux/Android `O_NOFOLLOW`. The value is architecture-specific: 0x8000 on
-/// arm, aarch64, powerpc, and sparc; 0x20000 (asm-generic) elsewhere.
+/// arm, aarch64, and powerpc; 0x20000 (asm-generic) elsewhere.
 #[cfg(all(
     any(target_os = "linux", target_os = "android"),
     any(
         target_arch = "arm",
         target_arch = "aarch64",
         target_arch = "powerpc",
-        target_arch = "powerpc64",
-        target_arch = "sparc",
-        target_arch = "sparc64"
+        target_arch = "powerpc64"
     )
 ))]
 const LINUX_O_NOFOLLOW: i32 = 0o100000;
@@ -276,13 +277,13 @@ const LINUX_O_NOFOLLOW: i32 = 0o100000;
         target_arch = "arm",
         target_arch = "aarch64",
         target_arch = "powerpc",
-        target_arch = "powerpc64",
-        target_arch = "sparc",
-        target_arch = "sparc64"
+        target_arch = "powerpc64"
     ))
 ))]
 const LINUX_O_NOFOLLOW: i32 = 0o400000;
 
+/// Open a WAL without following a final-component symlink, and reject special
+/// files. New WALs are private to their owner on Unix (subject to umask).
 fn open_wal(path: &Path, writable: bool, create_new: bool, append: bool) -> std::io::Result<File> {
     let mut options = OpenOptions::new();
     options.read(true).write(writable).append(append);
@@ -338,6 +339,24 @@ fn check_wal_size(len: u64) -> Result<()> {
             "WAL size {len} exceeds recovery limit {MAX_WAL_BYTES}"
         )));
     }
+    Ok(())
+}
+
+fn preserve_torn_tail(path: &Path, file: &File, valid_end: u64, len: u64) -> Result<()> {
+    let mut tail = path.as_os_str().to_os_string();
+    tail.push(".torn");
+    let torn_path = PathBuf::from(tail);
+    let mut buf = vec![0u8; (len - valid_end) as usize];
+    let mut reader = file.try_clone()?;
+    reader.seek(SeekFrom::Start(valid_end))?;
+    reader.read_exact(&mut buf)?;
+    let mut out = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&torn_path)?;
+    out.write_all(&buf)?;
+    out.sync_data()?;
     Ok(())
 }
 
@@ -425,11 +444,11 @@ where
     Ok(())
 }
 
-/// Walk complete records. An invalid record at EOF (short length prefix,
-/// length past EOF, bad CRC, or an undecodable tail such as a zero-filled
-/// empty record) is treated as a torn crash tail and is not applied.
-/// Damage followed by a later valid record is a hard error.
-/// Returns the byte offset after the last complete record.
+/// Walk complete records. An invalid record is treated as a torn crash
+/// tail only when no later CRC-valid, decodable record can be found, even
+/// after a byte-by-byte resync of the suffix. Mid-file damage that still
+/// has a later valid record is a hard error. Returns the byte offset after
+/// the last complete record.
 fn scan_records<F>(file: &mut File, len: u64, decode: bool, apply: &mut F) -> Result<u64>
 where
     F: FnMut(&str, &[Point]) -> Result<()>,
@@ -446,17 +465,12 @@ where
         file.read_exact(&mut len_buf)?;
         let record_len = u32::from_le_bytes(len_buf) as u64;
         let total = record_len + 8;
-        if record_len > MAX_WAL_RECORD_BYTES {
-            if total > remaining {
-                // A torn or garbage length prefix at EOF cannot be a
-                // committed record.
-                break;
+        if record_len > MAX_WAL_RECORD_BYTES || total > remaining {
+            if suffix_has_valid_record(file, pos, len)? {
+                return Err(Error::Format(format!(
+                    "WAL record length {record_len} at byte {pos} is followed by a later valid record; damaged data preserved"
+                )));
             }
-            return Err(Error::Format(format!(
-                "WAL record size {record_len} exceeds limit {MAX_WAL_RECORD_BYTES}"
-            )));
-        }
-        if total > remaining {
             break;
         }
         let mut payload = vec![0u8; record_len as usize];
@@ -466,7 +480,7 @@ where
         let stored = u32::from_le_bytes(crc_buf);
         let crc_ok = crc32(&payload) == stored;
         if !crc_ok {
-            if has_valid_record_after(file, pos + total, len)? {
+            if suffix_has_valid_record(file, pos, len)? {
                 return Err(Error::Format(format!(
                     "WAL checksum mismatch at byte {pos}; damaged data preserved"
                 )));
@@ -477,7 +491,7 @@ where
             match decode_payload(&payload) {
                 Ok((series, points)) => apply(&series, &points)?,
                 Err(error) => {
-                    if has_valid_record_after(file, pos + total, len)? {
+                    if suffix_has_valid_record(file, pos, len)? {
                         return Err(error);
                     }
                     break;
@@ -489,33 +503,40 @@ where
     Ok(pos)
 }
 
-/// True if a complete, checksum-valid, decodable record exists at or after
-/// `start`. Used to tell a torn tail from mid-file corruption.
-fn has_valid_record_after(file: &mut File, mut pos: u64, len: u64) -> Result<bool> {
-    while pos < len {
-        let remaining = len - pos;
-        if remaining < 8 {
-            return Ok(false);
+/// True if a CRC-valid, decodable record exists at any byte offset in
+/// `[start, len)`. Used to tell a torn tail from mid-file corruption
+/// whose length prefix no longer points at the next record.
+fn suffix_has_valid_record(file: &mut File, start: u64, len: u64) -> Result<bool> {
+    if start >= len || len - start < 8 {
+        return Ok(false);
+    }
+    let suffix_len = (len - start) as usize;
+    let mut suffix = vec![0u8; suffix_len];
+    file.seek(SeekFrom::Start(start))?;
+    file.read_exact(&mut suffix)?;
+    if suffix.iter().all(|&b| b == 0) {
+        return Ok(false);
+    }
+    let mut offset = 0usize;
+    while offset + 8 <= suffix.len() {
+        let record_len =
+            u32::from_le_bytes(suffix[offset..offset + 4].try_into().unwrap()) as usize;
+        let total = record_len.saturating_add(8);
+        if record_len > 0
+            && record_len as u64 <= MAX_WAL_RECORD_BYTES
+            && offset + total <= suffix.len()
+        {
+            let payload = &suffix[offset + 4..offset + 4 + record_len];
+            let stored = u32::from_le_bytes(
+                suffix[offset + 4 + record_len..offset + total]
+                    .try_into()
+                    .unwrap(),
+            );
+            if crc32(payload) == stored && decode_payload(payload).is_ok() {
+                return Ok(true);
+            }
         }
-        file.seek(SeekFrom::Start(pos))?;
-        let mut len_buf = [0u8; 4];
-        file.read_exact(&mut len_buf)?;
-        let record_len = u32::from_le_bytes(len_buf) as u64;
-        if record_len > MAX_WAL_RECORD_BYTES {
-            return Ok(false);
-        }
-        let total = record_len + 8;
-        if total > remaining {
-            return Ok(false);
-        }
-        let mut payload = vec![0u8; record_len as usize];
-        file.read_exact(&mut payload)?;
-        let mut crc_buf = [0u8; 4];
-        file.read_exact(&mut crc_buf)?;
-        if crc32(&payload) == u32::from_le_bytes(crc_buf) && decode_payload(&payload).is_ok() {
-            return Ok(true);
-        }
-        pos += total;
+        offset += 1;
     }
     Ok(false)
 }
