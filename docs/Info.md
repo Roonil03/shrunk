@@ -94,13 +94,16 @@ db.checkpoint().unwrap();
 ```
 
 If the process dies before a checkpoint, `Db::open` replays complete WAL records.
-Legacy WAL v1 can safely repair an incomplete terminal length prefix. A complete
-length that extends beyond EOF, an invalid record, or a checksum mismatch is
-ambiguous damage: open fails and leaves the WAL intact for inspection. A
-checkpoint writes the snapshot to a new private temp file, fsyncs it, renames
-it, syncs the parent directory, then truncates the WAL. If a crash happens
-between rename and truncation, replay skips points already covered by the
-snapshot, so recovery is idempotent.
+An invalid final record — a short length prefix, a length that runs past EOF, a
+checksum mismatch with no later valid record, or a zero-filled tail — is treated
+as a torn crash tail: `open` ignores it and leaves the file alone, and
+`open_rw` truncates it before appending. Damage followed by a later valid
+record is still a hard error and is preserved for inspection. `open` also
+retries if the snapshot or WAL changes mid-read, so a concurrent checkpoint
+cannot produce a mixed view. A checkpoint writes the snapshot to a new private
+temp file, fsyncs it, renames it, syncs the parent directory, then truncates
+the WAL. If a crash happens between rename and truncation, replay skips points
+already covered by the snapshot, so recovery is idempotent.
 
 `Db::new` followed by `save` creates or replaces a snapshot only when its
 destination has no WAL. An unbound handle can also export its current contents

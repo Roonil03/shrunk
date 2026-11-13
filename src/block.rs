@@ -66,7 +66,7 @@ impl Payload {
         }
     }
 
-    fn with_bytes<T>(&self, f: impl FnOnce(&[u8]) -> T) -> Result<T, String> {
+    pub(crate) fn with_bytes<T>(&self, f: impl FnOnce(&[u8]) -> T) -> Result<T, String> {
         match self {
             Payload::Memory(bytes) => Ok(f(bytes)),
             Payload::File { .. } => {

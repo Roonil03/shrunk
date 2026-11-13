@@ -177,7 +177,7 @@ fn save_and_open_roundtrip() {
             .collect::<Vec<_>>()
     })
     .unwrap();
-    db.flush_all();
+    db.flush_all().unwrap();
     let before = db.summaries();
     db.save(&path).unwrap();
 
@@ -483,7 +483,7 @@ fn wal_append_does_not_rewrite_the_snapshot_and_checkpoint_truncates() {
 }
 
 #[test]
-fn wal_preserves_an_ambiguous_truncated_record() {
+fn wal_open_ignores_an_incomplete_terminal_record() {
     let dir = std::env::temp_dir().join(format!("shrunk-wal3-{}", std::process::id()));
     let _ = fs::create_dir_all(&dir);
     let path = dir.join("db.shrunk");
@@ -501,9 +501,59 @@ fn wal_preserves_an_ambiguous_truncated_record() {
     f.set_len(len - 3).unwrap();
     drop(f);
 
-    let error = Db::open(&path).unwrap_err();
-    assert!(error.to_string().contains("damaged data preserved"));
+    // A reader ignores the torn tail and leaves the file alone.
+    let read = Db::open(&path).unwrap();
+    assert_eq!(read.point_count(), 10);
     assert_eq!(fs::metadata(&wal).unwrap().len(), len - 3);
+
+    // A writer truncates the torn tail so later appends stay valid.
+    let mut rw = Db::open_rw(&path).unwrap();
+    assert_eq!(rw.point_count(), 10);
+    assert!(fs::metadata(&wal).unwrap().len() < len - 3 || fs::metadata(&wal).unwrap().len() < len);
+    rw.append("m", &series(10, 1_200, 10)).unwrap();
+    drop(rw);
+    let recovered = Db::open(&path).unwrap();
+    assert_eq!(recovered.point_count(), 20);
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn wal_recovers_zero_filled_and_bad_crc_tails() {
+    let dir = std::env::temp_dir().join(format!("shrunk-wal-tails-{}", std::process::id()));
+    let _ = fs::create_dir_all(&dir);
+    let path = dir.join("db.shrunk");
+    let wal = wal_sidecar(&path);
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_file(&wal);
+
+    let mut db = Db::open_rw_with_block_size(&path, 64).unwrap();
+    db.append("m", &[Point::new(1, 1.0)]).unwrap();
+    drop(db);
+    let committed = fs::read(&wal).unwrap();
+
+    // Zero-filled tail.
+    let mut bytes = committed.clone();
+    bytes.extend_from_slice(&[0u8; 16]);
+    fs::write(&wal, &bytes).unwrap();
+    assert_eq!(Db::open(&path).unwrap().point_count(), 1);
+    let rw = Db::open_rw(&path).unwrap();
+    assert_eq!(rw.point_count(), 1);
+    drop(rw);
+    assert_eq!(fs::read(&wal).unwrap(), committed);
+
+    // Bad CRC at EOF of the only record's trailing bytes... flip last byte of
+    // a second, complete-looking copy so the first record stays valid.
+    let mut db = Db::open_rw(&path).unwrap();
+    db.append("m", &[Point::new(2, 2.0)]).unwrap();
+    drop(db);
+    let mut bytes = fs::read(&wal).unwrap();
+    *bytes.last_mut().unwrap() ^= 0x80;
+    fs::write(&wal, &bytes).unwrap();
+    assert_eq!(Db::open(&path).unwrap().point_count(), 1);
+    let rw = Db::open_rw(&path).unwrap();
+    assert_eq!(rw.point_count(), 1);
+    drop(rw);
 
     let _ = fs::remove_dir_all(&dir);
 }
