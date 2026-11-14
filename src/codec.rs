@@ -1013,6 +1013,25 @@ mod tests {
     }
 
     #[test]
+    fn greedy_window_choice_can_increase_later_cost() {
+        let first = (1u64 << 63) | (1 << 12);
+        let second = first ^ ((1u64 << 63) | 1);
+        let mut w = BitWriter::new();
+        let mut window = Some((0, 0));
+        encode_xor(&mut w, 0, first, &mut window);
+        encode_xor(&mut w, first, second, &mut window);
+        let bytes = w.finish();
+        let mut r = BitReader::new(&bytes);
+        let mut window = Some((0, 0));
+        assert_eq!(decode_xor(&mut r, 0, &mut window).unwrap(), first);
+        assert_eq!(decode_xor(&mut r, first, &mut window).unwrap(), second);
+        // A one-bit local saving causes an 11-bit cost for the next window.
+        // Keeping the original 64-bit window twice would use 132 bits.
+        assert_eq!(r.bits_consumed(), 142);
+        check_bit_padding(&r, bytes.len()).unwrap();
+    }
+
+    #[test]
     fn narrowing_then_widening_preserves_exact_value_bits() {
         let bits = [
             0,
