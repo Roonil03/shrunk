@@ -66,10 +66,6 @@ impl LockedWal {
         self.len
     }
 
-    pub(crate) fn created(&self) -> bool {
-        self.created
-    }
-
     /// Validate or recreate the header, replay complete records, and truncate
     /// a torn terminal record. Returns a still-locked writer ready to append.
     pub(crate) fn recover<F>(

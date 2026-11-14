@@ -1051,7 +1051,6 @@ impl Db {
         // writer cannot replay onto an old generation and overwrite a
         // newer checkpoint.
         let locked = Wal::lock_writer(&wal_path)?;
-        let created = locked.created();
         let result = (|| -> Result<Db> {
             let has_snapshot = match path.symlink_metadata() {
                 Ok(_) => true,
@@ -1083,9 +1082,8 @@ impl Db {
             db.path = Some(path.to_path_buf());
             Ok(db)
         })();
-        if result.is_err() && created {
-            let _ = fs::remove_file(&wal_path);
-        }
+        // Keep a newly created WAL on error. Once the lock is released,
+        // unlinking its path could discard a second writer's acknowledged data.
         result
     }
 
@@ -2243,6 +2241,24 @@ mod tests {
         assert!(fs::read(&wal_path).unwrap().len() < bytes.len());
         drop(rw);
         let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&wal_path);
+    }
+
+    #[test]
+    fn failed_writer_open_keeps_lock_file_for_retry() {
+        let path =
+            std::env::temp_dir().join(format!("shrunk-failed-open-{}.db", std::process::id()));
+        let wal_path = wal::wal_path(&path);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&wal_path);
+        fs::write(&path, b"bad snapshot").unwrap();
+        assert!(Db::open_rw(&path).is_err());
+        assert!(wal_path.exists());
+        fs::remove_file(&path).unwrap();
+        let mut db = Db::open_rw(&path).unwrap();
+        db.write("s", 1, 2.0).unwrap();
+        drop(db);
+        assert_eq!(Db::open(&path).unwrap().point_count(), 1);
         let _ = fs::remove_file(&wal_path);
     }
 
