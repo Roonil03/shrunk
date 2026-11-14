@@ -44,8 +44,11 @@ handles closed query output pipes. Regression tests accompany these changes.
    recovered suffixes are preserved, and a bounded resync can refuse recovery
    when its work budget is exhausted. Operators should retain independent
    backups.
-4. A formal verification effort would need explicit models for filesystem
-   durability, concurrency, codecs, floating-point behavior and Rust code,
-   with proofs connected to the implementation. This review does not provide
-   those proofs. Further fuzzing, fault injection and cross-platform crash tests
-   would improve evidence without replacing them.
+4. Formal verification is incremental. [Core verification](../proofs/README.md)
+   records Lean models for codec algebra, byte behavior, ordered replay and
+   time pruning, plus Kani checks of actual Rust encoding helpers and bounded
+   storage arithmetic. It states each input domain and assumption. Full codec
+   refinement, database cache maintenance, filesystem durability, concurrency
+   and floating-point behavior remain unproved. Fuzzing, fault injection and
+   cross-platform crash tests improve separate evidence without closing those
+   formal gaps.

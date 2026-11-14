@@ -75,3 +75,5 @@ theorem residuals_roundtrip (previous : BitVec 64) (values : List (BitVec 64)) :
     simp [encodeResiduals, decodeResiduals, xor64_reconstruct, ih]
 
 #print axioms residuals_roundtrip
+#print axioms ties_reuse
+#print axioms xor_reconstruct
