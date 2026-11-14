@@ -246,3 +246,40 @@ cargo build --release
 - Zhou, Li, Xu, Li, Zhang. GR: a fixed-frequency time series data timestamp
   compression algorithm based on RLE. ICCAIS 2025, 2026.
   https://doi.org/10.1117/12.3111295
+
+## Cost-based Gorilla window updates
+
+The Gorilla XOR encoder now compares the cost of reusing a compatible window
+with the cost of declaring a new one: the old window width versus 11 metadata
+bits plus the new width. Both alternatives use the same two tag bits. Ties
+reuse the old window. The existing wire grammar and decoders are unchanged.
+The choice minimizes the current residual's bits, not the entire stream: a
+narrower window can make a later residual more expensive. See
+[`proofs/README.md`](../proofs/README.md) for the Lean model and its limits.
+
+A single synthetic run on Linux x86_64 (8 logical CPUs), rustc 1.99.1,
+release mode, block size 1024, 100,000 points, using the checked-in CLI:
+
+```sh
+cargo build --release
+./target/release/shrunk codec-bench --points 100000
+./target/release/shrunk bench --points 100000 --pattern cpu
+./target/release/shrunk bench --points 100000 --pattern oscillating
+```
+
+The baseline binary was built before the encoder change (commit `aeb8d05`;
+upstream changes through `1e7c834` do not alter codec logic). Payload sizes
+from `codec-bench` were:
+
+| pattern / codec | before bits/point | after bits/point |
+|---|---:|---:|
+| CPU / Gorilla-RLE | 55.63 | 53.91 |
+| noise / Gorilla-RLE | 64.55 | 58.50 |
+| counter / predictor | 2.17 | 2.17 |
+| saw / predictor | 30.96 | 28.74 |
+| oscillating / predictor | 61.04 | 41.05 |
+
+Whole-file CPU changed from 56.09 to 54.37 bits/point; oscillating changed
+from 59.97 to 41.51. These are synthetic results, not a universal size or
+throughput guarantee; timings were affected by shared system load and are not
+compared here.
