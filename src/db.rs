@@ -710,6 +710,8 @@ impl Db {
 
     /// Aggregate over an inclusive time range. Full blocks with no value
     /// predicate are answered from block metadata and never decoded.
+    /// Floating-point sum and average depend on accumulation order: block
+    /// boundaries and a value predicate can change rounding and the result.
     pub fn aggregate(
         &self,
         series: &str,
@@ -2249,6 +2251,21 @@ mod tests {
         drop(rw);
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(&wal_path);
+    }
+
+    #[test]
+    fn sum_rounding_can_depend_on_query_plan() {
+        let mut db = Db::with_block_size(2);
+        for (ts, value) in [1e16, 1.0, -1e16, 1.0].into_iter().enumerate() {
+            db.write("s", ts as i64, value).unwrap();
+        }
+        let metadata = db.aggregate("s", 0, 3, Agg::Sum, None).unwrap().value;
+        let decoded = db
+            .aggregate("s", 0, 3, Agg::Sum, Some(Predicate::Gt(f64::NEG_INFINITY)))
+            .unwrap()
+            .value;
+        assert_eq!(metadata, Some(0.0));
+        assert_eq!(decoded, Some(1.0));
     }
 
     #[test]

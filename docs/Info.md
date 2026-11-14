@@ -74,6 +74,13 @@ so a bad point leaves the series unchanged. A batch is limited to one million
 points; generated CLI workloads are written in chunks of that size. A query
 returning more than 16 million points errors rather than growing without bound.
 
+`flush_all` returns `Result<()>`; callers should handle failures (for example,
+`db.flush_all()?`). `Error` is non-exhaustive, so external exhaustive matches
+need a wildcard arm. These are source-level API changes from earlier versions.
+Sum and average use floating-point arithmetic. Block metadata groups additions,
+so changing block boundaries or adding a predicate can change rounding; these
+aggregates do not promise identical bits across query plans.
+
 For durable incremental appends, open the database with `Db::open_rw` (or
 `Db::open_rw_with_block_size`). Each `append`/`write_many` is written to a
 `<db>.wal` sidecar and fsynced before it is applied in memory:
