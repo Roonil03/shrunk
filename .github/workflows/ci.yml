@@ -80,4 +80,15 @@ jobs:
           curl --fail --location --retry 3 -o lean.tar.zst https://github.com/leanprover/lean4/releases/download/v4.19.0/lean-4.19.0-linux.tar.zst
           echo '6fe3ce97a58f44e2b3567d455b994eacec5bfe9ae7774f2a573444480ba813fe  lean.tar.zst' | sha256sum --check
           tar --zstd -xf lean.tar.zst
-      - run: ./lean-4.19.0-linux/bin/lean -j 1 proofs/WindowChoice.lean
+      - run: LEAN=./lean-4.19.0-linux/bin/lean bash scripts/verify-lean.sh
+
+  kani:
+    name: Rust model checking
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo install --locked kani-verifier --version 0.68.0
+      - run: cargo kani setup
+      - run: cargo kani --lib
