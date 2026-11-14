@@ -102,10 +102,20 @@ at least 8% of adjacent XORs can take the skip path.
 
 - `<db>.wal` is an append-only sidecar with a versioned header and CRC'd point
   records.
-- `Db::open_rw` / `open_rw_with_block_size` bind a database for appends.
-  `append`, `write`, and `write_many` fsync the WAL before applying to memory.
-- Replay stops at the first short or bad-CRC record, so a torn crash tail is
-  ignored.
+- `Db::open_rw` / `open_rw_with_block_size` take the exclusive WAL lock before
+  reading the snapshot, then bind the database for appends. `append`, `write`,
+  and `write_many` fsync the WAL before applying to memory. There is no group
+  commit: each batch is one `fsync`.
+- An invalid WAL record is treated as a torn crash tail only when a resync of
+  the suffix finds no later CRC-valid record. `Db::open` ignores that tail;
+  `open_rw` copies it to `<db>.wal.torn` (or a numbered `.torn.N` backup if that name exists) and then truncates it. Damage with a
+  later valid record, including a corrupted length that no longer points at
+  the next record, is still a hard error and is preserved. A length or CRC
+  failure of the last record is indistinguishable from a crash mid-append and
+  may drop that last record.
+- `Db::open` re-checks the snapshot and WAL after the read. It retries only
+  if the snapshot changed, or the WAL was replaced or shrunk. Growth of an
+  existing WAL is a consistent prefix and does not fail the open.
 - A checkpoint writes a snapshot atomically (temp file, fsync, rename, directory
   fsync) and then truncates the WAL.
 - Replay is idempotent: points already covered by the snapshot are skipped, so a

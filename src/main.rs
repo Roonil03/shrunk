@@ -1,7 +1,7 @@
 use std::env;
 use std::fmt::Display;
 use std::fs;
-use std::io::Read;
+use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,6 +14,16 @@ fn main() {
     if let Err(e) = run() {
         eprintln!("error: {e}");
         std::process::exit(1);
+    }
+}
+
+/// Write one line to stdout. Returns `Ok(false)` on a closed pipe so callers
+/// can stop without aborting (release builds use `panic = "abort"`).
+fn emit_line(line: impl std::fmt::Display) -> Result<bool, String> {
+    match writeln!(io::stdout(), "{line}") {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(false),
+        Err(e) => Err(e.to_string()),
     }
 }
 
@@ -200,17 +210,23 @@ fn cmd_query(args: &[String]) -> Result<(), String> {
     let pred = parse_predicate(args)?;
 
     if let Some(agg_s) = flag(args, "--agg") {
+        if limit.is_some() || csv {
+            return Err("--limit and --csv cannot be used with --agg".into());
+        }
         let agg = Agg::parse(agg_s)
             .ok_or_else(|| format!("unknown aggregate {agg_s:?} (count, sum, min, max, avg)"))?;
         let res = db
             .aggregate(series, from, to, agg, pred)
             .map_err(|e| e.to_string())?;
-        match res.value {
-            Some(v) => println!("{v:.6}"),
-            None => println!("null"),
+        let emitted = match res.value {
+            Some(v) => emit_line(format!("{v:.6}"))?,
+            None => emit_line("null")?,
+        };
+        if !emitted {
+            return Ok(());
         }
         if explain {
-            print_query_stats(&res.stats);
+            print_query_stats(&res.stats)?;
         }
         return Ok(());
     }
@@ -224,18 +240,21 @@ fn cmd_query(args: &[String]) -> Result<(), String> {
     }
     let res = db.query(&q).map_err(|e| e.to_string())?;
 
-    if csv {
-        println!("timestamp,value");
+    if csv && !emit_line("timestamp,value")? {
+        return Ok(());
     }
     for p in &res.points {
-        if csv {
-            println!("{},{}", p.ts, p.value);
+        let line = if csv {
+            format!("{},{}", p.ts, p.value)
         } else {
-            println!("{} {}", p.ts, p.value);
+            format!("{} {}", p.ts, p.value)
+        };
+        if !emit_line(line)? {
+            return Ok(());
         }
     }
     if explain {
-        print_query_stats(&res.stats);
+        print_query_stats(&res.stats)?;
     }
     Ok(())
 }
@@ -621,7 +640,7 @@ fn cmd_demo(args: &[String]) -> Result<(), String> {
         "query cpu.load over 300 s: {} points returned",
         res.points.len()
     );
-    print_query_stats(&res.stats);
+    print_query_stats(&res.stats)?;
 
     let spikes = db
         .query(
@@ -634,7 +653,7 @@ fn cmd_demo(args: &[String]) -> Result<(), String> {
         "query whole series with value > 90 (limit 10): {} spike points returned",
         spikes.points.len()
     );
-    print_query_stats(&spikes.stats);
+    print_query_stats(&spikes.stats)?;
 
     let cnt = db
         .aggregate("cpu.load", window_start, window_end, Agg::Count, None)
@@ -695,13 +714,24 @@ fn print_summaries(db: &Db) {
     println!();
 }
 
-fn print_query_stats(stats: &QueryStats) {
+fn print_query_stats(stats: &QueryStats) -> Result<(), String> {
+    write_query_stats(&mut io::stderr(), stats).or_else(|e| {
+        if e.kind() == io::ErrorKind::BrokenPipe {
+            Ok(())
+        } else {
+            Err(e.to_string())
+        }
+    })
+}
+
+fn write_query_stats(out: &mut impl Write, stats: &QueryStats) -> io::Result<()> {
     let limit_note = if stats.blocks_skipped_limit > 0 {
         format!(", {} left unread after limit", stats.blocks_skipped_limit)
     } else {
         String::new()
     };
-    eprintln!(
+    writeln!(
+        out,
         "blocks: {} total, {} visited, {} decoded, {} skipped ({} time, {} value){}{}",
         stats.blocks_total,
         stats.blocks_visited,
@@ -715,8 +745,9 @@ fn print_query_stats(stats: &QueryStats) {
             String::new()
         },
         limit_note
-    );
-    eprintln!(
+    )?;
+    writeln!(
+        out,
         "read: {} points from {} bytes of compressed payload{}",
         stats.points_decoded,
         stats.bytes_decoded,
@@ -728,7 +759,7 @@ fn print_query_stats(stats: &QueryStats) {
         } else {
             String::new()
         }
-    );
+    )
 }
 
 fn parse_predicate(args: &[String]) -> Result<Option<Predicate>, String> {
