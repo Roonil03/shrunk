@@ -343,20 +343,38 @@ fn check_wal_size(len: u64) -> Result<()> {
 }
 
 fn preserve_torn_tail(path: &Path, file: &File, valid_end: u64, len: u64) -> Result<()> {
-    let mut tail = path.as_os_str().to_os_string();
-    tail.push(".torn");
-    let torn_path = PathBuf::from(tail);
     let mut buf = vec![0u8; (len - valid_end) as usize];
     let mut reader = file.try_clone()?;
     reader.seek(SeekFrom::Start(valid_end))?;
     reader.read_exact(&mut buf)?;
-    let mut out = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&torn_path)?;
+    // Never overwrite an earlier backup or follow an attacker-controlled link.
+    let mut number = 0u64;
+    let (torn_path, mut out) = loop {
+        let mut name = path.as_os_str().to_os_string();
+        name.push(if number == 0 {
+            ".torn".to_string()
+        } else {
+            format!(".torn.{number}")
+        });
+        let candidate = PathBuf::from(name);
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        match options.open(&candidate) {
+            Ok(file) => break (candidate, file),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                number = number
+                    .checked_add(1)
+                    .ok_or_else(|| Error::Limit("torn backup names exhausted".into()))?;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    };
     out.write_all(&buf)?;
-    out.sync_data()?;
+    out.sync_all()?;
+    // Persist the backup's directory entry before removing bytes from the WAL.
+    sync_parent_dir(&torn_path)?;
     Ok(())
 }
 
@@ -752,6 +770,41 @@ mod tests {
         .unwrap();
         assert_eq!(points_only, vec![first]);
         remove(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn torn_backup_is_private_and_never_clobbers_existing_files_or_symlinks() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let path = test_path("backup-no-clobber");
+        let first = PathBuf::from(format!("{}.torn", path.display()));
+        let second = PathBuf::from(format!("{}.torn.1", path.display()));
+        let victim = test_path("backup-victim");
+        for p in [&path, &first, &second, &victim] {
+            remove(p);
+        }
+        std::fs::write(&victim, b"keep").unwrap();
+        symlink(&victim, &first).unwrap();
+        let mut bytes = Vec::new();
+        write_header_to_vec(&mut bytes, 64);
+        bytes.extend_from_slice(&[1, 2, 3]);
+        std::fs::write(&path, &bytes).unwrap();
+        drop(open_writer(&path, 64));
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+        assert_eq!(std::fs::read(&second).unwrap(), [1, 2, 3]);
+        assert_eq!(
+            std::fs::metadata(&second).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        // A subsequent repair also preserves the first backup.
+        std::fs::write(&path, &bytes).unwrap();
+        drop(open_writer(&path, 64));
+        let third = PathBuf::from(format!("{}.torn.2", path.display()));
+        assert_eq!(std::fs::read(&second).unwrap(), [1, 2, 3]);
+        assert_eq!(std::fs::read(&third).unwrap(), [1, 2, 3]);
+        for p in [&path, &first, &second, &third, &victim] {
+            remove(p);
+        }
     }
 
     #[test]

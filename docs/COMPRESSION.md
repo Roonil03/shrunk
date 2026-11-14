@@ -108,7 +108,7 @@ at least 8% of adjacent XORs can take the skip path.
   commit: each batch is one `fsync`.
 - An invalid WAL record is treated as a torn crash tail only when a resync of
   the suffix finds no later CRC-valid record. `Db::open` ignores that tail;
-  `open_rw` copies it to `<db>.wal.torn` and then truncates it. Damage with a
+  `open_rw` copies it to `<db>.wal.torn` (or a numbered `.torn.N` backup if that name exists) and then truncates it. Damage with a
   later valid record, including a corrupted length that no longer points at
   the next record, is still a hard error and is preserved. A length or CRC
   failure of the last record is indistinguishable from a crash mid-append and

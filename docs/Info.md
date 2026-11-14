@@ -96,7 +96,7 @@ db.checkpoint().unwrap();
 If the process dies before a checkpoint, `Db::open` replays complete WAL records.
 An invalid record is treated as a torn crash tail only when a resync of the
 suffix finds no later CRC-valid record: `open` ignores that tail and leaves
-the file alone, and `open_rw` copies it to `<db>.wal.torn` before truncating
+the file alone, and `open_rw` copies it to `<db>.wal.torn` (or a numbered `.torn.N` backup if that name exists) before truncating
 and appending. A length or CRC failure of the last record is indistinguishable
 from a crash mid-append and may drop that last record. Damage with a later
 valid record, including a corrupted length field, is still a hard error and is
@@ -188,7 +188,7 @@ repeated:
 Each batch is fsynced before the in-memory series is updated. There is no group
 commit. WAL version 1 framing and codec IDs are unchanged. Replay ignores a
 torn terminal record after a suffix resync finds no later valid record, and
-`open_rw` copies that tail to `<db>.wal.torn` before truncating. Damage with
+`open_rw` copies that tail to `<db>.wal.torn` (or a numbered `.torn.N` backup if that name exists) before truncating. Damage with
 a later valid record errors out and is preserved. WAL creation uses mode
 `0600` on Unix; reads and writes reject non-regular WAL files and
 final-component symlinks. `O_NOFOLLOW` uses the correct architecture-specific
