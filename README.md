@@ -98,7 +98,6 @@ the label on the box.
   reproducible compression benchmarks.
 - [Compression notes](docs/COMPRESSION.md): measured codec results, research
   verdicts, and trade-offs.
-- [Core audit](docs/AUDIT.md): reviewed contracts, findings, and limitations.
 - [Pre-hardening baseline](docs/BASELINE.md): the numbers this work started
   from.
 - [Contributing](CONTRIBUTING.md): development setup, the pull request process,

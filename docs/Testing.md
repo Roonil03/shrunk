@@ -44,7 +44,7 @@ cargo build --release
 
 ## Formal checks
 
-The [core verification coverage ledger](../proofs/README.md) separates Lean
+The [core verification guide](../proofs/README.md) separates Lean
 model proofs from Kani checks of actual Rust helpers, with explicit bounds,
 assumptions, and remaining gaps. With Lean 4.19.0 and Kani 0.68.0 installed:
 
