@@ -359,6 +359,7 @@ pub struct Db {
     block_size: usize,
     format_version: u16,
     series: BTreeMap<String, Series>,
+    projected_blocks: usize,
     path: Option<PathBuf>,
     wal: Option<Wal>,
 }
@@ -379,6 +380,7 @@ impl Db {
             block_size: block_size.clamp(1, MAX_BLOCK_SIZE),
             format_version: FORMAT_VERSION,
             series: BTreeMap::new(),
+            projected_blocks: 0,
             path: None,
             wal: None,
         }
@@ -411,7 +413,8 @@ impl Db {
         validate_series_write(series, !self.series.contains_key(series), self.series.len())?;
         let block_size = self.block_size;
         let pending_len = self.series.get(series).map_or(0, |s| s.pending.len());
-        self.ensure_block_budget(self.write_block_delta(series, pending_len, 1))?;
+        let projected = self.projected_after_write(series, pending_len, 1);
+        self.ensure_block_budget(projected)?;
         let s = self
             .series
             .entry(series.to_string())
@@ -437,6 +440,7 @@ impl Db {
             let chunk = std::mem::take(&mut s.pending);
             s.blocks.push(Block::build(&chunk));
         }
+        self.projected_blocks = projected;
         Ok(())
     }
 
@@ -483,8 +487,9 @@ impl Db {
     fn apply_points(&mut self, series: &str, points: &[Point], enforce_budget: bool) -> Result<()> {
         let pending_len = self.series.get(series).map_or(0, |s| s.pending.len());
         let block_size = self.block_size;
+        let projected = self.projected_after_write(series, pending_len, points.len());
         if enforce_budget {
-            self.ensure_block_budget(self.write_block_delta(series, pending_len, points.len()))?;
+            self.ensure_block_budget(projected)?;
         }
         if let Some(wal) = self.wal.as_mut() {
             wal.append(series, points)?;
@@ -514,6 +519,7 @@ impl Db {
             remaining = &remaining[block_size..];
         }
         s.pending.extend_from_slice(remaining);
+        self.projected_blocks = projected;
         Ok(())
     }
 
@@ -535,7 +541,7 @@ impl Db {
             .get(series)
             .ok_or_else(|| Error::UnknownSeries(series.to_string()))?
             .flush_block_delta(block_size);
-        self.ensure_block_budget(extra)?;
+        self.ensure_block_budget(self.total_blocks().saturating_add(extra))?;
         self.series
             .get_mut(series)
             .ok_or_else(|| Error::UnknownSeries(series.to_string()))?
@@ -548,7 +554,7 @@ impl Db {
             .values()
             .map(|s| s.flush_block_delta(self.block_size))
             .sum();
-        self.ensure_block_budget(extra)?;
+        self.ensure_block_budget(self.total_blocks().saturating_add(extra))?;
         let block_size = self.block_size;
         for s in self.series.values_mut() {
             s.flush(block_size)?;
@@ -560,50 +566,34 @@ impl Db {
         self.series.values().map(|s| s.blocks.len()).sum()
     }
 
-    fn ensure_block_budget(&self, additional: usize) -> Result<()> {
-        let total = self
-            .total_blocks()
-            .checked_add(additional)
-            .ok_or_else(|| Error::Limit("block count overflow".into()))?;
-        if total > MAX_TOTAL_BLOCKS {
+    fn ensure_block_budget(&self, projected: usize) -> Result<()> {
+        if projected > MAX_TOTAL_BLOCKS {
             return Err(Error::Limit("snapshot block budget exceeded".into()));
         }
         Ok(())
     }
 
-    /// Extra blocks this write would add, including the trailing block each
-    /// series will need at flush, so an acknowledged write can be checkpointed.
-    fn write_block_delta(&self, series: &str, pending_len: usize, new_points: usize) -> usize {
-        let mut projected = 0usize;
-        let mut seen = false;
-        for (name, s) in &self.series {
-            if name.as_str() == series {
-                seen = true;
-                projected = projected.saturating_add(projected_series_blocks(
-                    self.block_size,
-                    s.blocks.len(),
-                    s.blocks.last().map(|b| b.count as usize).unwrap_or(0),
-                    pending_len,
-                    new_points,
-                ));
-            } else {
-                projected = projected.saturating_add(
-                    s.blocks
-                        .len()
-                        .saturating_add(s.flush_block_delta(self.block_size)),
-                );
-            }
-        }
-        if !seen {
-            projected = projected.saturating_add(projected_series_blocks(
-                self.block_size,
-                0,
-                0,
-                0,
-                new_points,
-            ));
-        }
-        projected.saturating_sub(self.total_blocks())
+    /// Project the snapshot after this write without scanning other series.
+    fn projected_after_write(&self, series: &str, pending_len: usize, new_points: usize) -> usize {
+        let (blocks, last_count) = self.series.get(series).map_or((0, 0), |s| {
+            (
+                s.blocks.len(),
+                s.blocks.last().map_or(0, |b| b.count as usize),
+            )
+        });
+        let before = projected_series_blocks(self.block_size, blocks, last_count, pending_len, 0);
+        let total = pending_len.saturating_add(new_points);
+        let full = total / self.block_size;
+        let after = if full > 0 {
+            blocks
+                .saturating_add(full)
+                .saturating_add(usize::from(!total.is_multiple_of(self.block_size)))
+        } else {
+            projected_series_blocks(self.block_size, blocks, last_count, pending_len, new_points)
+        };
+        self.projected_blocks
+            .saturating_sub(before)
+            .saturating_add(after)
     }
 
     /// Full scan. Time bounds are inclusive.
@@ -710,6 +700,8 @@ impl Db {
 
     /// Aggregate over an inclusive time range. Full blocks with no value
     /// predicate are answered from block metadata and never decoded.
+    /// Floating-point sum and average depend on accumulation order: block
+    /// boundaries and a value predicate can change rounding and the result.
     pub fn aggregate(
         &self,
         series: &str,
@@ -1051,7 +1043,6 @@ impl Db {
         // writer cannot replay onto an old generation and overwrite a
         // newer checkpoint.
         let locked = Wal::lock_writer(&wal_path)?;
-        let created = locked.created();
         let result = (|| -> Result<Db> {
             let has_snapshot = match path.symlink_metadata() {
                 Ok(_) => true,
@@ -1083,9 +1074,8 @@ impl Db {
             db.path = Some(path.to_path_buf());
             Ok(db)
         })();
-        if result.is_err() && created {
-            let _ = fs::remove_file(&wal_path);
-        }
+        // Keep a newly created WAL on error. Once the lock is released,
+        // unlinking its path could discard a second writer's acknowledged data.
         result
     }
 
@@ -1098,6 +1088,13 @@ impl Db {
     }
 
     fn replay_record(&mut self, series: &str, points: &[Point]) -> Result<()> {
+        // partition_point and the query path both require ordered timestamps.
+        // A valid checksum alone does not establish that semantic invariant.
+        if points.windows(2).any(|pair| pair[0].ts >= pair[1].ts) {
+            return Err(Error::Format(
+                "WAL record timestamps are not strictly increasing".into(),
+            ));
+        }
         let last = self.series.get(series).and_then(|s| s.last_ts);
         let start = match last {
             Some(last) => points.partition_point(|p| p.ts <= last),
@@ -1667,6 +1664,7 @@ fn decode_current_file(file: File, len: u64) -> Result<Db> {
         )));
     }
     db.format_version = FORMAT_VERSION;
+    db.projected_blocks = total_blocks;
     Ok(db)
 }
 
@@ -1813,6 +1811,7 @@ fn decode_body(
             data.len() - c.pos
         )));
     }
+    db.projected_blocks = total_blocks;
     Ok(db)
 }
 
@@ -2243,6 +2242,90 @@ mod tests {
         assert!(fs::read(&wal_path).unwrap().len() < bytes.len());
         drop(rw);
         let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&wal_path);
+    }
+
+    #[test]
+    fn cached_block_budget_tracks_writes_flush_and_reload() {
+        fn check(db: &Db) {
+            let expected: usize = db
+                .series
+                .values()
+                .map(|s| s.blocks.len() + s.flush_block_delta(db.block_size))
+                .sum();
+            assert_eq!(db.projected_blocks, expected);
+        }
+        let path =
+            std::env::temp_dir().join(format!("shrunk-block-cache-{}.db", std::process::id()));
+        let _ = fs::remove_file(&path);
+        let mut db = Db::with_block_size(4);
+        db.write("a", 0, 0.0).unwrap();
+        db.flush("a").unwrap();
+        check(&db);
+        // A full new block after a short flushed block cannot merge backwards.
+        let points: Vec<_> = (1..=4)
+            .map(|ts| Point {
+                ts,
+                value: ts as f64,
+            })
+            .collect();
+        db.write_many("a", &points).unwrap();
+        check(&db);
+        assert_eq!(db.projected_blocks, 2);
+        for ts in 0..7 {
+            db.write("b", ts, ts as f64).unwrap();
+            check(&db);
+        }
+        db.flush_all().unwrap();
+        check(&db);
+        db.save(&path).unwrap();
+        let db = Db::open(&path).unwrap();
+        check(&db);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn sum_rounding_can_depend_on_query_plan() {
+        let mut db = Db::with_block_size(2);
+        for (ts, value) in [1e16, 1.0, -1e16, 1.0].into_iter().enumerate() {
+            db.write("s", ts as i64, value).unwrap();
+        }
+        let metadata = db.aggregate("s", 0, 3, Agg::Sum, None).unwrap().value;
+        let decoded = db
+            .aggregate("s", 0, 3, Agg::Sum, Some(Predicate::Gt(f64::NEG_INFINITY)))
+            .unwrap()
+            .value;
+        assert_eq!(metadata, Some(0.0));
+        assert_eq!(decoded, Some(1.0));
+    }
+
+    #[test]
+    fn replay_rejects_unordered_records_even_when_snapshot_would_skip_them() {
+        let mut db = Db::new();
+        db.write("s", 5, 1.0).unwrap();
+        let points = [Point { ts: 7, value: 1.0 }, Point { ts: 4, value: 2.0 }];
+        assert!(matches!(
+            db.replay_record("s", &points),
+            Err(Error::Format(_))
+        ));
+        assert_eq!(db.point_count(), 1);
+    }
+
+    #[test]
+    fn failed_writer_open_keeps_lock_file_for_retry() {
+        let path =
+            std::env::temp_dir().join(format!("shrunk-failed-open-{}.db", std::process::id()));
+        let wal_path = wal::wal_path(&path);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&wal_path);
+        fs::write(&path, b"bad snapshot").unwrap();
+        assert!(Db::open_rw(&path).is_err());
+        assert!(wal_path.exists());
+        fs::remove_file(&path).unwrap();
+        let mut db = Db::open_rw(&path).unwrap();
+        db.write("s", 1, 2.0).unwrap();
+        drop(db);
+        assert_eq!(Db::open(&path).unwrap().point_count(), 1);
         let _ = fs::remove_file(&wal_path);
     }
 

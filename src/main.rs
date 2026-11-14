@@ -218,16 +218,15 @@ fn cmd_query(args: &[String]) -> Result<(), String> {
         let res = db
             .aggregate(series, from, to, agg, pred)
             .map_err(|e| e.to_string())?;
-        match res.value {
-            Some(v) => {
-                emit_line(format!("{v:.6}"))?;
-            }
-            None => {
-                emit_line("null")?;
-            }
+        let emitted = match res.value {
+            Some(v) => emit_line(format!("{v:.6}"))?,
+            None => emit_line("null")?,
+        };
+        if !emitted {
+            return Ok(());
         }
         if explain {
-            print_query_stats(&res.stats);
+            print_query_stats(&res.stats)?;
         }
         return Ok(());
     }
@@ -255,7 +254,7 @@ fn cmd_query(args: &[String]) -> Result<(), String> {
         }
     }
     if explain {
-        print_query_stats(&res.stats);
+        print_query_stats(&res.stats)?;
     }
     Ok(())
 }
@@ -641,7 +640,7 @@ fn cmd_demo(args: &[String]) -> Result<(), String> {
         "query cpu.load over 300 s: {} points returned",
         res.points.len()
     );
-    print_query_stats(&res.stats);
+    print_query_stats(&res.stats)?;
 
     let spikes = db
         .query(
@@ -654,7 +653,7 @@ fn cmd_demo(args: &[String]) -> Result<(), String> {
         "query whole series with value > 90 (limit 10): {} spike points returned",
         spikes.points.len()
     );
-    print_query_stats(&spikes.stats);
+    print_query_stats(&spikes.stats)?;
 
     let cnt = db
         .aggregate("cpu.load", window_start, window_end, Agg::Count, None)
@@ -715,13 +714,24 @@ fn print_summaries(db: &Db) {
     println!();
 }
 
-fn print_query_stats(stats: &QueryStats) {
+fn print_query_stats(stats: &QueryStats) -> Result<(), String> {
+    write_query_stats(&mut io::stderr(), stats).or_else(|e| {
+        if e.kind() == io::ErrorKind::BrokenPipe {
+            Ok(())
+        } else {
+            Err(e.to_string())
+        }
+    })
+}
+
+fn write_query_stats(out: &mut impl Write, stats: &QueryStats) -> io::Result<()> {
     let limit_note = if stats.blocks_skipped_limit > 0 {
         format!(", {} left unread after limit", stats.blocks_skipped_limit)
     } else {
         String::new()
     };
-    eprintln!(
+    writeln!(
+        out,
         "blocks: {} total, {} visited, {} decoded, {} skipped ({} time, {} value){}{}",
         stats.blocks_total,
         stats.blocks_visited,
@@ -735,8 +745,9 @@ fn print_query_stats(stats: &QueryStats) {
             String::new()
         },
         limit_note
-    );
-    eprintln!(
+    )?;
+    writeln!(
+        out,
         "read: {} points from {} bytes of compressed payload{}",
         stats.points_decoded,
         stats.bytes_decoded,
@@ -748,7 +759,7 @@ fn print_query_stats(stats: &QueryStats) {
         } else {
             String::new()
         }
-    );
+    )
 }
 
 fn parse_predicate(args: &[String]) -> Result<Option<Predicate>, String> {
