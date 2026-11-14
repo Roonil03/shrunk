@@ -6,7 +6,8 @@ Run `lean proofs/WindowChoice.lean` from the repository root.
 The kernel-checked model establishes that, when both representations are
 valid, the chosen local bit cost is no greater than either alternative, and
 that ties choose reuse. It also proves the 64-bit XOR reconstruction identity
-and lossless window packing under explicit bounds for the zero regions.
+lossless window packing under explicit bounds for the zero regions, and a
+stateful list of XOR residuals reconstructing the original list.
 This is a local result, not a global optimality claim: changing the stored
 window affects later residuals, so an entire block can in principle grow.
 
