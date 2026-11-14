@@ -242,8 +242,11 @@ fn encode_xor(w: &mut BitWriter, prev_bits: u64, bits: u64, window: &mut Option<
     let tz = xor.trailing_zeros();
     let meaningful = 64 - lz - tz;
 
+    // Reuse costs the old width; a new window costs 11 metadata bits plus
+    // the new width. Both paths have the same two tag bits. Prefer reuse on
+    // ties, keeping the existing window available for later residuals.
     let reused = window
-        .map(|(plz, ptz)| lz >= plz && tz >= ptz)
+        .map(|(plz, ptz)| lz >= plz && tz >= ptz && 64 - plz - ptz <= 11 + meaningful)
         .unwrap_or(false);
 
     if reused {
@@ -981,6 +984,66 @@ mod tests {
             pts.push(Point { ts, value: v });
         }
         pts
+    }
+
+    #[test]
+    fn xor_window_chooses_cheaper_encoding_and_preserves_ties() {
+        let mut w = BitWriter::new();
+        let mut window = Some((0, 0));
+        encode_xor(&mut w, 0, 1, &mut window);
+        assert_eq!(window, Some((31, 0)));
+        let bytes = w.finish();
+        let mut r = BitReader::new(&bytes);
+        assert!(r.read_bit());
+        assert!(r.read_bit()); // A new narrow window replaces the 64-bit one.
+        let mut decode_window = Some((0, 0));
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(decode_xor(&mut r, 0, &mut decode_window).unwrap(), 1);
+        check_bit_padding(&r, bytes.len()).unwrap();
+        assert!(check_bit_padding(&r, bytes.len() - 1).is_err());
+
+        let mut w = BitWriter::new();
+        let mut window = Some((31, 0));
+        encode_xor(&mut w, 0, 1 << 11, &mut window);
+        let bytes = w.finish();
+        let mut r = BitReader::new(&bytes);
+        assert!(r.read_bit());
+        assert!(!r.read_bit()); // Reuse and new window both cost 33 bits.
+        assert_eq!(window, Some((31, 0)));
+    }
+
+    #[test]
+    fn narrowing_then_widening_preserves_exact_value_bits() {
+        let bits = [
+            0,
+            0x8000_0000_0000_0001,
+            0x8000_0000_0000_0000,
+            0x7ff8_0000_0000_0042,
+            0x7ff0_0000_0000_0000,
+            0xfff0_0000_0000_0000,
+            0,
+        ];
+        let points: Vec<_> = bits
+            .into_iter()
+            .enumerate()
+            .map(|(i, bits)| Point {
+                ts: i as i64,
+                value: f64::from_bits(bits),
+            })
+            .collect();
+        for codec in [Codec::Gorilla, Codec::GorillaRle, Codec::Predictor] {
+            let bytes = codec.encode(&points).unwrap();
+            let decoded = codec.decode(&bytes, points.len()).unwrap();
+            for (actual, expected) in decoded.iter().zip(&points) {
+                assert_eq!(
+                    (actual.ts, actual.value.to_bits()),
+                    (expected.ts, expected.value.to_bits())
+                );
+            }
+            assert!(codec
+                .decode(&bytes[..bytes.len() - 1], points.len())
+                .is_err());
+        }
     }
 
     #[test]
