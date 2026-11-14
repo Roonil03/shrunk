@@ -1443,3 +1443,7 @@ mod tests {
         assert_eq!(Codec::from_u8(7), None);
     }
 }
+
+#[cfg(kani)]
+#[path = "codec_verification.rs"]
+mod verification;

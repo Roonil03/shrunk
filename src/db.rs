@@ -581,19 +581,14 @@ impl Db {
                 s.blocks.last().map_or(0, |b| b.count as usize),
             )
         });
-        let before = projected_series_blocks(self.block_size, blocks, last_count, pending_len, 0);
-        let total = pending_len.saturating_add(new_points);
-        let full = total / self.block_size;
-        let after = if full > 0 {
-            blocks
-                .saturating_add(full)
-                .saturating_add(usize::from(!total.is_multiple_of(self.block_size)))
-        } else {
-            projected_series_blocks(self.block_size, blocks, last_count, pending_len, new_points)
-        };
-        self.projected_blocks
-            .saturating_sub(before)
-            .saturating_add(after)
+        projected_after_write_counts(
+            self.block_size,
+            self.projected_blocks,
+            blocks,
+            last_count,
+            pending_len,
+            new_points,
+        )
     }
 
     /// Full scan. Time bounds are inclusive.
@@ -1232,6 +1227,30 @@ fn wal_replaced(before: FileIdentity, after: FileIdentity) -> bool {
         let _ = (before, after);
         false
     }
+}
+
+// Calculate the cache update from one series' metadata without scanning other series.
+fn projected_after_write_counts(
+    block_size: usize,
+    projected_blocks: usize,
+    blocks: usize,
+    last_count: usize,
+    pending_len: usize,
+    new_points: usize,
+) -> usize {
+    let before = projected_series_blocks(block_size, blocks, last_count, pending_len, 0);
+    let total = pending_len.saturating_add(new_points);
+    let full = total / block_size;
+    let after = if full > 0 {
+        blocks
+            .saturating_add(full)
+            .saturating_add(usize::from(!total.is_multiple_of(block_size)))
+    } else {
+        projected_series_blocks(block_size, blocks, last_count, pending_len, new_points)
+    };
+    projected_blocks
+        .saturating_sub(before)
+        .saturating_add(after)
 }
 
 fn projected_series_blocks(
@@ -2347,5 +2366,158 @@ mod tests {
         assert!(Db::open_rw(&path).is_ok());
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(&wal_path);
+    }
+}
+
+// Bounded verification of the real arithmetic helpers. The specification
+// below packs points one at a time; it does not call the projection helpers.
+#[cfg(kani)]
+mod kani_storage {
+    use super::*;
+
+    fn packed_blocks(block_size: usize, blocks: usize, last_count: usize, points: usize) -> usize {
+        // Flush merges a short trailing block, if any, with the pending points.
+        let mut count = blocks;
+        let mut fill = 0;
+        if blocks > 0 && last_count < block_size {
+            count -= 1;
+            fill = last_count;
+        }
+        let mut left = points;
+        while left > 0 {
+            fill += 1;
+            if fill == block_size {
+                count += 1;
+                fill = 0;
+            }
+            left -= 1;
+        }
+        if fill > 0 {
+            count += 1;
+        }
+        count
+    }
+
+    #[kani::proof]
+    #[kani::unwind(9)]
+    fn projected_series_matches_point_packing() {
+        let block_size: usize = kani::any();
+        let blocks: usize = kani::any();
+        let last_count: usize = kani::any();
+        let pending: usize = kani::any();
+        let new_points: usize = kani::any();
+        kani::assume((1..=4).contains(&block_size));
+        kani::assume(blocks <= 4);
+        kani::assume(if blocks == 0 {
+            last_count == 0
+        } else {
+            (1..=block_size).contains(&last_count)
+        });
+        kani::assume(pending < block_size);
+        kani::assume(new_points <= 4);
+        assert_eq!(
+            projected_series_blocks(block_size, blocks, last_count, pending, new_points),
+            packed_blocks(block_size, blocks, last_count, pending + new_points)
+        );
+    }
+
+    // Model apply_points one point at a time before the eventual flush.
+    fn after_write_then_flush(
+        block_size: usize,
+        blocks: usize,
+        last_count: usize,
+        pending: usize,
+        new_points: usize,
+    ) -> usize {
+        let mut count = blocks;
+        let mut last = last_count;
+        let mut fill = pending;
+        let mut left = new_points;
+        while left > 0 {
+            fill += 1;
+            if fill == block_size {
+                count += 1;
+                last = block_size;
+                fill = 0;
+            }
+            left -= 1;
+        }
+        packed_blocks(block_size, count, last, fill)
+    }
+
+    #[kani::proof]
+    #[kani::unwind(9)]
+    fn write_projection_matches_point_packing() {
+        let block_size: usize = kani::any();
+        let blocks: usize = kani::any();
+        let last_count: usize = kani::any();
+        let pending: usize = kani::any();
+        let new_points: usize = kani::any();
+        let other_series_blocks: usize = kani::any();
+        kani::assume((1..=4).contains(&block_size));
+        kani::assume(blocks <= 4);
+        kani::assume(if blocks == 0 {
+            last_count == 0
+        } else {
+            (1..=block_size).contains(&last_count)
+        });
+        kani::assume(pending < block_size);
+        kani::assume(new_points <= 4);
+        let before = packed_blocks(block_size, blocks, last_count, pending);
+        kani::assume(other_series_blocks <= MAX_TOTAL_BLOCKS);
+        kani::assume(before <= MAX_TOTAL_BLOCKS - other_series_blocks);
+        let actual = projected_after_write_counts(
+            block_size,
+            before + other_series_blocks,
+            blocks,
+            last_count,
+            pending,
+            new_points,
+        );
+        assert_eq!(
+            actual,
+            other_series_blocks
+                + after_write_then_flush(block_size, blocks, last_count, pending, new_points)
+        );
+    }
+
+    #[kani::proof]
+    #[kani::unwind(9)]
+    fn flush_delta_matches_point_packing() {
+        let block_size: usize = kani::any();
+        let blocks: usize = kani::any();
+        let last_count: usize = kani::any();
+        let pending: usize = kani::any();
+        kani::assume((1..=4).contains(&block_size));
+        kani::assume(blocks <= 4);
+        kani::assume(if blocks == 0 {
+            last_count == 0
+        } else {
+            (1..=block_size).contains(&last_count)
+        });
+        kani::assume(pending < block_size);
+        // Only counts and pending length are read by flush_block_delta; no
+        // claim is made about decoding these synthetic block payloads.
+        let block = Block {
+            codec: Codec::Raw,
+            count: last_count as u32,
+            t_min: 0,
+            t_max: 0,
+            v_min: 0.0,
+            v_max: 0.0,
+            has_nan: false,
+            sum: None,
+            payload: Payload::Memory(Vec::new()),
+            payload_crc: None,
+        };
+        let mut s = Series::new("s");
+        for _ in 0..blocks {
+            s.blocks.push(block.clone());
+        }
+        for _ in 0..pending {
+            s.pending.push(Point::new(0, 0.0));
+        }
+        let after = packed_blocks(block_size, blocks, last_count, pending);
+        assert_eq!(blocks + s.flush_block_delta(block_size), after);
     }
 }

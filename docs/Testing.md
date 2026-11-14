@@ -42,6 +42,21 @@ cargo test --doc
 cargo build --release
 ```
 
+## Formal checks
+
+The [core verification coverage ledger](../proofs/README.md) separates Lean
+model proofs from Kani checks of actual Rust helpers, with explicit bounds,
+assumptions, and remaining gaps. With Lean 4.19.0 and Kani 0.68.0 installed:
+
+```sh
+bash scripts/verify-lean.sh
+cargo kani --lib
+```
+
+CI checks all standalone Lean modules with warnings treated as errors and runs
+all library Kani harnesses with unwinding assertions enabled. These checks do
+not replace the runtime tests or establish full-repository formal correctness.
+
 ## Linters
 
 CI runs these linters on every pull request:
