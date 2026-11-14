@@ -587,7 +587,7 @@ impl Db {
         let after = if full > 0 {
             blocks
                 .saturating_add(full)
-                .saturating_add(usize::from(total % self.block_size != 0))
+                .saturating_add(usize::from(!total.is_multiple_of(self.block_size)))
         } else {
             projected_series_blocks(self.block_size, blocks, last_count, pending_len, new_points)
         };
