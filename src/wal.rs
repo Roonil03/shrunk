@@ -66,10 +66,6 @@ impl LockedWal {
         self.len
     }
 
-    pub(crate) fn created(&self) -> bool {
-        self.created
-    }
-
     /// Validate or recreate the header, replay complete records, and truncate
     /// a torn terminal record. Returns a still-locked writer ready to append.
     pub(crate) fn recover<F>(
@@ -343,20 +339,42 @@ fn check_wal_size(len: u64) -> Result<()> {
 }
 
 fn preserve_torn_tail(path: &Path, file: &File, valid_end: u64, len: u64) -> Result<()> {
-    let mut tail = path.as_os_str().to_os_string();
-    tail.push(".torn");
-    let torn_path = PathBuf::from(tail);
-    let mut buf = vec![0u8; (len - valid_end) as usize];
     let mut reader = file.try_clone()?;
     reader.seek(SeekFrom::Start(valid_end))?;
-    reader.read_exact(&mut buf)?;
-    let mut out = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&torn_path)?;
-    out.write_all(&buf)?;
-    out.sync_data()?;
+    // Never overwrite an earlier backup or follow an attacker-controlled link.
+    let mut number = 0u64;
+    let (torn_path, mut out) = loop {
+        let mut name = path.as_os_str().to_os_string();
+        name.push(if number == 0 {
+            ".torn".to_string()
+        } else {
+            format!(".torn.{number}")
+        });
+        let candidate = PathBuf::from(name);
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        match options.open(&candidate) {
+            Ok(file) => break (candidate, file),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                number = number
+                    .checked_add(1)
+                    .ok_or_else(|| Error::Limit("torn backup names exhausted".into()))?;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    };
+    let tail_len = len - valid_end;
+    let copied = std::io::copy(&mut reader.take(tail_len), &mut out)?;
+    if copied != tail_len {
+        return Err(Error::Format(
+            "WAL changed while preserving torn tail".into(),
+        ));
+    }
+    out.sync_all()?;
+    // Persist the backup's directory entry before removing bytes from the WAL.
+    sync_parent_dir(&torn_path)?;
     Ok(())
 }
 
@@ -510,33 +528,63 @@ fn suffix_has_valid_record(file: &mut File, start: u64, len: u64) -> Result<bool
     if start >= len || len - start < 8 {
         return Ok(false);
     }
-    let suffix_len = (len - start) as usize;
-    let mut suffix = vec![0u8; suffix_len];
-    file.seek(SeekFrom::Start(start))?;
-    file.read_exact(&mut suffix)?;
-    if suffix.iter().all(|&b| b == 0) {
-        return Ok(false);
-    }
-    let mut offset = 0usize;
-    while offset + 8 <= suffix.len() {
-        let record_len =
-            u32::from_le_bytes(suffix[offset..offset + 4].try_into().unwrap()) as usize;
-        let total = record_len.saturating_add(8);
-        if record_len > 0
-            && record_len as u64 <= MAX_WAL_RECORD_BYTES
-            && offset + total <= suffix.len()
-        {
-            let payload = &suffix[offset + 4..offset + 4 + record_len];
-            let stored = u32::from_le_bytes(
-                suffix[offset + 4 + record_len..offset + total]
-                    .try_into()
-                    .unwrap(),
-            );
-            if crc32(payload) == stored && decode_payload(payload).is_ok() {
+    const SCAN_CHUNK: usize = 64 * 1024;
+    // Bound adversarial candidate probes independently of the WAL size.
+    const MAX_PROBE_BYTES: u64 = 1024 * 1024 * 1024;
+    let mut probed = 0u64;
+    let mut pos = start;
+    let mut chunk = vec![0u8; SCAN_CHUNK + 3];
+    while pos + 8 <= len {
+        let n = ((len - pos) as usize).min(chunk.len());
+        file.seek(SeekFrom::Start(pos))?;
+        file.read_exact(&mut chunk[..n])?;
+        let scan = (n.saturating_sub(3)).min(SCAN_CHUNK);
+        for offset in 0..scan {
+            let at = pos + offset as u64;
+            if at + 8 > len {
+                break;
+            }
+            let record_len =
+                u32::from_le_bytes(chunk[offset..offset + 4].try_into().unwrap()) as u64;
+            if !(9..=MAX_WAL_RECORD_BYTES).contains(&record_len) || record_len + 8 > len - at {
+                continue;
+            }
+            probed = probed.saturating_add(9);
+            if probed > MAX_PROBE_BYTES {
+                return Err(Error::Limit(
+                    "WAL resync probe budget exceeded; damaged data preserved".into(),
+                ));
+            }
+            file.seek(SeekFrom::Start(at + 4))?;
+            let mut header = [0u8; 9];
+            file.read_exact(&mut header)?;
+            let name_len = u32::from_le_bytes(header[1..5].try_into().unwrap()) as usize;
+            let count = u32::from_le_bytes(header[5..9].try_into().unwrap()) as usize;
+            if header[0] != RECORD_KIND_POINTS
+                || checked_payload_len(name_len, count).ok() != Some(record_len as usize)
+            {
+                continue;
+            }
+            probed = probed.saturating_add(record_len);
+            if probed > MAX_PROBE_BYTES {
+                return Err(Error::Limit(
+                    "WAL resync probe budget exceeded; damaged data preserved".into(),
+                ));
+            }
+            let mut payload = Vec::new();
+            payload
+                .try_reserve_exact(record_len as usize)
+                .map_err(|_| Error::Limit("WAL resync allocation failed".into()))?;
+            payload.resize(record_len as usize, 0);
+            payload[..9].copy_from_slice(&header);
+            file.read_exact(&mut payload[9..])?;
+            let mut crc = [0u8; 4];
+            file.read_exact(&mut crc)?;
+            if crc32(&payload) == u32::from_le_bytes(crc) && decode_payload(&payload).is_ok() {
                 return Ok(true);
             }
         }
-        offset += 1;
+        pos += scan as u64;
     }
     Ok(false)
 }
@@ -751,6 +799,55 @@ mod tests {
         })
         .unwrap();
         assert_eq!(points_only, vec![first]);
+        remove(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn torn_backup_is_private_and_never_clobbers_existing_files_or_symlinks() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let path = test_path("backup-no-clobber");
+        let first = PathBuf::from(format!("{}.torn", path.display()));
+        let second = PathBuf::from(format!("{}.torn.1", path.display()));
+        let victim = test_path("backup-victim");
+        for p in [&path, &first, &second, &victim] {
+            remove(p);
+        }
+        std::fs::write(&victim, b"keep").unwrap();
+        symlink(&victim, &first).unwrap();
+        let mut bytes = Vec::new();
+        write_header_to_vec(&mut bytes, 64);
+        bytes.extend_from_slice(&[1, 2, 3]);
+        std::fs::write(&path, &bytes).unwrap();
+        drop(open_writer(&path, 64));
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+        assert_eq!(std::fs::read(&second).unwrap(), [1, 2, 3]);
+        assert_eq!(
+            std::fs::metadata(&second).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        // A subsequent repair also preserves the first backup.
+        std::fs::write(&path, &bytes).unwrap();
+        drop(open_writer(&path, 64));
+        let third = PathBuf::from(format!("{}.torn.2", path.display()));
+        assert_eq!(std::fs::read(&second).unwrap(), [1, 2, 3]);
+        assert_eq!(std::fs::read(&third).unwrap(), [1, 2, 3]);
+        for p in [&path, &first, &second, &third, &victim] {
+            remove(p);
+        }
+    }
+
+    #[test]
+    fn resync_finds_record_across_scan_chunk_boundary() {
+        let path = test_path("resync-boundary");
+        remove(&path);
+        let mut bytes = Vec::new();
+        write_header_to_vec(&mut bytes, 64);
+        bytes.extend(std::iter::repeat_n(0, 65_535));
+        bytes.extend_from_slice(&encoded_record("cpu", &[Point { ts: 1, value: 2.0 }]));
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(Wal::recover_and_open(&path, Some(64), &mut |_, _, _| Ok(())).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
         remove(&path);
     }
 

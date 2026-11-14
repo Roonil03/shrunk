@@ -12,7 +12,8 @@
 //! ```
 //!
 //! Data is grouped into blocks (default 1024 points). Each block is encoded
-//! with Gorilla, delta-varint, RLE, and raw, and the smallest encoding wins.
+//! using adaptive codec candidates, including Gorilla, delta-varint, RLE,
+//! and raw; selection also uses workload gates for other codecs.
 //! Blocks carry time bounds, value bounds, a sum, and a NaN flag so reads and
 //! aggregates can skip work.
 

@@ -165,3 +165,7 @@ mod tests {
         assert!(r.overrun());
     }
 }
+
+#[cfg(kani)]
+#[path = "bits_verification.rs"]
+mod verification;
