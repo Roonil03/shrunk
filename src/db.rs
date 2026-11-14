@@ -1096,6 +1096,13 @@ impl Db {
     }
 
     fn replay_record(&mut self, series: &str, points: &[Point]) -> Result<()> {
+        // partition_point and the query path both require ordered timestamps.
+        // A valid checksum alone does not establish that semantic invariant.
+        if points.windows(2).any(|pair| pair[0].ts >= pair[1].ts) {
+            return Err(Error::Format(
+                "WAL record timestamps are not strictly increasing".into(),
+            ));
+        }
         let last = self.series.get(series).and_then(|s| s.last_ts);
         let start = match last {
             Some(last) => points.partition_point(|p| p.ts <= last),
@@ -2242,6 +2249,18 @@ mod tests {
         drop(rw);
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(&wal_path);
+    }
+
+    #[test]
+    fn replay_rejects_unordered_records_even_when_snapshot_would_skip_them() {
+        let mut db = Db::new();
+        db.write("s", 5, 1.0).unwrap();
+        let points = [Point { ts: 7, value: 1.0 }, Point { ts: 4, value: 2.0 }];
+        assert!(matches!(
+            db.replay_record("s", &points),
+            Err(Error::Format(_))
+        ));
+        assert_eq!(db.point_count(), 1);
     }
 
     #[test]
