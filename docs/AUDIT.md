@@ -36,9 +36,9 @@ handles closed query output pipes. Regression tests accompany these changes.
    groups additions by block, so a predicate or different block size can alter
    results; exact or reproducible aggregation would require a stronger
    accumulator and an explicit format/API design.
-2. Projecting the snapshot block budget scans all series on each write. Many
-   small writes across many series can be quadratic; consider cached counters
-   with invariant tests and workload benchmarks.
+2. Snapshot block budget projection is cached for writes; future changes to
+   block construction must preserve that invariant. Benchmark high-series-count
+   workloads to track performance as the implementation evolves.
 3. CRC detects accidental corruption but is not authentication. Torn-tail
    classification cannot distinguish every possible corruption from a crash;
    recovered suffixes are preserved, and a bounded resync can refuse recovery
