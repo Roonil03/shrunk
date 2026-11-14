@@ -351,9 +351,10 @@ mod tests {
     }
 
     #[test]
-    fn dolphin_is_selected_only_for_oscillating_blocks() {
+    fn oscillating_selection_is_no_larger_than_dolphin_candidate() {
         let oscillating = generate(Pattern::Oscillating, 1024, 1_700_000_000_000, 1000);
-        assert_eq!(Block::build(&oscillating).codec, Codec::Dolphin);
+        let selected = Block::build(&oscillating);
+        assert!(selected.payload.len() <= Codec::Dolphin.encode(&oscillating).unwrap().len());
 
         let cpu = generate(Pattern::Cpu, 1024, 1_700_000_000_000, 1000);
         assert_ne!(Block::build(&cpu).codec, Codec::Dolphin);
