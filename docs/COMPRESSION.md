@@ -22,8 +22,12 @@ canonical windows. The 2048-point cap bounds latency for configurable blocks.
 The old greedy encoding is one admissible path. Thus, on optimized blocks,
 the new value bit count is no greater than the old one; identical timestamp
 bytes and final byte padding preserve the payload-size inequality. On longer
-blocks the bytes are identical. `Block::build` selects a smallest candidate,
-so its payload size also cannot increase because of this change. The proof in
+blocks the bytes are identical. The Predictor eligibility gate still compares
+its 128-point prefix against greedy Gorilla-RLE. This preserves which full
+Predictor candidates `Block::build` tries; the Gorilla-RLE candidate itself
+uses the optimized path. With the same candidate set and no larger Gorilla-RLE
+payload, selected block payload size cannot increase because of this change.
+The proof in
 `proofs/OptimalWindowPath.lean` establishes the abstract finite-horizon
 minimum is no greater than any valid path. Existing window reconstruction
 proofs remain in `proofs/WindowChoice.lean`. A machine-checked refinement from

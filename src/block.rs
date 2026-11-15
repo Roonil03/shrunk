@@ -359,4 +359,27 @@ mod tests {
         let cpu = generate(Pattern::Cpu, 1024, 1_700_000_000_000, 1000);
         assert_ne!(Block::build(&cpu).codec, Codec::Dolphin);
     }
+
+    #[test]
+    fn predictor_remains_eligible_when_optimized_gr_tightens_noisy_prefix() {
+        for count in [1024, 2049] {
+            let mut points = generate(Pattern::Noise, count, 0, 1);
+            for (i, point) in points.iter_mut().enumerate().skip(103) {
+                point.value = (2 * i) as f64;
+            }
+
+            let predictor = Codec::Predictor.encode(&points).unwrap();
+            let gr = Codec::GorillaRle.encode(&points).unwrap();
+            assert!(predictor.len() < gr.len(), "count={count}");
+
+            let block = Block::build(&points);
+            assert_eq!(block.codec, Codec::Predictor, "count={count}");
+            assert_eq!(block.payload.len(), predictor.len(), "count={count}");
+            let decoded = block.decode().unwrap();
+            for (original, actual) in points.iter().zip(decoded) {
+                assert_eq!(original.ts, actual.ts);
+                assert_eq!(original.value.to_bits(), actual.value.to_bits());
+            }
+        }
+    }
 }

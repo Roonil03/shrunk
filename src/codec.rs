@@ -541,6 +541,15 @@ fn decode_ts_rle(
 }
 
 fn gorilla_rle_encode(points: &[Point]) -> Vec<u8> {
+    let choices = optimal_xor_choices(points);
+    gorilla_rle_encode_with_choices(points, choices.as_deref())
+}
+
+fn gorilla_rle_encode_greedy(points: &[Point]) -> Vec<u8> {
+    gorilla_rle_encode_with_choices(points, None)
+}
+
+fn gorilla_rle_encode_with_choices(points: &[Point], choices: Option<&[bool]>) -> Vec<u8> {
     let mut out = Vec::new();
     encode_ts_rle(points, &mut out);
 
@@ -548,16 +557,9 @@ fn gorilla_rle_encode(points: &[Point]) -> Vec<u8> {
     w.write_bits(points[0].value.to_bits(), 64);
     let mut prev_bits = points[0].value.to_bits();
     let mut window: Option<(u32, u32)> = None;
-    let choices = optimal_xor_choices(points);
     for (i, p) in points.iter().enumerate().skip(1) {
         let bits = p.value.to_bits();
-        encode_xor_with_choice(
-            &mut w,
-            prev_bits,
-            bits,
-            &mut window,
-            choices.as_ref().map(|c| c[i]),
-        );
+        encode_xor_with_choice(&mut w, prev_bits, bits, &mut window, choices.map(|c| c[i]));
         prev_bits = bits;
     }
     out.extend_from_slice(&w.finish());
@@ -784,16 +786,16 @@ fn predictor_index(bits: u64) -> usize {
     ((bits >> 52) as usize) & (PREDICTOR_TABLE_SIZE - 1)
 }
 
-/// Cheap per-block gate: encode a small prefix with both the predictor and GR.
-/// This costs a fraction of one block encode and directly tests whether the
-/// predictor is worth trying on the rest of the block.
+/// Cheap per-block gate: compare a small predictor prefix with the original
+/// greedy GR prefix. Optimizing this prefix can hide a Predictor win on the
+/// full block, so only the final GR candidate uses the optimal window path.
 pub(crate) fn predictor_is_promising(points: &[Point]) -> bool {
     let n = points.len().min(128);
     if n < 8 {
         return false;
     }
     let sample = &points[..n];
-    predictor_encode(sample).len() < gorilla_rle_encode(sample).len()
+    predictor_encode(sample).len() < gorilla_rle_encode_greedy(sample).len()
 }
 
 fn predictor_encode(points: &[Point]) -> Vec<u8> {
@@ -1074,21 +1076,7 @@ mod tests {
     use super::*;
 
     fn greedy_gorilla_rle(points: &[Point]) -> Vec<u8> {
-        let mut out = Vec::new();
-        encode_ts_rle(points, &mut out);
-        let mut writer = BitWriter::new();
-        writer.write_bits(points[0].value.to_bits(), 64);
-        let mut window = None;
-        for pair in points.windows(2) {
-            encode_xor(
-                &mut writer,
-                pair[0].value.to_bits(),
-                pair[1].value.to_bits(),
-                &mut window,
-            );
-        }
-        out.extend(writer.finish());
-        out
+        gorilla_rle_encode_greedy(points)
     }
 
     fn points_from_residuals(residuals: &[u64]) -> Vec<Point> {
@@ -1194,6 +1182,19 @@ mod tests {
             Codec::GorillaRle.encode(&points).unwrap(),
             greedy_gorilla_rle(&points)
         );
+    }
+
+    #[test]
+    fn predictor_gate_uses_greedy_gr_prefix() {
+        let mut points = crate::gen::generate(crate::gen::Pattern::Noise, 1024, 0, 1);
+        for (i, point) in points.iter_mut().enumerate().skip(103) {
+            point.value = (2 * i) as f64;
+        }
+        let sample = &points[..128];
+        assert_eq!(predictor_encode(sample).len(), 796);
+        assert_eq!(gorilla_rle_encode_greedy(sample).len(), 798);
+        assert_eq!(gorilla_rle_encode(sample).len(), 792);
+        assert!(predictor_is_promising(&points));
     }
 
     fn sample() -> Vec<Point> {
