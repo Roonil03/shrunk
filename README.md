@@ -1,4 +1,8 @@
-# shrunk
+<p align="center">
+  <img src="assets/logo.svg" alt="shrunk" width="112">
+</p>
+
+<h1 align="center">shrunk</h1>
 
 shrunk stores time-stamped numbers in less space and answers questions without
 unpacking every reading.

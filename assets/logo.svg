@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-label="shrunk">
+  <title>shrunk</title>
+  <defs>
+    <linearGradient id="s" x1="0.1" y1="0" x2="0.9" y2="1">
+      <stop offset="0" stop-color="#53F2C4"/>
+      <stop offset="1" stop-color="#3E9CFF"/>
+    </linearGradient>
+  </defs>
+  <rect width="1024" height="1024" rx="232" fill="#0A0D12"/>
+  <path d="M716 336c0-78-88-122-204-122s-208 52-208 134c0 74 74 106 190 126 120 20 208 46 208 132 0 90-96 142-208 142s-214-42-232-124"
+        fill="none" stroke="url(#s)" stroke-width="104"
+        stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
