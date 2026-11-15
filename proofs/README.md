@@ -15,8 +15,11 @@ valid, the chosen local bit cost is no greater than either alternative, and
 that ties choose reuse. It also proves the 64-bit XOR reconstruction identity,
 lossless window packing under explicit bounds for the zero regions, and that a
 stateful list of XOR residuals reconstructs the original list.
-This is a local result, not a global optimality claim: changing the stored
-window affects later residuals, so an entire block can in principle grow.
+This is a local result: changing the stored window affects later residuals.
+`OptimalWindowPath.lean` adds a finite-horizon recurrence for the canonical
+fresh-window/reuse grammar. Its theorem says the recurrence costs no more than
+any valid path through that grammar. It does not include the wider fresh
+windows that Gorilla's wire format can also represent.
 
 The model is handwritten; no theorem connects it mechanically to the Rust
 encoder, decoder, byte packing, floating-point bit conversions, or block
@@ -40,6 +43,7 @@ and are checked together by `scripts/verify-lean.sh`.
 | Module | Established property | Assumptions and boundary |
 |---|---|---|
 | `WindowChoice.lean` | Local compatible-window cost bounds and reuse on ties; XOR reconstruction and residual-list round trip; conditional window packing | Both window alternatives must be valid for the local cost comparison. Packing requires the explicit zero-region bounds. No Rust tags, window eligibility, or whole-stream optimality proof. |
+| `OptimalWindowPath.lean` | Abstract finite-horizon optimum is no greater than every valid canonical-window path | Models weighted fresh/reuse transitions, with validity supplied by the caller. It does not prove the Rust dynamic program implements the recurrence, nor cover byte packing or noncanonical fresh windows. |
 | `BitCodec.lean` | Eight Boolean writes pack into a byte read MSB first; partial-byte alignment and zero padding; abstract prefix consumption and one exhausted read | The list reader starts after byte expansion. No theorem links this abstraction to Rust, and no arbitrary-length stateful byte-writer theorem is claimed. |
 | `Storage.lean` | Ordered record partition equals filtering beyond a watermark; replay at a covered final timestamp adds nothing; time pruning and ordered-block break are safe; cache contribution replacement identity | Timestamps are mathematical integers, records strictly ordered where required, bounds honest, blocks ordered and non-overlapping. The cache identity assumes the old contribution is represented; it is not a proof of cache maintenance or filesystem replay. |
 
