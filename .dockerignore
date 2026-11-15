@@ -5,6 +5,7 @@
 !src
 !src/**
 !service
+service/**
 !service/Cargo.toml
 !service/Cargo.lock
 !service/src
