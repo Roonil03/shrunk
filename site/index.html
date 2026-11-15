@@ -1,0 +1,1016 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>shrunk · a tiny time series database</title>
+<meta name="description" content="shrunk groups time-stamped numbers into compressed blocks and answers queries from a 58-byte label, without decoding every reading.">
+<meta name="theme-color" content="#07090D">
+<link rel="canonical" href="https://shrunk-db.vercel.app/">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="shrunk">
+<meta property="og:title" content="shrunk · a tiny time series database">
+<meta property="og:description" content="Compress the readings. Skip the rest. A tiny time series database that reads block labels instead of every point.">
+<meta property="og:url" content="https://shrunk-db.vercel.app/">
+<meta property="og:image" content="https://shrunk-db.vercel.app/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="shrunk · a tiny time series database">
+<meta name="twitter:description" content="Compress the readings. Skip the rest.">
+<meta name="twitter:image" content="https://shrunk-db.vercel.app/og.png">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%230A0D12'/%3E%3Cpath d='M45 21c0-5-5.5-7.6-12.8-7.6S19 16.6 19 21.7c0 4.6 4.6 6.6 11.9 7.9 7.5 1.3 13 2.9 13 8.2 0 5.6-6 8.9-13 8.9s-13.4-2.6-14.5-7.8' fill='none' stroke='%2353F2C4' stroke-width='6.5' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,700&family=Inter+Tight:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --ink: #07090D;
+    --ink-2: #0C1016;
+    --ink-3: #131A23;
+    --paper: #F3F4F1;
+    --paper-2: #E9EBE6;
+    --line: #D8DBD3;
+    --line-dark: #1E2733;
+    --text: #12160F;
+    --muted: #5B625B;
+    --muted-dark: #8C96A3;
+    --mint: #53F2C4;
+    --mint-deep: #16A97E;
+    --blue: #4AA3FF;
+    --radius: 14px;
+    --sans: "Inter Tight", system-ui, -apple-system, "Segoe UI", sans-serif;
+    --display: "Bricolage Grotesque", "Inter Tight", system-ui, sans-serif;
+    --mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+    --wrap: 1120px;
+    --gutter: 24px;
+  }
+
+  * { box-sizing: border-box; }
+
+  html { -webkit-text-size-adjust: 100%; }
+
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 17px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  a { color: inherit; }
+  img { display: block; max-width: 100%; }
+
+  .wrap {
+    width: 100%;
+    max-width: var(--wrap);
+    margin: 0 auto;
+    padding: 0 var(--gutter);
+  }
+
+  .mono {
+    font-family: var(--mono);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 11.5px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--muted-dark);
+  }
+
+  /* ---------- top bar ---------- */
+
+  .bar {
+    background: var(--ink);
+    border-bottom: 1px solid var(--line-dark);
+  }
+
+  .bar-inner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    height: 64px;
+  }
+
+  .brand {
+    display: inline-flex;
+    align-items: center;
+    gap: 11px;
+    text-decoration: none;
+    color: #F2F5F8;
+  }
+
+  .brand img { width: 28px; height: 28px; }
+
+  .brand span {
+    font-family: var(--display);
+    font-weight: 600;
+    font-size: 19px;
+    letter-spacing: -0.01em;
+  }
+
+  .bar nav {
+    display: flex;
+    align-items: center;
+    gap: 22px;
+    font-size: 14px;
+  }
+
+  .bar nav a {
+    color: #AEB8C4;
+    text-decoration: none;
+  }
+
+  .bar nav a:hover { color: #F2F5F8; }
+
+  /* ---------- hero ---------- */
+
+  .hero {
+    background: var(--ink);
+    color: #EDF1F5;
+    padding: 84px 0 96px;
+    position: relative;
+    overflow: hidden;
+  }
+
+  .hero::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background:
+      radial-gradient(900px 420px at 78% -10%, rgba(83, 242, 196, 0.10), transparent 68%),
+      radial-gradient(700px 380px at 96% 40%, rgba(74, 163, 255, 0.09), transparent 70%);
+    pointer-events: none;
+  }
+
+  .hero .wrap {
+    position: relative;
+    z-index: 1;
+    display: grid;
+    grid-template-columns: minmax(0, 1.15fr) minmax(320px, 0.85fr);
+    gap: 64px;
+    align-items: start;
+  }
+
+  .hero h1 {
+    font-family: var(--display);
+    font-weight: 600;
+    font-size: clamp(2.55rem, 5.1vw, 4.15rem);
+    line-height: 0.98;
+    letter-spacing: -0.032em;
+    margin: 18px 0 26px;
+    max-width: 15ch;
+    text-wrap: balance;
+  }
+
+  .hero h1 em {
+    font-style: normal;
+    background: linear-gradient(92deg, var(--mint), var(--blue));
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+
+  .hero p.lede {
+    max-width: 54ch;
+    color: #B7C1CD;
+    margin: 0 0 30px;
+  }
+
+  .actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    margin-bottom: 46px;
+  }
+
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 9px;
+    padding: 13px 19px;
+    border-radius: 9px;
+    font-size: 15px;
+    font-weight: 500;
+    text-decoration: none;
+    border: 1px solid transparent;
+    transition: background-color 160ms ease, border-color 160ms ease, color 160ms ease;
+  }
+
+  .btn-primary {
+    background: var(--mint);
+    color: #06120D;
+  }
+
+  .btn-primary:hover { background: #7AF7D3; }
+
+  .btn-ghost {
+    border-color: #2A3542;
+    color: #E3E9F0;
+  }
+
+  .btn-ghost:hover {
+    border-color: #465568;
+    background: #111823;
+  }
+
+  .btn svg { flex: none; }
+
+  .hero .facts {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 28px 44px;
+    padding-top: 24px;
+    border-top: 1px solid var(--line-dark);
+    margin: 0;
+  }
+
+  .fact dt {
+    font-family: var(--mono);
+    font-size: 10.5px;
+    letter-spacing: 0.13em;
+    text-transform: uppercase;
+    color: var(--muted-dark);
+    margin-bottom: 4px;
+  }
+
+  .fact dd {
+    margin: 0;
+    font-family: var(--mono);
+    font-size: 15px;
+    color: #E9EFF5;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .fact dd b {
+    font-weight: 500;
+    color: var(--mint);
+  }
+
+  /* ---------- block card ---------- */
+
+  .blockcard {
+    background: var(--ink-2);
+    border: 1px solid var(--line-dark);
+    border-radius: var(--radius);
+    overflow: hidden;
+    box-shadow: 0 24px 60px -30px rgba(0, 0, 0, 0.9);
+  }
+
+  .blockcard-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px 14px;
+    padding: 14px 18px;
+    border-bottom: 1px solid var(--line-dark);
+    background: #0A0F15;
+  }
+
+  .blockcard-head .name {
+    font-family: var(--mono);
+    font-size: 12.5px;
+    color: #DDE5EE;
+    min-width: 0;
+  }
+
+  .seal {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    font-family: var(--mono);
+    font-size: 10.5px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--mint);
+  }
+
+  .seal i {
+    width: 6px;
+    height: 6px;
+    background: var(--mint);
+    border-radius: 1px;
+    box-shadow: 0 0 0 3px rgba(83, 242, 196, 0.14);
+  }
+
+  .fields {
+    margin: 0;
+    padding: 6px 18px 14px;
+  }
+
+  .fields div {
+    display: grid;
+    grid-template-columns: 92px 1fr;
+    gap: 14px;
+    padding: 9px 0;
+    border-bottom: 1px dashed #1B2430;
+  }
+
+  .fields div:last-child { border-bottom: 0; }
+
+  .fields dt {
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--muted-dark);
+    letter-spacing: 0.04em;
+  }
+
+  .fields dd {
+    margin: 0;
+    font-family: var(--mono);
+    font-size: 12.5px;
+    color: #CFD9E4;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .blockcard-foot {
+    padding: 12px 18px;
+    border-top: 1px solid var(--line-dark);
+    font-family: var(--mono);
+    font-size: 11px;
+    color: #7E8998;
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+  }
+
+  /* ---------- ruler ---------- */
+
+  .ruler {
+    margin-top: 22px;
+  }
+
+  .ruler-row {
+    margin-bottom: 14px;
+  }
+
+  .ruler-label {
+    display: flex;
+    justify-content: space-between;
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.06em;
+    color: #96A1AE;
+    margin-bottom: 7px;
+  }
+
+  .ruler-label b {
+    font-weight: 500;
+    color: #DCE4EC;
+  }
+
+  .track {
+    height: 8px;
+    border-radius: 2px;
+    background: #1A222C;
+    overflow: hidden;
+  }
+
+  .track span {
+    display: block;
+    height: 100%;
+    transform-origin: left center;
+    animation: grow 900ms cubic-bezier(.2,.7,.3,1) both;
+  }
+
+  .track.raw span { background: #2C3745; }
+  .track.stored span { background: linear-gradient(90deg, var(--mint), var(--blue)); }
+
+  .ruler-note {
+    font-family: var(--mono);
+    font-size: 10.5px;
+    color: #6E7A88;
+    margin: 12px 0 0;
+  }
+
+  /* ---------- sections ---------- */
+
+  .sheet {
+    padding: 92px 0;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .sheet:last-of-type { border-bottom: 0; }
+
+  .sheet-head {
+    display: grid;
+    grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr);
+    gap: 48px;
+    align-items: end;
+    margin-bottom: 48px;
+  }
+
+  h2 {
+    font-family: var(--display);
+    font-weight: 600;
+    font-size: clamp(1.7rem, 2.9vw, 2.35rem);
+    line-height: 1.08;
+    letter-spacing: -0.025em;
+    margin: 10px 0 0;
+    text-wrap: balance;
+  }
+
+  .sheet-head p {
+    margin: 0;
+    color: var(--muted);
+    max-width: 46ch;
+  }
+
+  /* fields table */
+
+  .spectable {
+    border-top: 1px solid var(--line);
+  }
+
+  .spectable .row {
+    display: grid;
+    grid-template-columns: 150px minmax(0, 1fr) 96px;
+    gap: 28px;
+    padding: 13px 0;
+    border-bottom: 1px solid var(--line);
+    align-items: baseline;
+  }
+
+  .spectable .row.head {
+    font-family: var(--mono);
+    font-size: 10.5px;
+    letter-spacing: 0.13em;
+    text-transform: uppercase;
+    color: var(--muted);
+    padding: 10px 0;
+  }
+
+  .spectable .key {
+    font-family: var(--mono);
+    font-size: 13.5px;
+    color: #0E1310;
+  }
+
+  .spectable .desc { color: var(--muted); font-size: 15.5px; }
+
+  .spectable .bytes {
+    font-family: var(--mono);
+    font-size: 12.5px;
+    color: var(--muted);
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .callout {
+    margin-top: 26px;
+    padding: 16px 18px;
+    background: var(--paper-2);
+    border-left: 2px solid var(--mint-deep);
+    font-size: 15px;
+    color: #2A302A;
+  }
+
+  .callout code { font-family: var(--mono); font-size: 13.5px; }
+
+  /* queries */
+
+  .split {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 22px;
+  }
+
+  .qcard {
+    border: 1px solid var(--line);
+    background: #F7F8F5;
+    border-radius: var(--radius);
+    padding: 22px 22px 20px;
+  }
+
+  .qcard .q {
+    font-family: var(--mono);
+    font-size: 13.5px;
+    color: #0E1310;
+    margin: 0 0 14px;
+    padding-bottom: 14px;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .qcard h3 {
+    font-family: var(--sans);
+    font-size: 15px;
+    font-weight: 600;
+    margin: 0 0 6px;
+    letter-spacing: -0.005em;
+  }
+
+  .qcard p {
+    margin: 0;
+    color: var(--muted);
+    font-size: 15px;
+  }
+
+  .qcard .answer {
+    margin-top: 16px;
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--muted);
+  }
+
+  .qcard .answer b {
+    font-weight: 500;
+    color: #0E1310;
+    font-size: 14px;
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* codec table */
+
+  .codec-table { width: 100%; border-collapse: collapse; border-top: 1px solid var(--line); }
+  .codec-table th, .codec-table td {
+    text-align: left;
+    padding: 13px 0;
+    border-bottom: 1px solid var(--line);
+    font-size: 15px;
+  }
+
+  .codec-table th {
+    font-family: var(--mono);
+    font-size: 10.5px;
+    letter-spacing: 0.13em;
+    text-transform: uppercase;
+    color: var(--muted);
+    font-weight: 400;
+  }
+
+  .codec-table td.num, .codec-table th.num {
+    text-align: right;
+    font-family: var(--mono);
+    font-variant-numeric: tabular-nums;
+    font-size: 13.5px;
+  }
+
+  .codec-table td.series { font-family: var(--mono); font-size: 13.5px; }
+  .codec-table td.codec { font-family: var(--mono); font-size: 13px; color: var(--muted); }
+  .codec-table tr.total td { border-bottom: 0; padding-top: 18px; font-weight: 600; }
+  .codec-table tr.total td.num { color: var(--mint-deep); }
+
+  .note {
+    margin: 14px 0 0;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--muted);
+  }
+
+  /* build */
+
+  .build {
+    display: grid;
+    grid-template-columns: minmax(0, 0.85fr) minmax(0, 1.15fr);
+    gap: 56px;
+    align-items: start;
+  }
+
+  .terminal {
+    background: var(--ink);
+    border-radius: var(--radius);
+    border: 1px solid var(--line-dark);
+    overflow: hidden;
+  }
+
+  .terminal-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--line-dark);
+  }
+
+  .terminal-head i {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #2B3644;
+  }
+
+  .terminal-head span {
+    margin-left: auto;
+    font-family: var(--mono);
+    font-size: 10.5px;
+    color: #6E7A88;
+    letter-spacing: 0.08em;
+  }
+
+  .terminal pre {
+    margin: 0;
+    padding: 18px 16px 20px;
+    font-family: var(--mono);
+    font-size: 12.5px;
+    line-height: 1.75;
+    color: #C9D4E0;
+    overflow-x: auto;
+  }
+
+  .terminal .c { color: #6E7A88; }
+  .terminal .g { color: var(--mint); }
+
+  .links {
+    margin-top: 20px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 20px;
+    font-size: 14px;
+  }
+
+  .links a {
+    color: #0E1310;
+    text-decoration-color: #A9B3A9;
+    text-underline-offset: 3px;
+  }
+
+  /* footer */
+
+  footer {
+    background: var(--ink);
+    color: #8C96A3;
+    padding: 34px 0;
+    font-size: 13.5px;
+  }
+
+  footer .wrap {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px 26px;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  footer nav { display: flex; gap: 20px; }
+  footer a { color: #B6C0CC; text-decoration: none; }
+  footer a:hover { color: #F2F5F8; }
+
+  /* focus */
+
+  a:focus-visible, button:focus-visible {
+    outline: 2px solid var(--mint-deep);
+    outline-offset: 3px;
+    border-radius: 3px;
+  }
+
+  .hero a:focus-visible, footer a:focus-visible { outline-color: var(--mint); }
+
+  /* motion */
+
+  @keyframes rise {
+    from { opacity: 0; transform: translateY(10px); }
+    to { opacity: 1; transform: none; }
+  }
+
+  @keyframes grow {
+    from { transform: scaleX(0); }
+    to { transform: scaleX(1); }
+  }
+
+  .hero-copy > * {
+    animation: rise 620ms cubic-bezier(.2,.7,.3,1) both;
+  }
+
+  .hero-copy > :nth-child(1) { animation-delay: 30ms; }
+  .hero-copy > :nth-child(2) { animation-delay: 80ms; }
+  .hero-copy > :nth-child(3) { animation-delay: 140ms; }
+  .hero-copy > :nth-child(4) { animation-delay: 200ms; }
+  .hero-copy > :nth-child(5) { animation-delay: 260ms; }
+
+  .blockcard { animation: rise 700ms cubic-bezier(.2,.7,.3,1) 160ms both; }
+  .ruler { animation: rise 700ms cubic-bezier(.2,.7,.3,1) 280ms both; }
+
+  @media (prefers-reduced-motion: reduce) {
+    .hero-copy > *, .blockcard, .ruler { animation: none; }
+    .track span { animation: none; }
+  }
+
+  /* responsive */
+
+  @media (max-width: 900px) {
+    .hero { padding: 64px 0 72px; }
+    .hero .wrap { grid-template-columns: minmax(0, 1fr); gap: 44px; }
+    .hero h1 { max-width: 18ch; }
+    .sheet { padding: 68px 0; }
+    .sheet-head { grid-template-columns: minmax(0, 1fr); gap: 16px; align-items: start; }
+    .split { grid-template-columns: minmax(0, 1fr); }
+    .build { grid-template-columns: minmax(0, 1fr); gap: 36px; }
+    .spectable .row { grid-template-columns: 118px minmax(0,1fr); gap: 16px; }
+    .spectable .bytes { grid-column: 2; text-align: left; }
+    .spectable .row.head .bytes { display: none; }
+  }
+
+  @media (max-width: 520px) {
+    body { font-size: 16px; }
+    .bar nav a.hide-sm { display: none; }
+    .hero .facts { gap: 20px; }
+    .blockcard-foot { font-size: 10px; }
+  }
+</style>
+</head>
+<body>
+
+<header class="bar">
+  <div class="wrap bar-inner">
+    <a class="brand" href="/">
+      <img src="logo.svg" alt="" width="28" height="28">
+      <span>shrunk</span>
+    </a>
+    <nav>
+      <a class="hide-sm" href="https://github.com/shrunk-db/shrunk/tree/main/docs">Docs</a>
+      <a href="https://github.com/shrunk-db/shrunk">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+
+  <section class="hero">
+    <div class="wrap">
+      <div class="hero-copy">
+        <p class="eyebrow">A tiny time series database</p>
+        <h1>Compress the readings. <em>Skip the rest.</em></h1>
+        <p class="lede">
+          shrunk packs time-stamped numbers into 1,024-point blocks, encodes each
+          block with whichever codec produces the smallest output, and labels
+          every block with its time range, value range, count, and sum. Queries
+          read the labels and skip the blocks that cannot match.
+        </p>
+        <div class="actions">
+          <a class="btn btn-primary" href="https://github.com/shrunk-db/shrunk">
+            Read the source
+            <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+              <path d="M3 8h9M8.5 3.5 13 8l-4.5 4.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="square"/>
+            </svg>
+          </a>
+          <a class="btn btn-ghost" href="#build">Build it</a>
+        </div>
+        <dl class="facts">
+          <div class="fact">
+            <dt>Benchmark</dt>
+            <dd><b>6.5x</b> smaller file</dd>
+          </div>
+          <div class="fact">
+            <dt>5-minute query</dt>
+            <dd><b>2</b> of 196 blocks read</dd>
+          </div>
+          <div class="fact">
+            <dt>Block label</dt>
+            <dd><b>58</b> bytes</dd>
+          </div>
+        </dl>
+      </div>
+
+      <div>
+        <aside class="blockcard" aria-label="One block and its label">
+          <div class="blockcard-head">
+            <span class="name">series/temperature · block 42</span>
+            <span class="seal"><i></i>sealed</span>
+          </div>
+          <dl class="fields">
+            <div><dt>t_min</dt><dd>14:00:00</dd></div>
+            <div><dt>t_max</dt><dd>16:49:10</dd></div>
+            <div><dt>count</dt><dd>1,024</dd></div>
+            <div><dt>v_min</dt><dd>18.2</dd></div>
+            <div><dt>v_max</dt><dd>24.9</dd></div>
+            <div><dt>sum</dt><dd>22,431.7</dd></div>
+            <div><dt>has_nan</dt><dd>false</dd></div>
+          </dl>
+          <div class="blockcard-foot">
+            <span>payload: gorilla-rle</span>
+            <span>still compressed</span>
+          </div>
+        </aside>
+
+        <div class="ruler" aria-label="File size comparison from the demo">
+          <div class="ruler-row">
+            <div class="ruler-label"><span>raw</span><b>9.2 MiB</b></div>
+            <div class="track raw"><span style="width:100%; animation-delay:420ms"></span></div>
+          </div>
+          <div class="ruler-row">
+            <div class="ruler-label"><span>stored by shrunk</span><b>1.4 MiB</b></div>
+            <div class="track stored"><span style="width:15.2%; animation-delay:560ms"></span></div>
+          </div>
+          <p class="ruler-note">600,000 synthetic readings, three series, from <span style="color:#AAB6C3">shrunk demo</span>.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="sheet" id="label">
+    <div class="wrap">
+      <div class="sheet-head">
+        <div>
+          <p class="eyebrow">The block</p>
+          <h2>Every block carries its own summary.</h2>
+        </div>
+        <p>
+          A block is an immutable run of 1,024 readings. When it fills, shrunk
+          writes a small header beside the compressed payload. Counts, sums, and
+          value ranges come from the header, and range checks use it to skip
+          blocks without touching the payload.
+        </p>
+      </div>
+
+      <div class="spectable" role="table" aria-label="Block header fields">
+        <div class="row head" role="row">
+          <span role="columnheader">field</span>
+          <span role="columnheader">meaning</span>
+          <span class="bytes" role="columnheader">size</span>
+        </div>
+        <div class="row" role="row">
+          <span class="key" role="cell">t_min, t_max</span>
+          <span class="desc" role="cell">First and last timestamp in the block</span>
+          <span class="bytes" role="cell">16 B</span>
+        </div>
+        <div class="row" role="row">
+          <span class="key" role="cell">v_min, v_max</span>
+          <span class="desc" role="cell">Lowest and highest value, ignored when the NaN flag is set</span>
+          <span class="bytes" role="cell">16 B</span>
+        </div>
+        <div class="row" role="row">
+          <span class="key" role="cell">count</span>
+          <span class="desc" role="cell">Readings in the block, used for counts and averages</span>
+          <span class="bytes" role="cell">4 B</span>
+        </div>
+        <div class="row" role="row">
+          <span class="key" role="cell">sum</span>
+          <span class="desc" role="cell">Total of all finite values, used for averages</span>
+          <span class="bytes" role="cell">8 B</span>
+        </div>
+        <div class="row" role="row">
+          <span class="key" role="cell">codec, flags</span>
+          <span class="desc" role="cell">Which encoder won, plus sum-present and has-NaN bits</span>
+          <span class="bytes" role="cell">2 B</span>
+        </div>
+        <div class="row" role="row">
+          <span class="key" role="cell">payload_len</span>
+          <span class="desc" role="cell">Compressed size of the payload that follows</span>
+          <span class="bytes" role="cell">4 B</span>
+        </div>
+        <div class="row" role="row">
+          <span class="key" role="cell">crc32 × 2</span>
+          <span class="desc" role="cell">One checksum for the header, one for the payload</span>
+          <span class="bytes" role="cell">8 B</span>
+        </div>
+      </div>
+
+      <p class="callout">
+        That is <code>58 bytes</code> per block, header and checksums. For 1,024
+        readings it costs about <code>0.45 bits</code> per point.
+      </p>
+    </div>
+  </section>
+
+  <section class="sheet" id="queries">
+    <div class="wrap">
+      <div class="sheet-head">
+        <div>
+          <p class="eyebrow">The query</p>
+          <h2>Questions get answered at the lid.</h2>
+        </div>
+        <p>
+          No index server, no column scan. The query planner walks block headers
+          in order and decodes only the blocks that can still contain an answer.
+        </p>
+      </div>
+
+      <div class="split">
+        <div class="qcard">
+          <p class="q">avg(cpu.load) over all points</p>
+          <h3>Divide the sums by the counts</h3>
+          <p>
+            Every block already stores its total and its point count. A covered
+            block is answered from the header, so nothing is unpacked.
+          </p>
+          <div class="answer"><b>196 of 196</b> blocks read from metadata</div>
+        </div>
+        <div class="qcard">
+          <p class="q">cpu.load over 300 seconds</p>
+          <h3>Skip by time, then decode</h3>
+          <p>
+            A binary search lands on the first block whose range can overlap the
+            window. Blocks outside it are never opened.
+          </p>
+          <div class="answer"><b>2 decoded · 194 skipped</b> blocks</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="sheet" id="codecs">
+    <div class="wrap">
+      <div class="sheet-head">
+        <div>
+          <p class="eyebrow">The codecs</p>
+          <h2>Seven encoders. The smallest result wins.</h2>
+        </div>
+        <p>
+          Each block is encoded with every codec that can represent it, and the
+          shortest output is kept. Flat sensors and counters compress far better
+          than noisy floats, and the format adapts per block.
+        </p>
+      </div>
+
+      <table class="codec-table">
+        <thead>
+          <tr>
+            <th scope="col">series</th>
+            <th scope="col">codec picked</th>
+            <th scope="col" class="num">points</th>
+            <th scope="col" class="num">stored</th>
+            <th scope="col" class="num">ratio</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="series">cpu.load</td>
+            <td class="codec">gorilla-rle</td>
+            <td class="num">200,000</td>
+            <td class="num">1.3 MiB</td>
+            <td class="num">2.3x</td>
+          </tr>
+          <tr>
+            <td class="series">requests.total</td>
+            <td class="codec">predictor</td>
+            <td class="num">200,000</td>
+            <td class="num">64.2 KiB</td>
+            <td class="num">48.7x</td>
+          </tr>
+          <tr>
+            <td class="series">thermostat.setpoint</td>
+            <td class="codec">rle</td>
+            <td class="num">200,000</td>
+            <td class="num">14.7 KiB</td>
+            <td class="num">212.0x</td>
+          </tr>
+          <tr class="total">
+            <td>total</td>
+            <td class="codec">all</td>
+            <td class="num">600,000</td>
+            <td class="num">1.4 MiB</td>
+            <td class="num">6.5x</td>
+          </tr>
+        </tbody>
+      </table>
+      <p class="note">From <span style="color:#2A302A">shrunk demo</span>, synthetic data, release build.</p>
+    </div>
+  </section>
+
+  <section class="sheet" id="build">
+    <div class="wrap build">
+      <div>
+        <p class="eyebrow">Run it</p>
+        <h2>One binary, one file, no server.</h2>
+        <p style="color:var(--muted); max-width:42ch; margin:18px 0 0;">
+          shrunk is a Rust crate and CLI with no runtime dependencies. Build it,
+          run the demo, and read the format. GPL-3.0.
+        </p>
+        <div class="links">
+          <a href="https://github.com/shrunk-db/shrunk/blob/main/docs/Install.md">Install guide</a>
+          <a href="https://github.com/shrunk-db/shrunk/blob/main/docs/Architecture.md">Architecture</a>
+          <a href="https://github.com/shrunk-db/shrunk">Source</a>
+        </div>
+      </div>
+
+      <div class="terminal" aria-label="Build commands">
+        <div class="terminal-head">
+          <i></i><i></i><i></i>
+          <span>sh</span>
+        </div>
+        <pre><span class="c">$</span> git clone https://github.com/shrunk-db/shrunk.git
+<span class="c">$</span> cd shrunk
+<span class="c">$</span> cargo build --release
+<span class="c">$</span> ./target/release/shrunk demo
+<span class="g">seeded 3 series x 200000 points in 76 ms; file 1.4 MiB</span>
+<span class="c">… 196 blocks, 2 visited, 2 decoded, 194 skipped</span></pre>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<footer>
+  <div class="wrap">
+    <span>shrunk · a tiny time series database · GPL-3.0</span>
+    <nav>
+      <a href="https://github.com/shrunk-db/shrunk">GitHub</a>
+      <a href="https://github.com/shrunk-db/shrunk/tree/main/docs">Docs</a>
+      <a href="https://github.com/shrunk-db/shrunk/blob/main/LICENSE">License</a>
+    </nav>
+  </div>
+</footer>
+
+</body>
+</html>

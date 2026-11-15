@@ -93,6 +93,7 @@ the label on the box.
 
 ## Documentation
 
+- [Website](https://shrunk-db.vercel.app): a short tour of the block format.
 - [Install and first run](docs/Install.md): build, run the demo, and benchmark.
 - [Architecture](docs/Architecture.md): blocks, codecs, headers, and the query
   path.

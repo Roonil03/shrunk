@@ -1,0 +1,56 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  * { margin: 0; box-sizing: border-box; }
+  body {
+    width: 1200px; height: 630px;
+    background: #07090D;
+    color: #EDF1F5;
+    padding: 64px 72px;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    font-family: "Bricolage Grotesque", sans-serif;
+    overflow: hidden;
+  }
+  .brand { display: flex; align-items: center; gap: 16px; }
+  .brand img { width: 56px; height: 56px; }
+  .brand span { font-size: 38px; font-weight: 600; letter-spacing: -0.02em; }
+  h1 {
+    font-size: 72px;
+    line-height: 1.02;
+    letter-spacing: -0.035em;
+    font-weight: 600;
+  }
+  h1 em {
+    font-style: normal;
+    background: linear-gradient(92deg, #53F2C4, #4AA3FF);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+  footer {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 18px;
+    color: #8C96A3;
+  }
+  footer b { color: #53F2C4; font-weight: 500; }
+</style>
+</head>
+<body>
+  <div class="brand"><img src="https://shrunk-db.vercel.app/logo.svg" alt=""><span>shrunk</span></div>
+  <h1>Compress the readings.<br><em>Skip the rest.</em></h1>
+  <footer>
+    <span>a tiny time series database</span>
+    <b>shrunk-db.vercel.app</b>
+  </footer>
+</body>
+</html>
