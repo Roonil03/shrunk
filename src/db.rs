@@ -1016,8 +1016,14 @@ impl Db {
         // the rename is safe: a crash before this point replays a WAL whose
         // points are already in the snapshot, and replay skips them.
         if let Some(wal) = self.wal.as_mut() {
+            // Only the WAL-bound writer has exclusive ownership of this
+            // pathname. Reopen before truncating so a failed rebind leaves
+            // both the current series and recovery WAL intact.
+            let snapshot = open_snapshot(path)?;
             hook(SaveStage::Truncate)?;
             wal.truncate()?;
+            self.series = snapshot.series;
+            self.projected_blocks = snapshot.projected_blocks;
         }
         self.path = Some(path.to_path_buf());
         self.format_version = FORMAT_VERSION;
@@ -2107,6 +2113,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn checkpoints_rebind_payloads_and_release_old_snapshot() {
+        let dir = std::env::temp_dir().join(format!(
+            "shrunk-checkpoint-rebind-{}-{}",
+            std::process::id(),
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("db.shrunk");
+        let mut db = Db::open_rw_with_block_size(&path, 4).unwrap();
+        for ts in 0..4 {
+            db.write("s", ts, ts as f64).unwrap();
+        }
+        assert!(matches!(
+            db.series["s"].blocks[0].payload,
+            Payload::Memory(_)
+        ));
+        db.checkpoint().unwrap();
+        for generation in 1..=4 {
+            let old_file = match &db.series["s"].blocks[0].payload {
+                Payload::File { file, .. } => Arc::downgrade(file),
+                Payload::Memory(_) => panic!("checkpoint retained an in-memory payload"),
+            };
+            for ts in generation * 4..(generation + 1) * 4 {
+                db.write("s", ts, ts as f64).unwrap();
+            }
+            db.checkpoint().unwrap();
+            assert!(old_file.upgrade().is_none(), "old snapshot still held open");
+            assert!(db.series["s"]
+                .blocks
+                .iter()
+                .all(|block| matches!(block.payload, Payload::File { .. })));
+        }
+        assert!(matches!(Db::open_rw(&path), Err(Error::Locked(_))));
+        let points = db.query(&Query::new("s", 0, 19)).unwrap().points;
+        assert_eq!(points.len(), 20);
+        assert_eq!(points[19], Point::new(19, 19.0));
+        drop(db);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn out_of_order_rejected() {
         let mut db = Db::new();
         db.write("s", 10, 1.0).unwrap();
@@ -2223,6 +2270,63 @@ mod tests {
             let _ = fs::remove_file(&path);
             let _ = fs::remove_file(&wal_path);
         }
+    }
+
+    #[test]
+    fn failed_snapshot_rebind_preserves_wal_and_reports_error() {
+        let dir = std::env::temp_dir().join(format!(
+            "shrunk-rebind-failure-{}-{}",
+            std::process::id(),
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("db.shrunk");
+        let wal_path = wal::wal_path(&path);
+        let mut db = Db::open_rw(&path).unwrap();
+        db.write("s", 1, 2.0).unwrap();
+        let wal_len = fs::metadata(&wal_path).unwrap().len();
+        let result = db.save_with_hook(&path, |stage| {
+            if stage == SaveStage::DirectorySync {
+                fs::remove_file(&path)?;
+            }
+            Ok(())
+        });
+        assert!(matches!(result, Err(Error::Io(_))));
+        assert_eq!(fs::metadata(&wal_path).unwrap().len(), wal_len);
+        assert_eq!(db.query(&Query::new("s", 1, 1)).unwrap().points.len(), 1);
+        drop(db);
+        assert_eq!(Db::open(&path).unwrap().point_count(), 1);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn unbound_save_does_not_adopt_interleaved_snapshot() {
+        let dir = std::env::temp_dir().join(format!(
+            "shrunk-unbound-save-{}-{}",
+            std::process::id(),
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("db.shrunk");
+        let mut a = Db::new();
+        a.write("a", 1, 1.0).unwrap();
+        let mut b = Db::new();
+        b.write("b", 2, 2.0).unwrap();
+        a.save_with_hook(&path, |stage| {
+            if stage == SaveStage::DirectorySync {
+                b.save(&path)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(a.query(&Query::new("a", 1, 1)).unwrap().points.len(), 1);
+        assert!(matches!(
+            a.query(&Query::new("b", 2, 2)),
+            Err(Error::UnknownSeries(_))
+        ));
+        assert_eq!(b.query(&Query::new("b", 2, 2)).unwrap().points.len(), 1);
+        assert_eq!(Db::open(&path).unwrap().series_names(), vec!["b"]);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
