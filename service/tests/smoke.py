@@ -245,6 +245,25 @@ def exercise_retention_policy(server):
     server.request("/v1/write", {"series": "policy", "points": [{"ts": now - 20000, "value": 1.0}, future]})
     server.stop(crash=True)
     server.environment = {"SHRUNK_RETENTION_MS": "1200", "SHRUNK_RETENTION_INTERVAL_MS": "100"}
+    if not server.image:
+        # A failed bind must not run the destructive startup sweep.
+        with socket.socket() as occupied:
+            occupied.bind(("127.0.0.1", 0))
+            occupied.listen()
+            env = dict(os.environ, SHRUNK_TOKEN=TOKEN,
+                       SHRUNK_LISTEN=f"127.0.0.1:{occupied.getsockname()[1]}",
+                       SHRUNK_DATA_DIR=server.temp.name)
+            env.pop("SHRUNK_TOKEN_FILE", None)
+            env.update(server.environment)
+            failed = subprocess.run([server.binary], env=env, capture_output=True, timeout=10)
+            assert failed.returncode != 0 and b"Address already in use" in failed.stderr, failed.stderr
+        server.environment = {}
+        server.start()
+        assert server.request("/v1/query", {"series": "policy"})["points"] == [
+            {"ts": now - 20000, "value": 1.0}, future
+        ]
+        server.stop(crash=True)
+        server.environment = {"SHRUNK_RETENTION_MS": "1200", "SHRUNK_RETENTION_INTERVAL_MS": "100"}
     server.start()
     assert server.request("/v1/query", {"series": "policy"})["points"] == [future]
     fresh = {"ts": time.time_ns() // 1_000_000, "value": 3.0}

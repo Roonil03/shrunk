@@ -747,6 +747,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(&data_dir)?;
     let path = data_dir.join("shrunk.db");
     let policy = RetentionPolicy::from_env()?;
+    // Reserve the address before opening the database: startup retention can
+    // publish a new snapshot, and a failed bind must not change stored data.
+    // Requests are only accepted after the open and initial sweep succeed.
+    let listener = tokio::net::TcpListener::bind(listen).await?;
     let mut db = Db::open_rw(&path)?;
     if let Some(policy) = policy {
         RetentionPolicy::report(policy.sweep(&mut db).map_err(|error| error.2)?);
@@ -760,7 +764,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         requests: Arc::new(Semaphore::new(16)),
         operations: Arc::new(Semaphore::new(8)),
     };
-    let listener = tokio::net::TcpListener::bind(listen).await?;
     eprintln!("shrunk-server listening on {}", listener.local_addr()?);
     let retention = policy.map(|policy| policy.start(state.clone()));
     let result = axum::serve(listener, app(state.clone()))
