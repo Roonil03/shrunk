@@ -478,21 +478,21 @@ mod tests {
     #[test]
     fn failed_boundary_decode_leaves_all_series_unchanged() {
         let mut db = Db::with_block_size(4);
-        db.write_many("good", &[Point::new(0, 0.0), Point::new(1, 1.0)])
+        db.write_many("agood", &[Point::new(0, 0.0), Point::new(1, 1.0)])
             .unwrap();
         db.write_many(
-            "bad",
+            "zbad",
             &(0..8)
                 .map(|ts| Point::new(ts, ts as f64))
                 .collect::<Vec<_>>(),
         )
         .unwrap();
-        let block = &mut db.series.get_mut("bad").unwrap().blocks[0];
+        let block = &mut db.series.get_mut("zbad").unwrap().blocks[0];
         block.payload_crc = Some(0);
         assert!(matches!(db.retain_since(2), Err(Error::Format(_))));
         assert_eq!(db.point_count(), 10);
-        assert_eq!(db.series["good"].point_count(), 2);
-        assert_eq!(db.series["bad"].point_count(), 8);
+        assert_eq!(db.series["agood"].point_count(), 2);
+        assert_eq!(db.series["zbad"].point_count(), 8);
     }
 
     #[test]
@@ -512,6 +512,47 @@ mod tests {
             assert_eq!(
                 before.payload.bytes().unwrap(),
                 after.payload.bytes().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn maintenance_reads_every_codec_through_the_block_interface() {
+        let points: Vec<_> = (-12..12)
+            .map(|ts| Point::new(ts, ((ts * 3) % 7) as f64))
+            .collect();
+        for codec in Codec::ALL {
+            let mut db = Db::with_block_size(8);
+            db.write_many("s", &points).unwrap();
+            for (block, chunk) in db
+                .series
+                .get_mut("s")
+                .unwrap()
+                .blocks
+                .iter_mut()
+                .zip(points.chunks(8))
+            {
+                block.codec = codec;
+                block.payload = Payload::Memory(codec.encode(chunk).unwrap());
+            }
+            let buckets = db.downsample("s", -11, 10, 7, Agg::Count).unwrap();
+            assert_eq!(
+                buckets.points,
+                vec![
+                    Point::new(-14, 4.0),
+                    Point::new(-7, 7.0),
+                    Point::new(0, 7.0),
+                    Point::new(7, 4.0),
+                ],
+                "{codec:?}"
+            );
+            db.delete_range("s", -9, 7).unwrap();
+            assert_eq!(
+                db.query(&Query::new("s", i64::MIN, i64::MAX))
+                    .unwrap()
+                    .points,
+                [points[..3].to_vec(), points[20..].to_vec()].concat(),
+                "{codec:?}"
             );
         }
     }

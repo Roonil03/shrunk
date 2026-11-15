@@ -19,6 +19,14 @@ WALs, WAL symlinks and permissions, writer locking, stale destination WALs,
 and injected snapshot failures before write, sync, rename, directory sync,
 and WAL truncation.
 
+Lifecycle tests compare range deletion and every downsampling aggregate with
+independent reference results across block sizes, pending points, negative and
+extreme timestamps, empty buckets, NaNs, and infinities. They check repeated
+event-time retention, one-time rollup retry behavior, unchanged compressed
+payloads, old readers, WAL-only starts, tail deletion followed by appends and
+reopen, and the CLI maintenance flow. Failure injection at each snapshot stage
+verifies that memory and recovery retain the same published generation.
+
 Run one test while iterating:
 
 ```sh
