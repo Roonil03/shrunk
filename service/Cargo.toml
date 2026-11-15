@@ -1,0 +1,31 @@
+[package]
+name = "shrunk-server"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+publish = false
+license = "GPL-3.0-or-later"
+description = "Authenticated HTTP service for the shrunk time series database"
+
+[dependencies]
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+shrunk = { path = ".." }
+subtle = "2.6"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "deny"
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
