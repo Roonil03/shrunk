@@ -30,6 +30,9 @@ Additional fault tests require a directory durability barrier before appends,
 identical delete/retention retries, and a reopened writer can proceed after a
 failed post-rename sync. A reduced snapshot-size limit verifies that oversized
 rollups fail before publication and leave the prior snapshot readable.
+The CLI subprocess flow lives in its own integration test binary so process
+creation cannot briefly inherit a WAL writer's open file description from a
+parallel lifecycle test in the same test process.
 
 Run one test while iterating:
 
