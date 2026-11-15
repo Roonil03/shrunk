@@ -1,0 +1,11 @@
+*
+!Cargo.toml
+!Cargo.lock
+!LICENSE
+!src
+!src/**
+!service
+!service/Cargo.toml
+!service/Cargo.lock
+!service/src
+!service/src/**
