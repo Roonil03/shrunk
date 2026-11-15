@@ -31,6 +31,7 @@ impl Db {
     /// the old WAL is checkpointed before the replacement snapshot is written.
     /// Other handles change only in memory until explicitly saved.
     pub fn delete_range(&mut self, series: &str, start: i64, end: i64) -> Result<DeleteResult> {
+        self.ensure_snapshot_dir_durable()?;
         let existing = self
             .series
             .get(series)
@@ -61,6 +62,7 @@ impl Db {
     /// Empty series remain present. This is an explicit maintenance operation;
     /// it does not configure a policy for future writes.
     pub fn retain_since(&mut self, cutoff: i64) -> Result<DeleteResult> {
+        self.ensure_snapshot_dir_durable()?;
         if cutoff == i64::MIN {
             return Ok(DeleteResult::default());
         }
@@ -194,6 +196,7 @@ impl Db {
         changes: Vec<(String, Option<Series>)>,
         hook: impl FnMut(SaveStage) -> Result<()>,
     ) -> Result<()> {
+        self.ensure_snapshot_dir_durable()?;
         let mut projected = self.projected_blocks;
         for (name, replacement) in &changes {
             if let Some(old) = self.series.get(name) {
@@ -459,6 +462,22 @@ mod tests {
             }
             // A retry or append after an error must use the visible generation.
             let next = Point::new(expected.last().unwrap().ts + 1, 999.0);
+            if stage == SaveStage::DirectorySync {
+                assert!(db.pending_snapshot_dir_sync.is_some());
+                let wal_path = wal::wal_path(&path);
+                let wal_len = fs::metadata(&wal_path).unwrap().len();
+                db.fail_snapshot_dir_sync = true;
+                assert!(matches!(db.append("s", &[next]), Err(Error::Io(_))));
+                assert_eq!(fs::metadata(&wal_path).unwrap().len(), wal_len);
+                // Identical maintenance must not report a successful no-op
+                // while the preceding replacement remains uncommitted.
+                assert!(matches!(db.delete_range("s", 4, 7), Err(Error::Io(_))));
+                assert!(matches!(db.retain_since(i64::MIN), Err(Error::Io(_))));
+                db.fail_snapshot_dir_sync = false;
+                assert_eq!(db.delete_range("s", 4, 7).unwrap().points_deleted, 0);
+                assert_eq!(db.retain_since(i64::MIN).unwrap().points_deleted, 0);
+                assert!(db.pending_snapshot_dir_sync.is_none());
+            }
             db.append("s", &[next]).unwrap();
             drop(db);
             let reopened = Db::open_rw(&path).unwrap();
@@ -473,6 +492,120 @@ mod tests {
             drop(reopened);
             fs::remove_dir_all(&dir).unwrap();
         }
+    }
+
+    #[test]
+    fn reopened_writer_barriers_a_prior_unsynced_snapshot() {
+        let dir = std::env::temp_dir().join(format!(
+            "shrunk-lifecycle-reopen-barrier-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("test.db");
+        let mut db = Db::open_rw_with_block_size(&path, 3).unwrap();
+        let original: Vec<_> = (0..8).map(|ts| Point::new(ts, ts as f64)).collect();
+        db.append("s", &original).unwrap();
+        let (replacement, _) = deleted_series(&db.series["s"], 4, 7, 3).unwrap();
+        assert!(db
+            .install_series_with_hook(vec![("s".into(), Some(replacement))], |at| {
+                if at == SaveStage::DirectorySync {
+                    Err(Error::Io(std::io::Error::other(
+                        "injected directory sync failure",
+                    )))
+                } else {
+                    Ok(())
+                }
+            })
+            .is_err());
+        drop(db);
+
+        assert!(matches!(
+            Db::open_rw_with_block_size_and_hook(&path, 3, || Err(Error::Io(
+                std::io::Error::other("injected reopen barrier failure")
+            ))),
+            Err(Error::Io(_))
+        ));
+        let mut reopened = Db::open_rw(&path).unwrap();
+        reopened.append("s", &[Point::new(4, 99.0)]).unwrap();
+        drop(reopened);
+        let points = Db::open(&path)
+            .unwrap()
+            .query(&Query::new("s", 0, 7))
+            .unwrap()
+            .points;
+        assert_eq!(points.len(), 5);
+        assert_eq!(points.last(), Some(&Point::new(4, 99.0)));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn identical_retention_retry_waits_for_directory_sync() {
+        let dir = std::env::temp_dir().join(format!(
+            "shrunk-lifecycle-retain-barrier-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("test.db");
+        let mut db = Db::open_rw_with_block_size(&path, 3).unwrap();
+        db.append(
+            "s",
+            &(0..8)
+                .map(|ts| Point::new(ts, ts as f64))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let (replacement, _) = deleted_series(&db.series["s"], i64::MIN, 3, 3).unwrap();
+        assert!(db
+            .install_series_with_hook(vec![("s".into(), Some(replacement))], |at| {
+                if at == SaveStage::DirectorySync {
+                    Err(Error::Io(std::io::Error::other(
+                        "injected directory sync failure",
+                    )))
+                } else {
+                    Ok(())
+                }
+            })
+            .is_err());
+        db.fail_snapshot_dir_sync = true;
+        assert!(matches!(db.retain_since(4), Err(Error::Io(_))));
+        db.fail_snapshot_dir_sync = false;
+        assert_eq!(db.retain_since(4).unwrap().points_deleted, 0);
+        assert_eq!(db.point_count(), 4);
+        drop(db);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn oversized_rollup_is_rejected_before_snapshot_publish() {
+        let dir = std::env::temp_dir().join(format!(
+            "shrunk-lifecycle-size-limit-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("test.db");
+        let mut db = Db::open_rw_with_block_size(&path, 3).unwrap();
+        let original: Vec<_> = (0..8).map(|ts| Point::new(ts, ts as f64)).collect();
+        db.append("s", &original).unwrap();
+        db.checkpoint().unwrap();
+        let before = fs::read(&path).unwrap();
+        db.snapshot_byte_limit = before.len() as u64;
+
+        assert!(matches!(
+            db.rollup("s", "r", 0, 7, 2, Agg::Count),
+            Err(Error::Limit(_))
+        ));
+        assert_eq!(db.series_names(), vec!["s"]);
+        assert_eq!(db.point_count(), original.len() as u64);
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(Db::open(&path).unwrap().series_names(), vec!["s"]);
+        db.snapshot_byte_limit = MAX_DB_BYTES;
+        assert_eq!(db.rollup("s", "r", 0, 7, 2, Agg::Count).unwrap(), 4);
+        assert_eq!(Db::open(&path).unwrap().series_names(), vec!["r", "s"]);
+        drop(db);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
