@@ -881,8 +881,8 @@
           <h2>Questions get answered at the lid.</h2>
         </div>
         <p>
-          No index server, no column scan. The query planner walks block headers
-          in order and decodes only the blocks that can still contain an answer.
+          No index server, no column scan. The query path walks block headers in
+          order and decodes only the blocks that can still contain an answer.
         </p>
       </div>
 
@@ -994,7 +994,8 @@
 <span class="c">$</span> cargo build --release
 <span class="c">$</span> ./target/release/shrunk demo
 <span class="g">seeded 3 series x 200000 points in 76 ms; file 1.4 MiB</span>
-<span class="c">… 196 blocks, 2 visited, 2 decoded, 194 skipped</span></pre>
+<span class="c">…</span>
+blocks: 196 total, 2 visited, 2 decoded, 194 skipped</pre>
       </div>
     </div>
   </section>
