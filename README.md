@@ -80,7 +80,7 @@ the label on the box.
 
 - It is not a cloud service. It is one file and one local process.
 - It is not a replacement for Prometheus, InfluxDB, or TimescaleDB. There is no
-  replication, clustering, retention policy, or SQL.
+  replication, clustering, background retention scheduler, or SQL.
 - It is not lossless magic for every data set. Noisy floating point sensors get
   about 2x. Integer counters and flat signals get 10x to 200x.
 - It does not load every payload on open. `open` reads metadata only and reads a
@@ -111,6 +111,7 @@ src/block.rs     block construction, metadata, codec selection, lazy payloads
 src/codec.rs     gorilla, delta-varint, rle, gorilla-rle, dolphin, predictor, raw
 src/crc.rs       CRC-32
 src/db.rs        series, writes, queries, aggregates, format versions, checkpoints
+src/lifecycle.rs deletes, explicit retention, downsampling, materialized rollups
 src/gen.rs       deterministic synthetic data
 src/wal.rs       write-ahead log, replay, truncation
 src/main.rs      CLI
@@ -124,12 +125,15 @@ CONTRIBUTING.md  contribution guide and PR checklist
 These are deliberate for a small project:
 
 - One writer at a time. The WAL makes appends durable, but there is no
-  multi-writer coordination or transaction API beyond per-batch atomicity.
+  multi-writer coordination or general transaction API.
 - A checkpoint rewrites the whole snapshot. Incremental appends avoid that cost
   until you checkpoint, but the snapshot itself is still a full rewrite.
 - `open` reads metadata only, but the block index for every series is held in
   memory. The payloads are read lazily.
-- No deletes, retention windows, downsampling, or rollups.
+- Deletes and retention rewrite snapshots. Retention windows are applied
+  explicitly using caller-supplied event time; there is no background policy.
+  Fixed-width downsampling and one-time materialized rollups support count,
+  sum, min, max, and average; rollups do not update when the source changes.
 - No multi-series joins or expression language. One series per query, one
   comparison per value filter.
 - Gorilla's advantage depends on data. Noisy f64 gauges get about 2x. Integer
