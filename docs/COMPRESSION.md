@@ -1,5 +1,64 @@
 # Compression and durability notes
 
+## Canonical Gorilla window path optimization (2026-11-15)
+
+Gorilla-RLE now chooses XOR value windows with a dynamic program for blocks of
+at most 2048 points. The on-disk codec ID and bit grammar are unchanged, so
+existing readers can decode the new payloads. Longer blocks use the previous
+greedy encoder. Timestamp encoding and every other codec are unchanged.
+
+For each nonzero XOR, a **fresh** action installs its canonical tight window:
+`lz = min(leading_zeros, 31)`, `tz = trailing_zeros`, width `64-lz-tz`.
+It costs `13 + width` bits (two tags, eleven metadata bits, payload). A
+**reuse** action is legal when the old window contains the XOR and costs
+`2 + old_width` bits. A zero XOR costs one bit and leaves the state unchanged.
+The dynamic program minimizes total bit cost over these actions, including
+future effects of a window choice. Equal canonical windows are merged; states
+that cannot reuse a residual are discarded. Backtracking stores only the
+winning fresh predecessor per residual because reuse is a self-loop. Time is
+`O(nw)` and extra memory `O(n+w)`, where `w ≤ 1552` is the number of possible
+canonical windows. The 2048-point cap bounds latency for configurable blocks.
+
+The old greedy encoding is one admissible path. Thus, on optimized blocks,
+the new value bit count is no greater than the old one; identical timestamp
+bytes and final byte padding preserve the payload-size inequality. On longer
+blocks the bytes are identical. The Predictor eligibility gate still compares
+its 128-point prefix against greedy Gorilla-RLE. This preserves which full
+Predictor candidates `Block::build` tries; the Gorilla-RLE candidate itself
+uses the optimized path. With the same candidate set and no larger Gorilla-RLE
+payload, selected block payload size cannot increase because of this change.
+The proof in
+`proofs/OptimalWindowPath.lean` establishes that the canonical finite-horizon
+minimum is both attainable and no greater than any valid path. Its concrete
+step model charges the Gorilla fresh/reuse bit costs and checks compatibility,
+under valid tight-window bounds. Existing window reconstruction
+proofs remain in `proofs/WindowChoice.lean`. A machine-checked refinement from
+the Rust state table and byte writer to that abstract recurrence is still
+missing. Exhaustive tests compare the Rust choice with brute force on 1296
+four-residual sequences; round-trip tests cover IEEE-754 bit patterns.
+
+This is an exact optimizer for the **canonical-window subgrammar**. Gorilla's
+wire format can represent wider fresh windows, so the result is not a global
+optimum over every representable payload or over other codec families. The
+dynamic-programming technique itself is established; no claim of a new
+general-purpose compression algorithm follows from this change.
+
+Measured with `codec-bench --points 100000`, block size 1024, release build,
+using a fresh `origin/main` archive as baseline on the same machine. These
+single-run timings vary with system load; sizes are deterministic.
+
+| pattern | greedy Gorilla-RLE bits/pt | optimized bits/pt | greedy encode ns/pt | optimized encode ns/pt |
+|---|---:|---:|---:|---:|
+| cpu | 53.91 | 53.09 | 86.3 | 131.2 |
+| counter | 11.25 | 8.24 | 16.6 | 51.9 |
+| noise | 58.50 | 58.14 | 61.4 | 149.2 |
+| saw | 54.74 | 54.25 | 62.7 | 112.4 |
+
+On `bench --points 100000 --pattern cpu`, the selected whole file fell from
+663.7 to 653.7 KiB (54.37 to 53.55 bits/point). Encode throughput is the
+main cost of the optimization; decode needs no new logic. On counter and saw,
+the predictor still wins block selection despite the Gorilla-RLE improvement.
+
 This file records what was implemented, what was measured, and what was
 rejected. All numbers come from the checked-in benchmark commands, so they can
 be reproduced on another machine.
