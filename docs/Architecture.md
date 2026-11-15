@@ -96,6 +96,14 @@ ordering matters because timestamp-based WAL replay alone would resurrect
 deleted tail points. The exclusive writer lock spans both checkpoints. The v3
 snapshot and v1 WAL formats remain unchanged.
 
+The HTTP service exposes these operations through its existing authenticated,
+serialized writer. Limited downsampling stops after completed buckets, keeping
+response allocation bounded; rollup budgets reject excess output before target
+creation. Optional service retention uses a wall-clock cutoff on a timer, while
+manual retention retains its caller-supplied event-time semantics. Both use
+metadata to skip series without expired points, avoiding payload copies and
+snapshot rewrites on ordinary no-op ticks.
+
 ## See also
 
 - [Info.md](Info.md): CLI, Rust API, v3 file layout, and WAL.

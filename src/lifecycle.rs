@@ -23,6 +23,12 @@ impl DeleteResult {
 }
 
 impl Db {
+    /// The earliest surviving timestamp across all series, using only block
+    /// metadata and pending points. Empty databases return `None`.
+    pub fn oldest_timestamp(&self) -> Option<i64> {
+        self.series.values().filter_map(series_oldest).min()
+    }
+
     /// Remove an inclusive time range. An inverted range is a no-op. The
     /// series remains present even if all its points are removed. Later writes
     /// must increase beyond the last surviving timestamp.
@@ -69,6 +75,11 @@ impl Db {
         let mut changes = Vec::new();
         let mut total = DeleteResult::default();
         for (name, series) in &self.series {
+            // Periodic retention commonly expires nothing. Avoid cloning
+            // compressed payloads or scanning the block index in that case.
+            if series_oldest(series).is_none_or(|oldest| oldest >= cutoff) {
+                continue;
+            }
             let (replacement, result) =
                 deleted_series(series, i64::MIN, cutoff - 1, self.block_size)?;
             if result.points_deleted > 0 {
@@ -104,6 +115,40 @@ impl Db {
         interval_ms: i64,
         agg: Agg,
     ) -> Result<QueryResult> {
+        self.downsample_impl(series, start, end, interval_ms, agg, usize::MAX)
+    }
+
+    /// Return at most `limit` completed buckets, stopping before scanning the
+    /// rest of the series. This bounds output allocation during execution.
+    /// Use one extra bucket to detect truncation when paginating results.
+    /// Limits above the database query budget are rejected; zero returns no
+    /// buckets. Bucket contents and alignment follow [`Db::downsample`].
+    pub fn downsample_with_limit(
+        &self,
+        series: &str,
+        start: i64,
+        end: i64,
+        interval_ms: i64,
+        agg: Agg,
+        limit: usize,
+    ) -> Result<QueryResult> {
+        if limit > MAX_QUERY_POINTS {
+            return Err(Error::Limit(format!(
+                "downsample limit exceeds {MAX_QUERY_POINTS} buckets"
+            )));
+        }
+        self.downsample_impl(series, start, end, interval_ms, agg, limit)
+    }
+
+    fn downsample_impl(
+        &self,
+        series: &str,
+        start: i64,
+        end: i64,
+        interval_ms: i64,
+        agg: Agg,
+        limit: usize,
+    ) -> Result<QueryResult> {
         validate_interval(interval_ms)?;
         let s = self
             .series
@@ -115,10 +160,13 @@ impl Db {
             ..Default::default()
         };
         let mut output = Buckets::new(interval_ms, agg);
-        if start <= end {
+        let mut stopped = false;
+        if start <= end && limit > 0 {
             let first = s.blocks.partition_point(|b| b.t_max < start);
-            for b in &s.blocks[first..] {
+            stats.blocks_skipped_time = first;
+            for (index, b) in s.blocks.iter().enumerate().skip(first) {
                 if b.t_min > end {
+                    stats.blocks_skipped_time += s.blocks.len() - index;
                     break;
                 }
                 stats.blocks_visited += 1;
@@ -128,6 +176,10 @@ impl Db {
                     && output.block(b)?
                 {
                     stats.fast_blocks += 1;
+                    if output.points.len() >= limit {
+                        stopped = true;
+                        break;
+                    }
                     continue;
                 }
                 let points = b.decode().map_err(Error::Format)?;
@@ -137,20 +189,41 @@ impl Db {
                 for p in points {
                     if p.ts >= start && p.ts <= end {
                         output.point(p)?;
+                        if output.points.len() >= limit {
+                            stopped = true;
+                            break;
+                        }
+                    }
+                }
+                if stopped {
+                    break;
+                }
+            }
+            if !stopped {
+                for p in &s.pending {
+                    if p.ts > end {
+                        break;
+                    }
+                    if p.ts >= start {
+                        output.point(*p)?;
+                        if output.points.len() >= limit {
+                            stopped = true;
+                            break;
+                        }
                     }
                 }
             }
-            for p in &s.pending {
-                if p.ts > end {
-                    break;
-                }
-                if p.ts >= start {
-                    output.point(*p)?;
-                }
-            }
+        } else if limit == 0 {
+            stats.blocks_skipped_limit = stats.blocks_total;
+        } else {
+            stats.blocks_skipped_time = stats.blocks_total;
         }
-        stats.blocks_skipped_time = stats.blocks_total - stats.blocks_visited;
-        output.finish()?;
+        stats.blocks_skipped_limit = stats
+            .blocks_total
+            .saturating_sub(stats.blocks_skipped_time + stats.blocks_visited);
+        if !stopped {
+            output.finish()?;
+        }
         Ok(QueryResult {
             points: output.points,
             stats,
@@ -170,13 +243,53 @@ impl Db {
         interval_ms: i64,
         agg: Agg,
     ) -> Result<u64> {
+        self.rollup_with_limit(
+            source,
+            target,
+            start..=end,
+            interval_ms,
+            agg,
+            MAX_QUERY_POINTS,
+        )
+    }
+
+    /// Materialize a complete rollup within an output budget. If more than
+    /// `max_buckets` would be produced, return `Error::Limit` before modifying
+    /// the database. Partial rollups are never installed. The maximum budget
+    /// is the database query limit; zero is rejected.
+    pub fn rollup_with_limit(
+        &mut self,
+        source: &str,
+        target: &str,
+        range: std::ops::RangeInclusive<i64>,
+        interval_ms: i64,
+        agg: Agg,
+        max_buckets: usize,
+    ) -> Result<u64> {
+        if max_buckets == 0 || max_buckets > MAX_QUERY_POINTS {
+            return Err(Error::InvalidInput(format!(
+                "rollup bucket limit must be in 1..={MAX_QUERY_POINTS}"
+            )));
+        }
         if source == target || self.series.contains_key(target) {
             return Err(Error::InvalidInput(
                 "rollup target must be a new series distinct from the source".into(),
             ));
         }
         validate_series_write(target, true, self.series.len())?;
-        let result = self.downsample(source, start, end, interval_ms, agg)?;
+        let result = self.downsample_impl(
+            source,
+            *range.start(),
+            *range.end(),
+            interval_ms,
+            agg,
+            max_buckets.saturating_add(1),
+        )?;
+        if result.points.len() > max_buckets {
+            return Err(Error::Limit(format!(
+                "rollup exceeds {max_buckets} bucket limit"
+            )));
+        }
         let count = result.points.len() as u64;
         let mut replacement = Series::new(target);
         replacement.last_ts = result.points.last().map(|p| p.ts);
@@ -246,6 +359,14 @@ impl Db {
         }
         Ok(())
     }
+}
+
+fn series_oldest(series: &Series) -> Option<i64> {
+    series
+        .blocks
+        .first()
+        .map(|b| b.t_min)
+        .or_else(|| series.pending.first().map(|p| p.ts))
 }
 
 fn deleted_series(

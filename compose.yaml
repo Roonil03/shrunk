@@ -1,10 +1,12 @@
 services:
   shrunk:
-    image: ghcr.io/roonil03/shrunk:latest
+    image: ${SHRUNK_IMAGE:-ghcr.io/roonil03/shrunk:latest}
     ports:
       - "127.0.0.1:8080:8080"
     environment:
       SHRUNK_TOKEN: ${SHRUNK_TOKEN:?Set SHRUNK_TOKEN to a random token of at least 32 characters}
+      SHRUNK_RETENTION_MS: ${SHRUNK_RETENTION_MS:-}
+      SHRUNK_RETENTION_INTERVAL_MS: ${SHRUNK_RETENTION_INTERVAL_MS:-}
     volumes:
       - shrunk-data:/data
     read_only: true

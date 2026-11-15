@@ -15,7 +15,8 @@ curl -s http://127.0.0.1:8080/v1/series -H "Authorization: Bearer $SHRUNK_TOKEN"
 ```
 
 See the [container and HTTP quick start](docs/Container.md) for writes, queries,
-Compose, persistence, backups, and image publication. Public GHCR packages allow
+deletes, downsampling, rollups, optional retention, Compose, persistence,
+backups, and image publication. Public GHCR packages allow
 anonymous pulls; a new package must first be made public by its owner.
 
 ## The problem, without the jargon
@@ -95,7 +96,7 @@ the label on the box.
 
 - It is not a cloud service. It is one file and one local process.
 - It is not a replacement for Prometheus, InfluxDB, or TimescaleDB. There is no
-  replication, clustering, background retention scheduler, or SQL.
+  replication, clustering, or SQL.
 - It is not lossless magic for every data set. Noisy floating point sensors get
   about 2x. Integer counters and flat signals get 10x to 200x.
 - It does not load every payload on open. `open` reads metadata only and reads a
@@ -148,7 +149,8 @@ These are deliberate for a small project:
 - `open` reads metadata only, but the block index for every series is held in
   memory. The payloads are read lazily.
 - Deletes and retention rewrite snapshots. Retention windows are applied
-  explicitly using caller-supplied event time; there is no background policy.
+  explicitly using caller-supplied event time; the HTTP service also supports
+  an opt-in policy using its wall clock, disabled by default.
   Fixed-width downsampling and one-time materialized rollups support count,
   sum, min, max, and average; rollups do not update when the source changes.
 - No multi-series joins or expression language. One series per query, one

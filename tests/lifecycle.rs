@@ -321,3 +321,72 @@ fn read_handles_change_only_in_memory_until_saved() {
     read.save(&path).unwrap();
     assert_eq!(scan(&Db::open(&path).unwrap(), "s"), points(0, 1));
 }
+
+#[test]
+fn limited_downsampling_returns_complete_buckets_and_stops_early() {
+    for block_size in [1, 7, 64, 1024] {
+        let mut db = Db::with_block_size(block_size);
+        db.write_many("s", &points(-100, 999)).unwrap();
+        for agg in [Agg::Count, Agg::Sum, Agg::Avg, Agg::Min, Agg::Max] {
+            let all = db.downsample("s", -83, 971, 13, agg).unwrap();
+            for limit in [0, 1, 3, 20, 1000] {
+                let result = db
+                    .downsample_with_limit("s", -83, 971, 13, agg, limit)
+                    .unwrap();
+                assert_eq!(result.points, all.points[..all.points.len().min(limit)]);
+                if block_size < 64 && (1..=3).contains(&limit) {
+                    assert!(result.stats.blocks_skipped_limit > 0);
+                    assert!(result.stats.blocks_visited < all.stats.blocks_visited);
+                }
+                assert_eq!(
+                    result.stats.blocks_total,
+                    result.stats.blocks_skipped_time
+                        + result.stats.blocks_skipped_limit
+                        + result.stats.blocks_visited
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn bounded_rollup_rejects_overflow_without_creating_partial_series() {
+    let mut db = Db::with_block_size(4);
+    db.write_many("raw", &points(-10, 109)).unwrap();
+    assert!(matches!(
+        db.rollup_with_limit("raw", "too-many", -10..=109, 10, Agg::Count, 11),
+        Err(Error::Limit(_))
+    ));
+    assert_eq!(db.series_names(), vec!["raw"]);
+    assert_eq!(
+        db.rollup_with_limit("raw", "exact", -10..=109, 10, Agg::Count, 12)
+            .unwrap(),
+        12
+    );
+    assert_eq!(
+        scan(&db, "exact"),
+        db.downsample("raw", -10, 109, 10, Agg::Count)
+            .unwrap()
+            .points
+    );
+    assert!(matches!(
+        db.rollup_with_limit("raw", "zero", -10..=109, 10, Agg::Count, 0),
+        Err(Error::InvalidInput(_))
+    ));
+}
+
+#[test]
+fn oldest_timestamp_tracks_pending_blocks_empty_series_and_retention() {
+    let mut db = Db::with_block_size(4);
+    assert_eq!(db.oldest_timestamp(), None);
+    db.write("later", 50, 1.0).unwrap();
+    db.write_many("earlier", &points(-5, 10)).unwrap();
+    assert_eq!(db.oldest_timestamp(), Some(-5));
+    assert_eq!(db.retain_since(-5).unwrap().points_deleted, 0);
+    db.retain_since(7).unwrap();
+    assert_eq!(db.oldest_timestamp(), Some(7));
+    db.delete_series("earlier").unwrap();
+    assert_eq!(db.oldest_timestamp(), Some(50));
+    db.delete_range("later", i64::MIN, i64::MAX).unwrap();
+    assert_eq!(db.oldest_timestamp(), None);
+}
