@@ -533,6 +533,8 @@
 
   /* codec table */
 
+  .table-wrap { overflow-x: auto; }
+
   .codec-table { width: 100%; border-collapse: collapse; border-top: 1px solid var(--line); }
   .codec-table th, .codec-table td {
     text-align: left;
@@ -711,11 +713,22 @@
     .spectable .row.head .bytes { display: none; }
   }
 
-  @media (max-width: 520px) {
+  @media (max-width: 560px) {
     body { font-size: 16px; }
     .bar nav a.hide-sm { display: none; }
     .hero .facts { gap: 20px; }
     .blockcard-foot { font-size: 10px; }
+    .codec-table th, .codec-table td { padding: 11px 0; }
+    .codec-table .col-points,
+    .codec-table .col-codec { display: none; }
+    .codec-table td.series { font-size: 12.5px; }
+    .terminal pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+    .spectable .row { grid-template-columns: minmax(0,1fr) auto; }
+    .spectable .key { grid-column: 1; }
+    .spectable .desc { grid-column: 1 / -1; }
+    .spectable .bytes { grid-column: 2; grid-row: 1; text-align: right; }
+    .spectable .row.head .col-meaning { display: none; }
+    .spectable .row.head .bytes { display: block; }
   }
 </style>
 </head>
@@ -826,7 +839,7 @@
       <div class="spectable" role="table" aria-label="Block header fields">
         <div class="row head" role="row">
           <span role="columnheader">field</span>
-          <span role="columnheader">meaning</span>
+          <span class="col-meaning" role="columnheader">meaning</span>
           <span class="bytes" role="columnheader">size</span>
         </div>
         <div class="row" role="row">
@@ -923,12 +936,13 @@
         </p>
       </div>
 
+      <div class="table-wrap">
       <table class="codec-table">
         <thead>
           <tr>
             <th scope="col">series</th>
-            <th scope="col">codec picked</th>
-            <th scope="col" class="num">points</th>
+            <th scope="col" class="col-codec">codec picked</th>
+            <th scope="col" class="num col-points">points</th>
             <th scope="col" class="num">stored</th>
             <th scope="col" class="num">ratio</th>
           </tr>
@@ -936,34 +950,35 @@
         <tbody>
           <tr>
             <td class="series">cpu.load</td>
-            <td class="codec">gorilla-rle</td>
-            <td class="num">200,000</td>
+            <td class="codec col-codec">gorilla-rle</td>
+            <td class="num col-points">200,000</td>
             <td class="num">1.3 MiB</td>
             <td class="num">2.3x</td>
           </tr>
           <tr>
             <td class="series">requests.total</td>
-            <td class="codec">predictor</td>
-            <td class="num">200,000</td>
+            <td class="codec col-codec">predictor</td>
+            <td class="num col-points">200,000</td>
             <td class="num">64.2 KiB</td>
             <td class="num">48.7x</td>
           </tr>
           <tr>
             <td class="series">thermostat.setpoint</td>
-            <td class="codec">rle</td>
-            <td class="num">200,000</td>
+            <td class="codec col-codec">rle</td>
+            <td class="num col-points">200,000</td>
             <td class="num">14.7 KiB</td>
             <td class="num">212.0x</td>
           </tr>
           <tr class="total">
             <td>total</td>
-            <td class="codec">all</td>
-            <td class="num">600,000</td>
+            <td class="codec col-codec">all</td>
+            <td class="num col-points">600,000</td>
             <td class="num">1.4 MiB</td>
             <td class="num">6.5x</td>
           </tr>
         </tbody>
       </table>
+      </div>
       <p class="note">From <span style="color:#2A302A">shrunk demo</span>, synthetic data, release build.</p>
     </div>
   </section>
