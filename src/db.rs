@@ -22,6 +22,10 @@ use crate::crc::crc32;
 use crate::wal::{self, Wal};
 use crate::Point;
 
+#[path = "lifecycle.rs"]
+mod lifecycle;
+pub use lifecycle::DeleteResult;
+
 pub type Result<T> = std::result::Result<T, Error>;
 
 const MAGIC_PREFIX: &[u8; 6] = b"SHRUNK";
@@ -362,6 +366,13 @@ pub struct Db {
     projected_blocks: usize,
     path: Option<PathBuf>,
     wal: Option<Wal>,
+    // Set after snapshot rename until the containing directory is synced.
+    // WAL writes must wait for that rename to become durable.
+    pending_snapshot_dir_sync: Option<PathBuf>,
+    #[cfg(test)]
+    fail_snapshot_dir_sync: bool,
+    #[cfg(test)]
+    snapshot_byte_limit: u64,
 }
 
 impl Default for Db {
@@ -383,6 +394,11 @@ impl Db {
             projected_blocks: 0,
             path: None,
             wal: None,
+            pending_snapshot_dir_sync: None,
+            #[cfg(test)]
+            fail_snapshot_dir_sync: false,
+            #[cfg(test)]
+            snapshot_byte_limit: MAX_DB_BYTES,
         }
     }
 
@@ -491,8 +507,11 @@ impl Db {
         if enforce_budget {
             self.ensure_block_budget(projected)?;
         }
-        if let Some(wal) = self.wal.as_mut() {
-            wal.append(series, points)?;
+        if self.wal.is_some() {
+            // A renamed replacement snapshot must survive a crash before a
+            // newly acknowledged WAL record can depend on its watermark.
+            self.ensure_snapshot_dir_durable()?;
+            self.wal.as_mut().unwrap().append(series, points)?;
         }
 
         let s = self
@@ -885,10 +904,33 @@ impl Db {
         self.save_with_hook(path, |_| Ok(()))
     }
 
+    fn ensure_snapshot_dir_durable(&mut self) -> Result<()> {
+        if let Some(path) = self.pending_snapshot_dir_sync.as_ref() {
+            #[cfg(test)]
+            if self.fail_snapshot_dir_sync {
+                return Err(Error::Io(std::io::Error::other(
+                    "injected snapshot directory sync failure",
+                )));
+            }
+            sync_snapshot_parent(path)?;
+            self.pending_snapshot_dir_sync = None;
+        }
+        Ok(())
+    }
+
     fn save_with_hook(
         &mut self,
         path: &Path,
+        hook: impl FnMut(SaveStage) -> Result<()>,
+    ) -> Result<()> {
+        self.save_with_status(path, hook, &mut false)
+    }
+
+    fn save_with_status(
+        &mut self,
+        path: &Path,
         mut hook: impl FnMut(SaveStage) -> Result<()>,
+        published: &mut bool,
     ) -> Result<()> {
         if self.wal.is_some() && !same_destination(self.path.as_deref().unwrap(), path)? {
             return Err(Error::InvalidInput(
@@ -911,10 +953,6 @@ impl Db {
         let file_name = path
             .file_name()
             .ok_or_else(|| Error::InvalidInput(format!("invalid path: {}", path.display())))?;
-        let parent = path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
         let (tmp, mut f) = loop {
             let seq = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
             let nanos = std::time::SystemTime::now()
@@ -948,17 +986,26 @@ impl Db {
                 write_db(self, &mut writer)?;
                 writer.flush()?;
             }
+            let snapshot_bytes = f.metadata()?.len();
+            #[cfg(test)]
+            let limit = self.snapshot_byte_limit;
+            #[cfg(not(test))]
+            let limit = MAX_DB_BYTES;
+            if snapshot_bytes > limit {
+                return Err(Error::Limit(format!(
+                    "snapshot is {snapshot_bytes} bytes, limit is {limit}"
+                )));
+            }
             hook(SaveStage::FileSync)?;
             f.sync_all()?;
             hook(SaveStage::Rename)?;
             fs::rename(&tmp, path)?;
+            // A failure after rename must retain this generation in memory.
+            // Lifecycle changes use this to roll back only unpublished data.
+            *published = true;
+            self.pending_snapshot_dir_sync = Some(path.to_path_buf());
             hook(SaveStage::DirectorySync)?;
-            // Opening and syncing a directory is a Unix operation. On other
-            // platforms rename alone is the durability boundary.
-            #[cfg(unix)]
-            File::open(parent)?.sync_all()?;
-            #[cfg(not(unix))]
-            let _ = parent;
+            self.ensure_snapshot_dir_durable()?;
             Ok(())
         })();
         if write_result.is_err() {
@@ -1038,6 +1085,14 @@ impl Db {
     }
 
     pub fn open_rw_with_block_size(path: &Path, block_size: usize) -> Result<Db> {
+        Self::open_rw_with_block_size_and_hook(path, block_size, || Ok(()))
+    }
+
+    fn open_rw_with_block_size_and_hook(
+        path: &Path,
+        block_size: usize,
+        before_directory_sync: impl FnOnce() -> Result<()>,
+    ) -> Result<Db> {
         reject_symlink(path)?;
         let wal_path = wal::wal_path(path);
         // Take the exclusive lock before reading the snapshot so a stale
@@ -1050,6 +1105,13 @@ impl Db {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
                 Err(e) => return Err(e.into()),
             };
+            if has_snapshot {
+                // A prior writer may have renamed a replacement but failed
+                // its directory sync. With the writer lock held, make the
+                // visible snapshot durable before replay or new WAL appends.
+                before_directory_sync()?;
+                sync_snapshot_parent(path)?;
+            }
             let mut db = if has_snapshot {
                 open_snapshot(path)?
             } else {
@@ -1116,6 +1178,20 @@ enum SaveStage {
     Rename,
     DirectorySync,
     Truncate,
+}
+
+fn sync_snapshot_parent(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        File::open(parent)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    let _ = path; // Rename is the platform's directory durability boundary.
+    Ok(())
 }
 
 fn open_snapshot(path: &Path) -> Result<Db> {

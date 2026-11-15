@@ -14,9 +14,18 @@ XOR reconstruction model represents `prev_bits ^ (prev_bits ^ bits)`. The
 window packing model requires removed low bits and omitted high bits to be zero;
 it does not establish that Rust computes or respects these bounds.
 
+`OptimalWindowPath.lean` proves that the canonical-window recurrence is both
+attained by a valid path and no greater than every valid path. Its instantiated
+steps charge `13 + width` for a fresh tight window and `2 + old_width` for
+compatible reuse, starting with no window. The model requires valid nonzero
+residual windows (`lz ≤ 31`, `lz + tz < 64`). Zero XORs add one bit without
+changing the state. No theorem connects the Rust dynamic program or byte
+writer to this recurrence, and wider fresh windows remain outside its scope.
+
 | Module | Established property | Assumptions and boundary |
 |---|---|---|
 | `WindowChoice.lean` | Local compatible-window cost bounds and reuse on ties; XOR reconstruction and residual-list round trip; conditional window packing | Both window alternatives must be valid for the local cost comparison. Packing requires the explicit zero-region bounds. No Rust tags, window eligibility, or whole-stream optimality proof. |
+| `OptimalWindowPath.lean` | Canonical finite-horizon cost is attained by a valid path and is no greater than every valid path; fresh/reuse steps use Gorilla bit costs and compatibility | Valid nonzero tight-window bounds are part of the model. Zero XORs add the same one-bit cost to every plan. Rust recurrence refinement, byte packing, and noncanonical windows are not proved. |
 | `BitCodec.lean` | Eight Boolean writes pack into a byte read MSB first; partial-byte alignment and zero padding; abstract prefix consumption and one exhausted read | The list reader starts after byte expansion. No theorem links this abstraction to Rust, and no arbitrary-length stateful byte-writer theorem is claimed. |
 | `Storage.lean` | Ordered record partition equals filtering beyond a watermark; replay at a covered final timestamp adds nothing; time pruning and ordered-block break are safe; cache contribution replacement identity | Timestamps are mathematical integers, records strictly ordered where required, bounds honest, blocks ordered and non-overlapping. The cache identity assumes the old contribution is represented; it is not a proof of cache maintenance or filesystem replay. |
 
