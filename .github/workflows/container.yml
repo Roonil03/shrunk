@@ -32,6 +32,7 @@ jobs:
           components: rustfmt, clippy
       - run: cargo fmt --manifest-path service/Cargo.toml --check
       - run: cargo clippy --manifest-path service/Cargo.toml --all-targets --locked -- -D warnings
+      - run: cargo test --manifest-path service/Cargo.toml --all-targets --locked
       - uses: docker/setup-buildx-action@v3
       - uses: docker/build-push-action@v6
         with:

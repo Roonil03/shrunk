@@ -16,9 +16,12 @@ use axum::{Json, Router};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use shrunk::{Agg, Db, Error, Point, Predicate, Query, QueryStats};
+use shrunk::{Agg, Db, DeleteResult, Error, Point, Predicate, Query, QueryStats};
 use subtle::ConstantTimeEq;
 use tokio::sync::Semaphore;
+
+mod retention;
+use retention::RetentionPolicy;
 
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 const MAX_BATCH_POINTS: usize = 10_000;
@@ -214,6 +217,11 @@ fn app(state: AppState) -> Router {
         .route("/v1/write", post(write))
         .route("/v1/query", post(query))
         .route("/v1/aggregate", post(aggregate))
+        .route("/v1/delete", post(delete_range))
+        .route("/v1/delete-series", post(delete_series))
+        .route("/v1/retain", post(retain))
+        .route("/v1/downsample", post(downsample))
+        .route("/v1/rollup", post(rollup))
         .route("/v1/series", get(series))
         .route("/v1/checkpoint", post(checkpoint))
         .route_layer(middleware::from_fn_with_state(state.clone(), authorize))
@@ -415,6 +423,215 @@ async fn aggregate(
         .map(Json)
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeleteRequest {
+    series: String,
+    from: Option<i64>,
+    to: Option<i64>,
+}
+
+fn deletion_result(result: DeleteResult) -> Value {
+    json!({
+        "points_deleted": result.points_deleted,
+        "blocks_dropped": result.blocks_dropped,
+        "blocks_rewritten": result.blocks_rewritten,
+    })
+}
+
+async fn delete_range(
+    State(state): State<AppState>,
+    Body(input): Body<DeleteRequest>,
+) -> Result<Json<Value>, ApiError> {
+    if input.from.is_none() && input.to.is_none() {
+        return Err(ApiError::bad(
+            "range deletion requires from or to; use delete-series to remove a whole series",
+        ));
+    }
+    let (from, to) = check_range(&input.series, input.from, input.to)?;
+    state
+        .run(move |store| {
+            Ok(deletion_result(store.db.delete_range(
+                &input.series,
+                from,
+                to,
+            )?))
+        })
+        .await
+        .map(Json)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SeriesRequest {
+    series: String,
+}
+
+async fn delete_series(
+    State(state): State<AppState>,
+    Body(input): Body<SeriesRequest>,
+) -> Result<Json<Value>, ApiError> {
+    check_series(&input.series)?;
+    state
+        .run(move |store| {
+            let deleted = store.db.delete_series(&input.series)?;
+            Ok(json!({"series_deleted": true, "points_deleted": deleted}))
+        })
+        .await
+        .map(Json)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetainRequest {
+    cutoff: Option<i64>,
+    now: Option<i64>,
+    window_ms: Option<i64>,
+}
+
+impl RetainRequest {
+    fn cutoff(&self) -> Result<i64, ApiError> {
+        match (self.cutoff, self.now, self.window_ms) {
+            (Some(cutoff), None, None) => Ok(cutoff),
+            (None, Some(now), Some(window)) if window > 0 => Ok(now.saturating_sub(window)),
+            _ => Err(ApiError::bad(
+                "use cutoff or both now and a positive window_ms",
+            )),
+        }
+    }
+}
+
+async fn retain(
+    State(state): State<AppState>,
+    Body(input): Body<RetainRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let cutoff = input.cutoff()?;
+    state
+        .run(move |store| {
+            let mut result = deletion_result(store.db.retain_since(cutoff)?);
+            result["cutoff"] = json!(cutoff);
+            Ok(result)
+        })
+        .await
+        .map(Json)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DownsampleRequest {
+    series: String,
+    from: Option<i64>,
+    to: Option<i64>,
+    interval_ms: i64,
+    agg: String,
+    limit: Option<usize>,
+}
+
+fn check_bucket_options(interval: i64, agg: &str, limit: usize) -> Result<Agg, ApiError> {
+    if interval <= 0 {
+        return Err(ApiError::bad("interval_ms must be positive"));
+    }
+    if limit == 0 || limit > MAX_QUERY_POINTS {
+        return Err(ApiError::bad(format!(
+            "bucket limit must be in 1..={MAX_QUERY_POINTS}"
+        )));
+    }
+    Agg::parse(agg).ok_or_else(|| ApiError::bad("agg must be count, sum, min, max, or avg"))
+}
+
+fn next_bucket_start(ts: i64, interval: i64) -> Option<i64> {
+    let width = i128::from(interval);
+    i64::try_from((i128::from(ts).div_euclid(width) + 1) * width).ok()
+}
+
+async fn downsample(
+    State(state): State<AppState>,
+    Body(input): Body<DownsampleRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let (from, to) = check_range(&input.series, input.from, input.to)?;
+    let limit = input.limit.unwrap_or(1000);
+    let agg = check_bucket_options(input.interval_ms, &input.agg, limit)?;
+    state
+        .run(move |store| {
+            let mut result = store.db.downsample_with_limit(
+                &input.series,
+                from,
+                to,
+                input.interval_ms,
+                agg,
+                limit + 1,
+            )?;
+            let truncated = result.points.len() > limit;
+            result.points.truncate(limit);
+            let next_from = if truncated {
+                result
+                    .points
+                    .last()
+                    .and_then(|p| next_bucket_start(p.ts, input.interval_ms))
+            } else {
+                None
+            };
+            let points: Vec<_> = result
+                .points
+                .iter()
+                .map(|p| json!({"ts": p.ts, "value": p.value}))
+                .collect();
+            Ok(json!({"points": points, "truncated": truncated,
+                "next_from": next_from, "stats": stats(result.stats)}))
+        })
+        .await
+        .map(Json)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RollupRequest {
+    series: String,
+    target: String,
+    from: Option<i64>,
+    to: Option<i64>,
+    interval_ms: i64,
+    agg: String,
+    max_buckets: Option<usize>,
+}
+
+async fn rollup(
+    State(state): State<AppState>,
+    Body(input): Body<RollupRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let (from, to) = check_range(&input.series, input.from, input.to)?;
+    check_series(&input.target)?;
+    let max_buckets = input.max_buckets.unwrap_or(MAX_QUERY_POINTS);
+    let agg = check_bucket_options(input.interval_ms, &input.agg, max_buckets)?;
+    state
+        .run(move |store| {
+            let names = store.db.series_names();
+            if input.series == input.target || names.contains(&input.target.as_str()) {
+                return Err(ApiError(
+                    StatusCode::CONFLICT,
+                    "series_exists",
+                    "rollup target must be a new series distinct from the source".into(),
+                ));
+            }
+            if names.len() >= MAX_SERIES {
+                return Err(ApiError::bad(format!(
+                    "database supports at most {MAX_SERIES} series"
+                )));
+            }
+            let count = store.db.rollup_with_limit(
+                &input.series,
+                &input.target,
+                from..=to,
+                input.interval_ms,
+                agg,
+                max_buckets,
+            )?;
+            Ok(json!({"series": input.target, "written": count}))
+        })
+        .await
+        .map(Json)
+}
+
 async fn series(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     state.run(|store| {
         let series: Vec<_> = store.db.summaries().into_iter().map(|s| json!({
@@ -529,7 +746,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let data_dir = PathBuf::from(env::var_os("SHRUNK_DATA_DIR").unwrap_or_else(|| "data".into()));
     fs::create_dir_all(&data_dir)?;
     let path = data_dir.join("shrunk.db");
-    let db = Db::open_rw(&path)?;
+    let policy = RetentionPolicy::from_env()?;
+    let mut db = Db::open_rw(&path)?;
+    if let Some(policy) = policy {
+        RetentionPolicy::report(policy.sweep(&mut db).map_err(|error| error.2)?);
+    }
     let state = AppState {
         store: Arc::new(Mutex::new(Store {
             db,
@@ -541,9 +762,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
     let listener = tokio::net::TcpListener::bind(listen).await?;
     eprintln!("shrunk-server listening on {}", listener.local_addr()?);
-    axum::serve(listener, app(state.clone()))
+    let retention = policy.map(|policy| policy.start(state.clone()));
+    let result = axum::serve(listener, app(state.clone()))
         .with_graceful_shutdown(shutdown_signal())
-        .await?;
+        .await;
+    if let Some((stop, task)) = retention {
+        let _ = stop.send(true);
+        task.await?;
+    }
+    result?;
     state
         .run(|store| {
             store.db.checkpoint()?;
