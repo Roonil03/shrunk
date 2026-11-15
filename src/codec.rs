@@ -231,6 +231,18 @@ fn gorilla_encode(points: &[Point]) -> Vec<u8> {
 }
 
 fn encode_xor(w: &mut BitWriter, prev_bits: u64, bits: u64, window: &mut Option<(u32, u32)>) {
+    encode_xor_with_choice(w, prev_bits, bits, window, None);
+}
+
+/// `force_new` is a shortest-path decision; `None` retains the legacy greedy
+/// choice for large blocks and for callers that do not optimize a full stream.
+fn encode_xor_with_choice(
+    w: &mut BitWriter,
+    prev_bits: u64,
+    bits: u64,
+    window: &mut Option<(u32, u32)>,
+    force_new: Option<bool>,
+) {
     let xor = prev_bits ^ bits;
     if xor == 0 {
         w.write_bit(false);
@@ -248,6 +260,7 @@ fn encode_xor(w: &mut BitWriter, prev_bits: u64, bits: u64, window: &mut Option<
     let reused = window
         .map(|(plz, ptz)| lz >= plz && tz >= ptz && 64 - plz - ptz <= 11 + meaningful)
         .unwrap_or(false);
+    let reused = force_new.map_or(reused, |new| !new);
 
     if reused {
         let (plz, ptz) = window.unwrap();
@@ -260,6 +273,88 @@ fn encode_xor(w: &mut BitWriter, prev_bits: u64, bits: u64, window: &mut Option<
         w.write_bits(xor >> tz, meaningful);
         *window = Some((lz, tz));
     }
+}
+
+/// Minimum-bit path through all reachable Gorilla windows. Each new-window
+/// action installs the unique tight window for its residual; a reuse action
+/// leaves the state unchanged. Equal windows are merged. The cap bounds work
+/// and memory for user-configurable blocks; larger blocks retain greedy bits.
+fn optimal_xor_choices(points: &[Point]) -> Option<Vec<bool>> {
+    const MAX_OPTIMAL_POINTS: usize = 2048;
+    if points.len() > MAX_OPTIMAL_POINTS {
+        return None;
+    }
+    struct Step {
+        point: usize,
+        target: (u32, u32),
+        predecessor: Option<(u32, u32)>,
+        fresh_won: bool,
+    }
+    struct State {
+        window: Option<(u32, u32)>,
+        cost: usize,
+    }
+
+    let mut states = vec![State {
+        window: None,
+        cost: 0,
+    }];
+    let mut next = Vec::new();
+    let mut steps = Vec::new();
+    for i in 1..points.len() {
+        let xor = points[i - 1].value.to_bits() ^ points[i].value.to_bits();
+        if xor == 0 {
+            continue; // Its one-bit cost is independent of the window path.
+        }
+        let lz = xor.leading_zeros().min(31);
+        let tz = xor.trailing_zeros();
+        let width = 64 - lz - tz;
+        let tight = (lz, tz);
+        let best_old = states.iter().min_by_key(|state| state.cost)?;
+        let predecessor = best_old.window;
+        let fresh_cost = best_old.cost + 13 + width as usize;
+        next.clear();
+        next.reserve(states.len() + 1);
+        for state in &states {
+            if let Some((plz, ptz)) = state.window {
+                if lz >= plz && tz >= ptz {
+                    next.push(State {
+                        window: state.window,
+                        cost: state.cost + 2 + (64 - plz - ptz) as usize,
+                    });
+                }
+            }
+        }
+        let mut fresh_won = false;
+        if let Some(target) = next.iter_mut().find(|state| state.window == Some(tight)) {
+            if fresh_cost < target.cost {
+                target.cost = fresh_cost;
+                fresh_won = true;
+            }
+        } else {
+            next.push(State {
+                window: Some(tight),
+                cost: fresh_cost,
+            });
+            fresh_won = true;
+        }
+        std::mem::swap(&mut states, &mut next);
+        steps.push(Step {
+            point: i,
+            target: tight,
+            predecessor,
+            fresh_won,
+        });
+    }
+    let mut state = states.iter().min_by_key(|state| state.cost)?.window;
+    let mut choices = vec![false; points.len()];
+    for step in steps.iter().rev() {
+        if state == Some(step.target) && step.fresh_won {
+            choices[step.point] = true;
+            state = step.predecessor;
+        }
+    }
+    Some(choices)
 }
 
 fn decode_xor(
@@ -453,9 +548,16 @@ fn gorilla_rle_encode(points: &[Point]) -> Vec<u8> {
     w.write_bits(points[0].value.to_bits(), 64);
     let mut prev_bits = points[0].value.to_bits();
     let mut window: Option<(u32, u32)> = None;
-    for p in points.iter().skip(1) {
+    let choices = optimal_xor_choices(points);
+    for (i, p) in points.iter().enumerate().skip(1) {
         let bits = p.value.to_bits();
-        encode_xor(&mut w, prev_bits, bits, &mut window);
+        encode_xor_with_choice(
+            &mut w,
+            prev_bits,
+            bits,
+            &mut window,
+            choices.as_ref().map(|c| c[i]),
+        );
         prev_bits = bits;
     }
     out.extend_from_slice(&w.finish());
@@ -971,6 +1073,129 @@ fn rle_decode(bytes: &[u8], count: usize) -> Result<Vec<Point>, String> {
 mod tests {
     use super::*;
 
+    fn greedy_gorilla_rle(points: &[Point]) -> Vec<u8> {
+        let mut out = Vec::new();
+        encode_ts_rle(points, &mut out);
+        let mut writer = BitWriter::new();
+        writer.write_bits(points[0].value.to_bits(), 64);
+        let mut window = None;
+        for pair in points.windows(2) {
+            encode_xor(
+                &mut writer,
+                pair[0].value.to_bits(),
+                pair[1].value.to_bits(),
+                &mut window,
+            );
+        }
+        out.extend(writer.finish());
+        out
+    }
+
+    fn points_from_residuals(residuals: &[u64]) -> Vec<Point> {
+        let mut bits = 0u64;
+        let mut points = vec![Point {
+            ts: 0,
+            value: f64::from_bits(bits),
+        }];
+        for (i, residual) in residuals.iter().enumerate() {
+            bits ^= residual;
+            points.push(Point {
+                ts: i as i64 + 1,
+                value: f64::from_bits(bits),
+            });
+        }
+        points
+    }
+
+    fn brute_xor_cost(residuals: &[u64], window: Option<(u32, u32)>) -> usize {
+        let Some((&xor, rest)) = residuals.split_first() else {
+            return 0;
+        };
+        if xor == 0 {
+            return 1 + brute_xor_cost(rest, window);
+        }
+        let lz = xor.leading_zeros().min(31);
+        let tz = xor.trailing_zeros();
+        let fresh = 13 + (64 - lz - tz) as usize + brute_xor_cost(rest, Some((lz, tz)));
+        if let Some((plz, ptz)) = window {
+            if lz >= plz && tz >= ptz {
+                return fresh.min(2 + (64 - plz - ptz) as usize + brute_xor_cost(rest, window));
+            }
+        }
+        fresh
+    }
+
+    fn chosen_xor_cost(residuals: &[u64], choices: &[bool]) -> usize {
+        let mut cost = 0;
+        let mut window = None;
+        for (i, &xor) in residuals.iter().enumerate() {
+            if xor == 0 {
+                cost += 1;
+            } else if choices[i + 1] {
+                let lz = xor.leading_zeros().min(31);
+                let tz = xor.trailing_zeros();
+                cost += 13 + (64 - lz - tz) as usize;
+                window = Some((lz, tz));
+            } else {
+                let (lz, tz) = window.expect("reuse needs a window");
+                assert!(xor.leading_zeros().min(31) >= lz && xor.trailing_zeros() >= tz);
+                cost += 2 + (64 - lz - tz) as usize;
+            }
+        }
+        cost
+    }
+
+    #[test]
+    fn optimal_window_path_beats_greedy_and_keeps_legacy_decoder() {
+        let points = points_from_residuals(&[u64::MAX, (1u64 << 63) | (1 << 12), (1u64 << 63) | 1]);
+        let optimal = Codec::GorillaRle.encode(&points).unwrap();
+        let greedy = greedy_gorilla_rle(&points);
+        assert!(
+            optimal.len() < greedy.len(),
+            "{} vs {}",
+            optimal.len(),
+            greedy.len()
+        );
+        let decoded = Codec::GorillaRle.decode(&optimal, points.len()).unwrap();
+        for (a, b) in points.iter().zip(decoded) {
+            assert_eq!(a.ts, b.ts);
+            assert_eq!(a.value.to_bits(), b.value.to_bits());
+        }
+    }
+
+    #[test]
+    fn window_dp_matches_exhaustive_paths() {
+        let alphabet = [0, u64::MAX, 1, 1 << 12, 1 << 63, (1 << 63) | 1];
+        for mut code in 0..alphabet.len().pow(4) {
+            let mut residuals = [0u64; 4];
+            for residual in &mut residuals {
+                *residual = alphabet[code % alphabet.len()];
+                code /= alphabet.len();
+            }
+            let points = points_from_residuals(&residuals);
+            let choices = optimal_xor_choices(&points).unwrap();
+            assert_eq!(
+                chosen_xor_cost(&residuals, &choices),
+                brute_xor_cost(&residuals, None)
+            );
+            assert!(
+                Codec::GorillaRle.encode(&points).unwrap().len()
+                    <= greedy_gorilla_rle(&points).len()
+            );
+        }
+    }
+
+    #[test]
+    fn long_blocks_keep_greedy_payload() {
+        let points = points_from_residuals(&vec![u64::MAX; 2048]);
+        assert_eq!(points.len(), 2049);
+        assert_eq!(optimal_xor_choices(&points), None);
+        assert_eq!(
+            Codec::GorillaRle.encode(&points).unwrap(),
+            greedy_gorilla_rle(&points)
+        );
+    }
+
     fn sample() -> Vec<Point> {
         let mut pts = Vec::new();
         let mut ts = 1_700_000_000_000i64;
@@ -1364,6 +1589,9 @@ mod tests {
                 let Some(bytes) = codec.encode(&points) else {
                     continue;
                 };
+                if codec == Codec::GorillaRle {
+                    assert!(bytes.len() <= greedy_gorilla_rle(&points).len());
+                }
                 let back = codec
                     .decode(&bytes, points.len())
                     .unwrap_or_else(|e| panic!("{codec:?} trial {trial} failed: {e}"));
