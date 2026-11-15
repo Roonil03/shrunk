@@ -69,11 +69,8 @@ impl RetentionPolicy {
 
     fn sweep_at(self, db: &mut Db, now: i64) -> Result<DeleteResult, ApiError> {
         let cutoff = now.saturating_sub(self.window_ms);
-        // Ordinary ticks do not clone payloads, scan every block or rewrite a
-        // snapshot. Only series with expired points reach destructive work.
-        if db.oldest_timestamp().is_none_or(|oldest| oldest >= cutoff) {
-            return Ok(DeleteResult::default());
-        }
+        // retain_since retries any pending snapshot directory sync before its
+        // cheap per-series check for expired points, even on an idle tick.
         db.retain_since(cutoff).map_err(Into::into)
     }
 
