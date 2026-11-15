@@ -5,41 +5,27 @@ mathematical models, and Kani checks that call selected actual Rust helpers.
 Neither establishes correctness of the entire database. The coverage and
 remaining gaps below are part of the verification contract.
 
-## Compatible XOR window model
-
-`WindowChoice.lean` targets Lean 4.19.0, with only the bundled `Std` library.
-Run `lean proofs/WindowChoice.lean` from the repository root.
-
-The kernel-checked model establishes that, when both representations are
-valid, the chosen local bit cost is no greater than either alternative, and
-that ties choose reuse. It also proves the 64-bit XOR reconstruction identity,
-lossless window packing under explicit bounds for the zero regions, and that a
-stateful list of XOR residuals reconstructs the original list.
-This is a local result, not a global optimality claim: changing the stored
-window affects later residuals, so an entire block can in principle grow.
-
-The model is handwritten; no theorem connects it mechanically to the Rust
-encoder, decoder, byte packing, floating-point bit conversions, or block
-selection. The Rust tests and benchmark supply separate empirical evidence,
-not a proof of refinement or full Rust verification.
-
-`xor64_reconstruct` models `prev_bits ^ (prev_bits ^ bits)` used by
-`encode_xor` and `decode_xor`. `window_roundtrip` models shifting away trailing
-zeros, writing the low `width` bits, reading them and shifting back. Its `low`
-and `high` hypotheses state that removed low bits and omitted high bits are
-zero. The Lean proof does not establish that Rust computes or respects those
-bounds; it also does not cover malformed input handling, window state, or
-padding. `#print axioms` reports only Lean's standard `propext`,
-`Classical.choice`, and `Quot.sound`, with no `sorryAx`.
-
 ## Lean coverage
 
 All modules use Lean 4.19.0 and its bundled `Std` library. They are standalone
-and are checked together by `scripts/verify-lean.sh`.
+and are checked together by `scripts/verify-lean.sh`. The window cost result is
+local: changing a stored window can affect later residuals and block size. The
+XOR reconstruction model represents `prev_bits ^ (prev_bits ^ bits)`. The
+window packing model requires removed low bits and omitted high bits to be zero;
+it does not establish that Rust computes or respects these bounds.
+
+`OptimalWindowPath.lean` proves that the canonical-window recurrence is both
+attained by a valid path and no greater than every valid path. Its instantiated
+steps charge `13 + width` for a fresh tight window and `2 + old_width` for
+compatible reuse, starting with no window. The model requires valid nonzero
+residual windows (`lz ≤ 31`, `lz + tz < 64`). Zero XORs add one bit without
+changing the state. No theorem connects the Rust dynamic program or byte
+writer to this recurrence, and wider fresh windows remain outside its scope.
 
 | Module | Established property | Assumptions and boundary |
 |---|---|---|
 | `WindowChoice.lean` | Local compatible-window cost bounds and reuse on ties; XOR reconstruction and residual-list round trip; conditional window packing | Both window alternatives must be valid for the local cost comparison. Packing requires the explicit zero-region bounds. No Rust tags, window eligibility, or whole-stream optimality proof. |
+| `OptimalWindowPath.lean` | Canonical finite-horizon cost is attained by a valid path and is no greater than every valid path; fresh/reuse steps use Gorilla bit costs and compatibility | Valid nonzero tight-window bounds are part of the model. Zero XORs add the same one-bit cost to every plan. Rust recurrence refinement, byte packing, and noncanonical windows are not proved. |
 | `BitCodec.lean` | Eight Boolean writes pack into a byte read MSB first; partial-byte alignment and zero padding; abstract prefix consumption and one exhausted read | The list reader starts after byte expansion. No theorem links this abstraction to Rust, and no arbitrary-length stateful byte-writer theorem is claimed. |
 | `Storage.lean` | Ordered record partition equals filtering beyond a watermark; replay at a covered final timestamp adds nothing; time pruning and ordered-block break are safe; cache contribution replacement identity | Timestamps are mathematical integers, records strictly ordered where required, bounds honest, blocks ordered and non-overlapping. The cache identity assumes the old contribution is represented; it is not a proof of cache maintenance or filesystem replay. |
 
@@ -48,8 +34,7 @@ only `propext`, `Classical.choice`, and `Quot.sound`, or fewer axioms. The runne
 treats warnings as errors (including admitted `sorry` proofs) and rejects
 reported `sorryAx` or `Lean.ofReduceBool` dependencies. New theorem declarations
 still require review and a matching `#print axioms`: the output scan is not a
-general analysis of every declaration. Native-evaluation-dependent duplicate
-zigzag models were removed; zigzag is instead checked on the Rust code below.
+general analysis of every declaration. Zigzag is checked on the Rust code below.
 
 ## Actual Rust checks
 
