@@ -196,6 +196,19 @@ aggregates for full blocks contained in one bucket. Its output is limited to
 16 million buckets. Floating-point rounding has the same query-plan dependence
 as ordinary aggregates. All lifecycle operations use the existing codecs.
 
+`downsample_with_limit(series, start, end, interval_ms, agg, limit)` returns
+only a prefix of completed buckets and stops scanning once that prefix is
+available. It bounds allocation during execution; callers can request one extra
+bucket to detect truncation. Continue from the next epoch-aligned bucket boundary
+after the last returned timestamp, rather than from that timestamp plus one.
+Zero returns no buckets, and limits above 16 million are rejected.
+`rollup_with_limit(source, target, start..=end, interval_ms, agg, max_buckets)`
+instead requires the entire result to fit its positive budget, returning
+`Error::Limit` without installing a partial target when it exceeds the budget.
+`oldest_timestamp()` returns the earliest surviving timestamp or `None`, reading
+only series metadata and pending points. Retention skips series whose earliest
+point is already within the window, avoiding payload copies for no-op checks.
+
 For a handle from `open_rw`, destructive maintenance and rollups are durable
 when they return successfully. Changes are prepared and validated first. The
 writer then checkpoints the old state and durably empties the WAL, followed by

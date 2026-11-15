@@ -43,6 +43,17 @@ docker compose down
 ```
 
 `docker compose down` keeps the named volume. `docker compose down -v` deletes it.
+Compose defaults to the published fork image `ghcr.io/roonil03/shrunk:latest`.
+Set `SHRUNK_IMAGE` to pin a digest, such as
+`ghcr.io/roonil03/shrunk@sha256:<digest>`, or use another publisher's image, such
+as `ghcr.io/your-org/shrunk:latest`. Replace placeholders with the desired image
+before running Compose:
+
+```sh
+export SHRUNK_IMAGE=ghcr.io/your-org/shrunk:latest
+docker compose up -d
+```
+
 Configure the token in your deployment's secret store so it survives a new shell.
 For a file-mounted secret, set `SHRUNK_TOKEN_FILE=/run/secrets/shrunk_token` instead
 of `SHRUNK_TOKEN` and mount a readable file at that path. A trailing newline in
@@ -86,6 +97,11 @@ curl --fail-with-body http://127.0.0.1:8080/v1/series \
 | `POST /v1/write` | `series`, `points: [{ts,value}]` | `{"written":N}`; one atomic durable batch |
 | `POST /v1/query` | `series`; optional `from`, `to`, `limit`, `filter` | `points`, `truncated`, compression `stats` |
 | `POST /v1/aggregate` | `series`, `agg`; optional `from`, `to`, `filter` | `value` (or `null`), compression `stats` |
+| `POST /v1/delete` | `series`; at least one of `from`, `to` | `points_deleted`, `blocks_dropped`, `blocks_rewritten` |
+| `POST /v1/delete-series` | `series` | `series_deleted: true`, `points_deleted` |
+| `POST /v1/retain` | `cutoff`, or both `now` and `window_ms` | Effective `cutoff` and deletion counters |
+| `POST /v1/downsample` | `series`, `interval_ms`, `agg`; optional `from`, `to`, `limit` | Bucket `points`, `truncated`, `next_from`, compression `stats` |
+| `POST /v1/rollup` | `series`, `target`, `interval_ms`, `agg`; optional `from`, `to`, `max_buckets` | Target `series`, `written` bucket count |
 | `GET /v1/series` | None | Series names, point/block counts, compressed/raw sizes, total points, format version |
 | `POST /v1/checkpoint` | Optional empty object | `{"checkpointed":true}` |
 
@@ -112,13 +128,76 @@ and series names of 1..255 UTF-8 bytes without control characters. Body reads
 time out after 10 seconds. At most 16 authenticated requests and eight database
 operations can be in flight; excess work gets 503. Database operations serialize
 on a blocking worker, keeping disk access off the HTTP runtime. These limits do
-not impose retention or a disk quota; monitor volume space and memory.
+not impose a disk quota; monitor volume space and memory. Retention is disabled
+unless explicitly enabled below.
 
 Existing snapshots created with the CLI/library can be placed in the volume as
 `shrunk.db` together with their `shrunk.db.wal`, if present, while the server is
 stopped. Non-finite values already present in imported files are returned as
 JSON `null`; aggregates follow the library's NaN semantics. See
 [the database API and storage format](Info.md).
+
+## Deletion, retention, and rollups
+
+```sh
+# At least one range bound is required. Omitted from/to is open-ended.
+curl --fail-with-body http://127.0.0.1:8080/v1/delete \
+  -H "Authorization: Bearer $SHRUNK_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"series":"temperature","to":1700000059999}'
+
+curl --fail-with-body http://127.0.0.1:8080/v1/retain \
+  -H "Authorization: Bearer $SHRUNK_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"now":1700086400000,"window_ms":86400000}'
+
+curl --fail-with-body http://127.0.0.1:8080/v1/downsample \
+  -H "Authorization: Bearer $SHRUNK_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"series":"temperature","interval_ms":60000,"agg":"avg","limit":1000}'
+
+curl --fail-with-body http://127.0.0.1:8080/v1/rollup \
+  -H "Authorization: Bearer $SHRUNK_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"series":"temperature","target":"temperature.minute","interval_ms":60000,"agg":"avg","max_buckets":100000}'
+```
+
+Range deletion is inclusive and keeps an empty series name. A body containing
+only `series` is rejected; whole-series deletion is explicit through
+`/v1/delete-series`. After tail deletion, writes may resume after the last
+surviving timestamp. Series deletion permits fresh writes at any timestamp.
+Missing series return 404. These operations are serialized with writes and
+durable before a successful response.
+
+`/v1/retain` is one-time event-time maintenance over every series, including
+materialized targets. It keeps timestamps at or after `cutoff`, or at or after
+`now - window_ms` when those two fields are used. The window must be positive;
+subtraction saturates at i64::MIN. Future-dated points are kept. The caller
+supplies the time; this route does not consult the wall clock or configure the
+operational policy below. Repeated retention with the same cutoff is a no-op.
+
+Downsampling groups points into fixed, half-open buckets aligned to timestamp
+zero. With width 10, -10..-1 is labeled -10 and 0..9 is labeled 0. Only points
+inside the inclusive requested range participate, so edge buckets can be
+partial and their timestamps can precede `from`. Empty buckets are omitted;
+undefined NaN-only average/min/max buckets are omitted too. The first bucket's
+mathematical start saturates at i64::MIN when necessary. Full blocks entirely
+inside one bucket use existing header aggregates; other blocks are decoded.
+
+Downsampling defaults to 1,000 returned buckets and permits at most 100,000.
+The engine stops after a bounded prefix, including one lookahead bucket; it
+does not build an unbounded result and truncate afterward. If `truncated` is
+true, continue with `from` set to `next_from`, keeping `to`, `interval_ms`, and
+`agg` unchanged. `next_from` is the next bucket boundary, rather than the last
+timestamp plus one, which would split a bucket. It is `null` when complete.
+Value filters are not accepted for downsampling or rollups.
+
+Rollups create a new, distinct target series using the same automatic lossless
+block compression as writes. They leave the source unchanged and do not refresh
+automatically. Existing targets, including empty ones, return 409 with
+`series_exists`; an empty result still reserves the target name. `max_buckets`
+defaults to 100,000 and accepts 1..100,000. Exceeding it returns 413 with
+`limit_exceeded` before changing the database; a partial rollup is never saved.
+If a client disconnects or receives a server-side I/O error, inspect the target
+before retrying. Explicitly delete an existing target before rebuilding it.
+Aggregate values do not retain source counts, so later averages of average
+rollups are unweighted. Floating-point rounding follows the library aggregates.
 
 ## Persistence and backups
 
@@ -146,8 +225,42 @@ including both the snapshot and WAL. Restart after the copy. Restore into an
 empty volume while the service is stopped, preserving file ownership. Copying
 only the snapshot from a live server can omit acknowledged WAL writes. Full
 checkpoints rewrite the snapshot, so provide enough disk space for the old and
-new files during replacement. This service has no scheduled retention or
-background compaction policy.
+new files during replacement. Deletes, retention with expired data, and rollups
+can write two full snapshots: the old WAL is checkpointed and emptied before
+the replacement is published. This prevents deleted tail points resurfacing
+during recovery. An I/O error after rename can leave the new state visible;
+inspect it before retrying. The library barriers subsequent writes and retries
+on directory durability. There is no background compaction policy.
+
+## Optional operational retention
+
+Set `SHRUNK_RETENTION_MS` to a positive i64 duration in milliseconds to enable
+scheduled retention. Unset or empty disables it. The service first expires old
+points after recovery and before accepting HTTP traffic, then checks every
+60 seconds. Set `SHRUNK_RETENTION_INTERVAL_MS` to 1..86,400,000 milliseconds to
+change the cadence; setting a cadence without a window is an error. Invalid
+configuration fails startup. Compose forwards both variables:
+
+```sh
+export SHRUNK_RETENTION_MS=604800000       # seven days
+export SHRUNK_RETENTION_INTERVAL_MS=60000 # check every minute
+docker compose up -d
+```
+
+This policy uses the server's wall clock: each pass removes timestamps strictly
+older than `current UTC epoch milliseconds - SHRUNK_RETENTION_MS`. It applies
+to all series, including rollup bucket timestamps, while preserving empty series
+names and future-dated points. Clock adjustments affect the cutoff. Old data
+accepted by a write can remain queryable until the next pass; writes remain
+durable and the policy later deletes expired points explicitly.
+
+Policy work shares the serialized database worker. A busy or failed sweep logs
+an error and retries at the next interval; missed ticks do not queue a backlog.
+No-op checks read the earliest timestamp from metadata without copying database
+payloads or rewriting snapshots. When data expires, the same durable retention
+path used by HTTP is applied. Shutdown stops the timer, waits for any active
+sweep, then performs the final checkpoint. Choose a cadence that allows for
+full snapshot maintenance on the expected database size.
 
 ## Build and verify locally
 
@@ -160,6 +273,7 @@ Or run the service directly with Rust 1.89 or newer and Python 3:
 
 ```sh
 cargo build --manifest-path service/Cargo.toml --locked
+cargo test --manifest-path service/Cargo.toml --all-targets --locked
 python3 service/tests/smoke.py --binary service/target/debug/shrunk-server
 export SHRUNK_TOKEN="$(openssl rand -hex 32)"
 SHRUNK_DATA_DIR=./data cargo run --manifest-path service/Cargo.toml --locked
@@ -174,7 +288,12 @@ requiring a token. Other command arguments are rejected.
 The smoke test sends real HTTP requests and verifies authentication, input
 limits, atomic conflict rejection, filters, aggregates, concurrent writers,
 crash recovery before and after checkpoints, persistence across container
-replacement, clean shutdown, the runtime UID, and the health probe.
+replacement, clean shutdown, the runtime UID, and the health probe. It also
+tests range/series deletion, accidental omitted ranges, explicit retention,
+bounded bucket pagination, cross-block aggregation, compressed rollup storage,
+restart persistence, and startup/scheduled wall-clock expiry. Use
+`--scenario base`, `--scenario lifecycle`, or `--scenario retention` to run one
+group; the default runs all three on separate data volumes.
 
 ## Image publication
 
