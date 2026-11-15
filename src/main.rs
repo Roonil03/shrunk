@@ -36,6 +36,9 @@ fn run() -> Result<(), String> {
     match args[0].as_str() {
         "seed" => cmd_seed(&args[1..]),
         "ingest" => cmd_ingest(&args[1..]),
+        "delete" => cmd_delete(&args[1..]),
+        "retain" => cmd_retain(&args[1..]),
+        "rollup" => cmd_rollup(&args[1..]),
         "query" => cmd_query(&args[1..]),
         "stats" => cmd_stats(&args[1..]),
         "bench" => cmd_bench(&args[1..]),
@@ -55,7 +58,12 @@ usage:
   shrunk ingest <db> --series NAME --file PATH
   shrunk query <db> --series NAME [--from MS] [--to MS] [--agg count|sum|min|max|avg]
                 [--gt X|--ge X|--lt X|--le X|--eq X|--ne X]
-                [--limit N] [--csv] [--explain]
+                [--every MS] [--limit N] [--csv] [--explain]
+  shrunk delete <db> --series NAME [--from MS] [--to MS] [--drop-series]
+  shrunk retain <db> --since MS
+  shrunk retain <db> --now MS --window MS
+  shrunk rollup <db> --series NAME --target NAME --every MS --agg count|sum|min|max|avg
+                 [--from MS] [--to MS]
   shrunk stats <db>
   shrunk bench [--points N] [--pattern NAME] [--block-size N]
   shrunk codec-bench [--points N] [--block-size N]
@@ -64,6 +72,8 @@ usage:
 
 notes:
   timestamps are milliseconds. time ranges are inclusive.
+  --every with --agg returns epoch-aligned buckets; --csv is supported.
+  retention is explicit event-time maintenance, applied to every series.
   values are f64. queries skip blocks using time and value bounds, and
   full-block aggregates use metadata instead of decompressing the block.
 "
@@ -191,7 +201,7 @@ fn cmd_query(args: &[String]) -> Result<(), String> {
         1,
         &[
             "--series", "--from", "--to", "--agg", "--limit", "--gt", "--ge", "--lt", "--le",
-            "--eq", "--ne",
+            "--eq", "--ne", "--every",
         ],
         &["--csv", "--explain"],
     )?;
@@ -209,12 +219,23 @@ fn cmd_query(args: &[String]) -> Result<(), String> {
     let db = Db::open(&path).map_err(|e| e.to_string())?;
     let pred = parse_predicate(args)?;
 
+    if let Some(every) = flag(args, "--every") {
+        if pred.is_some() || limit.is_some() {
+            return Err("--every cannot be used with a value filter or --limit".into());
+        }
+        let interval: i64 = number(Some(every), "--every", 1)?;
+        let agg = parse_agg(require_flag(args, "--agg")?)?;
+        let result = db
+            .downsample(series, from, to, interval, agg)
+            .map_err(|e| e.to_string())?;
+        return print_points(&result, csv, explain);
+    }
+
     if let Some(agg_s) = flag(args, "--agg") {
         if limit.is_some() || csv {
             return Err("--limit and --csv cannot be used with --agg".into());
         }
-        let agg = Agg::parse(agg_s)
-            .ok_or_else(|| format!("unknown aggregate {agg_s:?} (count, sum, min, max, avg)"))?;
+        let agg = parse_agg(agg_s)?;
         let res = db
             .aggregate(series, from, to, agg, pred)
             .map_err(|e| e.to_string())?;
@@ -240,6 +261,10 @@ fn cmd_query(args: &[String]) -> Result<(), String> {
     }
     let res = db.query(&q).map_err(|e| e.to_string())?;
 
+    print_points(&res, csv, explain)
+}
+
+fn print_points(res: &shrunk::QueryResult, csv: bool, explain: bool) -> Result<(), String> {
     if csv && !emit_line("timestamp,value")? {
         return Ok(());
     }
@@ -256,6 +281,88 @@ fn cmd_query(args: &[String]) -> Result<(), String> {
     if explain {
         print_query_stats(&res.stats)?;
     }
+    Ok(())
+}
+
+fn parse_agg(name: &str) -> Result<Agg, String> {
+    Agg::parse(name)
+        .ok_or_else(|| format!("unknown aggregate {name:?} (count, sum, min, max, avg)"))
+}
+
+fn cmd_delete(args: &[String]) -> Result<(), String> {
+    validate_options(args, 1, &["--series", "--from", "--to"], &["--drop-series"])?;
+    let path = db_arg(args)?;
+    let series = require_flag(args, "--series")?;
+    let drop_series = args.iter().any(|arg| arg == "--drop-series");
+    if drop_series && (flag(args, "--from").is_some() || flag(args, "--to").is_some()) {
+        return Err("--drop-series cannot be used with --from or --to".into());
+    }
+    let from = number(flag(args, "--from"), "--from", i64::MIN)?;
+    let to = number(flag(args, "--to"), "--to", i64::MAX)?;
+    let mut db = Db::open_rw(&path).map_err(|e| e.to_string())?;
+    let deleted = if drop_series {
+        db.delete_series(series).map_err(|e| e.to_string())?
+    } else {
+        db.delete_range(series, from, to)
+            .map_err(|e| e.to_string())?
+            .points_deleted
+    };
+    println!("deleted {deleted} points from {series:?}");
+    Ok(())
+}
+
+fn retention_cutoff(args: &[String]) -> Result<i64, String> {
+    match (flag(args, "--since"), flag(args, "--window")) {
+        (Some(since), None) => {
+            if flag(args, "--now").is_some() {
+                return Err("--now requires --window".into());
+            }
+            number(Some(since), "--since", i64::MIN)
+        }
+        (None, Some(window)) => {
+            let window: i64 = number(Some(window), "--window", 1)?;
+            if window <= 0 {
+                return Err("--window must be positive".into());
+            }
+            let now: i64 = number(Some(require_flag(args, "--now")?), "--now", 0)?;
+            Ok(now.saturating_sub(window))
+        }
+        _ => Err("use either --since MS or --now MS --window MS".into()),
+    }
+}
+
+fn cmd_retain(args: &[String]) -> Result<(), String> {
+    validate_options(args, 1, &["--since", "--now", "--window"], &[])?;
+    let path = db_arg(args)?;
+    let cutoff = retention_cutoff(args)?;
+    let mut db = Db::open_rw(&path).map_err(|e| e.to_string())?;
+    let result = db.retain_since(cutoff).map_err(|e| e.to_string())?;
+    println!(
+        "deleted {} points; retained timestamps >= {cutoff}",
+        result.points_deleted
+    );
+    Ok(())
+}
+
+fn cmd_rollup(args: &[String]) -> Result<(), String> {
+    validate_options(
+        args,
+        1,
+        &["--series", "--target", "--every", "--agg", "--from", "--to"],
+        &[],
+    )?;
+    let path = db_arg(args)?;
+    let source = require_flag(args, "--series")?;
+    let target = require_flag(args, "--target")?;
+    let interval: i64 = number(Some(require_flag(args, "--every")?), "--every", 1)?;
+    let agg = parse_agg(require_flag(args, "--agg")?)?;
+    let from = number(flag(args, "--from"), "--from", i64::MIN)?;
+    let to = number(flag(args, "--to"), "--to", i64::MAX)?;
+    let mut db = Db::open_rw(&path).map_err(|e| e.to_string())?;
+    let count = db
+        .rollup(source, target, from, to, interval, agg)
+        .map_err(|e| e.to_string())?;
+    println!("materialized {count} buckets from {source:?} into {target:?}");
     Ok(())
 }
 
