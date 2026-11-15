@@ -3,6 +3,21 @@
 shrunk stores time-stamped numbers in less space and answers questions without
 unpacking every reading.
 
+Run it as a persistent HTTP database with Docker after the first image is
+published (Linux amd64):
+
+```sh
+export SHRUNK_TOKEN="$(openssl rand -hex 32)"
+docker pull ghcr.io/roonil03/shrunk:latest
+docker run -d --name shrunk -p 127.0.0.1:8080:8080 \
+  -e SHRUNK_TOKEN -v shrunk-data:/data ghcr.io/roonil03/shrunk:latest
+curl -s http://127.0.0.1:8080/v1/series -H "Authorization: Bearer $SHRUNK_TOKEN"
+```
+
+See the [container and HTTP quick start](docs/Container.md) for writes, queries,
+Compose, persistence, backups, and image publication. Public GHCR packages allow
+anonymous pulls; a new package must first be made public by its owner.
+
 ## The problem, without the jargon
 
 Picture this. A small greenhouse has 100 temperature and humidity sensors. Each
@@ -90,6 +105,8 @@ the label on the box.
 ## Documentation
 
 - [Install and first run](docs/Install.md): build, run the demo, and benchmark.
+- [Container and HTTP service](docs/Container.md): Docker, durable storage,
+  authenticated API, and publishing images.
 - [Architecture](docs/Architecture.md): blocks, codecs, headers, and the query
   path.
 - [CLI, library, and on-disk format](docs/Info.md): commands, the Rust API, the
