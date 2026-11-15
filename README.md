@@ -8,9 +8,9 @@ published (Linux amd64):
 
 ```sh
 export SHRUNK_TOKEN="$(openssl rand -hex 32)"
-docker pull ghcr.io/roonil03/shrunk:latest
+docker pull ghcr.io/shrunk-db/shrunk:latest
 docker run -d --name shrunk -p 127.0.0.1:8080:8080 \
-  -e SHRUNK_TOKEN -v shrunk-data:/data ghcr.io/roonil03/shrunk:latest
+  -e SHRUNK_TOKEN -v shrunk-data:/data ghcr.io/shrunk-db/shrunk:latest
 curl -s http://127.0.0.1:8080/v1/series -H "Authorization: Bearer $SHRUNK_TOKEN"
 ```
 

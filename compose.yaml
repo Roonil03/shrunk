@@ -1,6 +1,6 @@
 services:
   shrunk:
-    image: ${SHRUNK_IMAGE:-ghcr.io/roonil03/shrunk:latest}
+    image: ${SHRUNK_IMAGE:-ghcr.io/shrunk-db/shrunk:latest}
     ports:
       - "127.0.0.1:8080:8080"
     environment:

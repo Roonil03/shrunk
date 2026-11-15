@@ -8,22 +8,22 @@ replication, SQL, or built-in user accounts.
 
 ## Run with Docker
 
-The fork publishes `ghcr.io/roonil03/shrunk` for Linux amd64. The image becomes
+This repository publishes `ghcr.io/shrunk-db/shrunk` for Linux amd64. The image becomes
 available after the Container workflow successfully publishes it from `main`.
-For another fork, replace `roonil03/shrunk` with its lowercase owner/repository.
+For a fork, replace `shrunk-db/shrunk` with its lowercase owner/repository.
 Use `sha-<full-commit>` or an image digest for repeatable deployments; `latest`
 tracks the last successful `main` publication.
 
 ```sh
 export SHRUNK_TOKEN="$(openssl rand -hex 32)"
-docker pull ghcr.io/roonil03/shrunk:latest
+docker pull ghcr.io/shrunk-db/shrunk:latest
 docker run -d --name shrunk \
   -p 127.0.0.1:8080:8080 \
   -e SHRUNK_TOKEN \
   -v shrunk-data:/data \
   --read-only --cap-drop=ALL --security-opt=no-new-privileges \
   --memory=512m --cpus=2 --pids-limit=64 \
-  ghcr.io/roonil03/shrunk:latest
+  ghcr.io/shrunk-db/shrunk:latest
 curl --fail http://127.0.0.1:8080/healthz
 ```
 
@@ -43,9 +43,9 @@ docker compose down
 ```
 
 `docker compose down` keeps the named volume. `docker compose down -v` deletes it.
-Compose defaults to the published fork image `ghcr.io/roonil03/shrunk:latest`.
+Compose defaults to the published image `ghcr.io/shrunk-db/shrunk:latest`.
 Set `SHRUNK_IMAGE` to pin a digest, such as
-`ghcr.io/roonil03/shrunk@sha256:<digest>`, or use another publisher's image, such
+`ghcr.io/shrunk-db/shrunk@sha256:<digest>`, or use another publisher's image, such
 as `ghcr.io/your-org/shrunk:latest`. Replace placeholders with the desired image
 before running Compose:
 

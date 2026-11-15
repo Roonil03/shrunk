@@ -10,7 +10,7 @@ RUN cargo build --release --locked --manifest-path service/Cargo.toml \
 
 FROM scratch
 ARG VCS_REF=unknown
-ARG SOURCE_URL=https://github.com/Roonil03/shrunk
+ARG SOURCE_URL=https://github.com/shrunk-db/shrunk
 LABEL org.opencontainers.image.title="shrunk" \
       org.opencontainers.image.description="Authenticated HTTP time series database with queryable compression" \
       org.opencontainers.image.source="${SOURCE_URL}" \
