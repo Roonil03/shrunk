@@ -1,0 +1,23 @@
+services:
+  shrunk:
+    image: ${SHRUNK_IMAGE:-ghcr.io/shrunk-db/shrunk:latest}
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      SHRUNK_TOKEN: ${SHRUNK_TOKEN:?Set SHRUNK_TOKEN to a random token of at least 32 characters}
+      SHRUNK_RETENTION_MS: ${SHRUNK_RETENTION_MS:-}
+      SHRUNK_RETENTION_INTERVAL_MS: ${SHRUNK_RETENTION_INTERVAL_MS:-}
+    volumes:
+      - shrunk-data:/data
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 512m
+    cpus: 2
+    pids_limit: 64
+    stop_grace_period: 60s
+    restart: unless-stopped
+
+volumes:
+  shrunk-data:

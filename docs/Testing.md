@@ -19,6 +19,38 @@ WALs, WAL symlinks and permissions, writer locking, stale destination WALs,
 and injected snapshot failures before write, sync, rename, directory sync,
 and WAL truncation.
 
+Lifecycle tests compare range deletion and every downsampling aggregate with
+independent reference results across block sizes, pending points, negative and
+extreme timestamps, empty buckets, NaNs, and infinities. They check repeated
+event-time retention, one-time rollup retry behavior, unchanged compressed
+payloads, old readers, WAL-only starts, tail deletion followed by appends and
+reopen, and the CLI maintenance flow. Failure injection at each snapshot stage
+verifies that memory and recovery retain the same published generation.
+
+The service is a separate Cargo crate. Run its policy unit tests as well as the
+real HTTP process smoke tests:
+
+```sh
+cargo test --manifest-path service/Cargo.toml --all-targets --locked
+cargo build --manifest-path service/Cargo.toml --locked
+python3 service/tests/smoke.py --binary service/target/debug/shrunk-server
+```
+
+The HTTP smoke covers bounded bucket pagination, partial edge buckets and
+cross-block aggregation, automatically compressed rollup storage, rejection of
+oversized rollups before target creation, authenticated range/series deletion,
+required deletion bounds, event-time retention, and crash/restart persistence.
+A separate policy scenario checks wall-clock expiry at startup and on a timer,
+future points, and no-op ticks without snapshot rewrites. The same smoke runs
+against the built image in container CI, which also runs the service unit tests.
+Additional fault tests require a directory durability barrier before appends,
+identical delete/retention retries, and a reopened writer can proceed after a
+failed post-rename sync. A reduced snapshot-size limit verifies that oversized
+rollups fail before publication and leave the prior snapshot readable.
+The CLI subprocess flow lives in its own integration test binary so process
+creation cannot briefly inherit a WAL writer's open file description from a
+parallel lifecycle test in the same test process.
+
 Run one test while iterating:
 
 ```sh

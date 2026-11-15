@@ -11,7 +11,13 @@ shrunk ingest <db> --series NAME --file PATH
 shrunk query <db> --series NAME [--from MS] [--to MS]
               [--agg count|sum|min|max|avg]
               [--gt X|--ge X|--lt X|--le X|--eq X|--ne X]
-              [--limit N] [--csv] [--explain]
+              [--every MS] [--limit N] [--csv] [--explain]
+
+shrunk delete <db> --series NAME [--from MS] [--to MS] [--drop-series]
+shrunk retain <db> --since MS
+shrunk retain <db> --now MS --window MS
+shrunk rollup <db> --series NAME --target NAME --every MS
+              --agg count|sum|min|max|avg [--from MS] [--to MS]
 
 shrunk stats <db>
 shrunk bench [--points N] [--pattern NAME] [--block-size N]
@@ -33,7 +39,44 @@ shrunk seed /tmp/cpu.db --series cpu --points 100000 --pattern cpu
 shrunk stats /tmp/cpu.db
 shrunk query /tmp/cpu.db --series cpu --from 1700000000000 --to 1700000600000 --agg avg --explain
 shrunk query /tmp/cpu.db --series cpu --from 1700000000000 --to 1700000600000 --gt 60 --limit 5
+shrunk query /tmp/cpu.db --series cpu --every 60000 --agg avg --csv --explain
+shrunk rollup /tmp/cpu.db --series cpu --target cpu.minute --every 60000 --agg avg
+shrunk delete /tmp/cpu.db --series cpu --from 1700000000000 --to 1700000059999
+shrunk retain /tmp/cpu.db --now 1700086400000 --window 86400000
 ```
+
+`delete` removes points in the inclusive range, retaining the series name even
+when empty. Omitted bounds cover all timestamps. `--drop-series` removes the
+name as well and cannot be combined with time bounds. Later appends must be
+newer than the last surviving point; deleting the tail permits those timestamps
+to be written again.
+
+`retain` applies to every series. `--since MS` keeps timestamps at or after the
+cutoff; `--now MS --window MS` computes the cutoff as `now - window`, saturating
+at the minimum i64 timestamp. The window must be positive. This is explicit
+maintenance based on caller-supplied event time, including future-dated points;
+it does not consult the wall clock or enforce a policy on later writes. Repeating
+the same retention is a no-op. Rollup targets are ordinary series and retention
+applies to their bucket timestamps too.
+
+`query --every MS --agg ...` produces one aggregate per nonempty bucket and
+supports `--csv` and `--explain`. It cannot be combined with a value filter or
+`--limit`. Buckets are fixed width and aligned to timestamp zero: width 10 groups
+timestamps -10 through -1 under -10, and 0 through 9 under 0. Only source points
+inside the inclusive query range participate, even for partial edge buckets.
+Output timestamps mark bucket starts and can precede `--from`. A mathematical
+bucket start below i64::MIN is represented as i64::MIN. Empty buckets are omitted;
+average, min, and max also omit buckets containing only NaNs. Count includes NaNs,
+sum ignores them, and infinities follow the ordinary aggregate behavior.
+
+`rollup` materializes those points into a new, distinct target series. It leaves
+the source unchanged and does not refresh automatically. An empty result still
+creates an empty target. Existing targets are rejected, making a repeated request
+an error rather than appending duplicate or overlapping buckets. Inspect an
+existing target after an uncertain result, or explicitly delete it before
+rebuilding. A rollup cannot be safely averaged again without retaining each
+bucket's source count; the stored points are aggregate values, not weighted
+aggregate states.
 
 ## Library
 
@@ -127,11 +170,72 @@ the same WAL fails. Snapshot symlinks and hard-link aliases are rejected for
 writes. This is a single-writer API; separate names referring to the same
 storage through other alias mechanisms are outside its coordination contract.
 
+### Lifecycle API and durability
+
+```rust
+use shrunk::{Agg, Db};
+
+let mut db = Db::open_rw(std::path::Path::new("/tmp/metrics.db")).unwrap();
+// The source series must already exist.
+let minute = db.downsample("cpu", 0, i64::MAX, 60_000, Agg::Avg).unwrap();
+db.rollup("cpu", "cpu.minute", 0, i64::MAX, 60_000, Agg::Avg).unwrap();
+let removed = db.delete_range("cpu", 0, 59_999).unwrap();
+println!("{} points removed", removed.points_deleted);
+db.retain_window(1_700_086_400_000, 86_400_000).unwrap();
+db.retain_since(1_700_000_000_000).unwrap();
+// Drop both the data and the series name.
+db.delete_series("cpu.minute").unwrap();
+```
+
+`delete_range`, `retain_since`, and `retain_window` return `DeleteResult` with
+`points_deleted`, `blocks_dropped`, and `blocks_rewritten` counters. Full blocks
+inside a deleted range are removed without decoding, and unaffected blocks keep
+their codec and compressed payload. Only boundary blocks are decoded and rebuilt.
+`downsample` returns `QueryResult`, including query statistics, and uses header
+aggregates for full blocks contained in one bucket. Its output is limited to
+16 million buckets. Floating-point rounding has the same query-plan dependence
+as ordinary aggregates. All lifecycle operations use the existing codecs.
+
+`downsample_with_limit(series, start, end, interval_ms, agg, limit)` returns
+only a prefix of completed buckets and stops scanning once that prefix is
+available. It bounds allocation during execution; callers can request one extra
+bucket to detect truncation. Continue from the next epoch-aligned bucket boundary
+after the last returned timestamp, rather than from that timestamp plus one.
+Zero returns no buckets, and limits above 16 million are rejected.
+`rollup_with_limit(source, target, start..=end, interval_ms, agg, max_buckets)`
+instead requires the entire result to fit its positive budget, returning
+`Error::Limit` without installing a partial target when it exceeds the budget.
+`oldest_timestamp()` returns the earliest surviving timestamp or `None`, reading
+only series metadata and pending points. Retention skips series whose earliest
+point is already within the window, avoiding payload copies for no-op checks.
+
+For a handle from `open_rw`, destructive maintenance and rollups are durable
+when they return successfully. Changes are prepared and validated first. The
+writer then checkpoints the old state and durably empties the WAL, followed by
+an atomic replacement snapshot with the new state. Both snapshots are written
+while holding the existing writer lock. Emptying the old WAL before publishing
+deletions prevents removed tail points from being replayed after a crash.
+This costs up to two full snapshot rewrites and introduces no new file or WAL
+format. Readers can observe the state before or after the atomic replacement;
+an existing reader retains its old snapshot.
+
+As with checkpoint, an I/O error after rename can mean the new state is already
+visible. The writer retains that visible state in memory; an error before rename
+restores the old state. After a failed directory sync, the same writer retries
+that sync before acknowledging any new WAL append or successful maintenance
+retry. A reopened writer syncs the snapshot directory under its writer lock
+before replay or appends. Reopen and inspect after an uncertain durability result.
+Handles from `new` or `open` apply lifecycle changes in memory until explicitly
+saved. Retention and range deletion retain empty series names; `delete_series`
+removes them and permits fresh writes at any timestamp.
+
 ## On-disk format
 
 A database snapshot is one file. `save`/`checkpoint` streams its blocks to an
 exclusive same-directory temp file, fsyncs it, renames it, then fsyncs the
 directory. The current format is v3.
+The writer rejects a snapshot larger than the reader's 64 GiB limit before
+renaming it into place.
 `FORMAT_VERSION` is the single source of truth: the magic (`SHRUNK03`), the
 writer, and the reader all derive from it. v1 and v2 files are still readable
 and are upgraded on the next save.

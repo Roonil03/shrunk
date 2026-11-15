@@ -76,6 +76,34 @@ This is not a general compressed-domain execution engine. Arbitrary arithmetic
 on encoded bits is not supported. The compression is queryable through block
 pruning and stored aggregates.
 
+## Lifecycle operations
+
+`src/lifecycle.rs` adds explicit range deletion, series deletion, and event-time
+retention. Whole deleted blocks are dropped, unchanged blocks retain their
+payloads, and partially overlapping blocks are decoded and rebuilt with normal
+codec selection. Pending points participate too. Deletion recalculates the last
+surviving timestamp so writes remain strictly ordered after a tail is removed.
+
+Fixed-width downsampling streams points and full-block aggregates into one
+epoch-aligned bucket at a time. Metadata answers a block only when it lies
+entirely inside both the requested time range and one bucket. Materialized
+rollups store the resulting points in a new ordinary series; there is no
+automatic refresh or special aggregate-state format.
+
+Durable lifecycle changes reuse atomic snapshots. The writer checkpoints the
+old state and empties its WAL before publishing the replacement snapshot. This
+ordering matters because timestamp-based WAL replay alone would resurrect
+deleted tail points. The exclusive writer lock spans both checkpoints. The v3
+snapshot and v1 WAL formats remain unchanged.
+
+The HTTP service exposes these operations through its existing authenticated,
+serialized writer. Limited downsampling stops after completed buckets, keeping
+response allocation bounded; rollup budgets reject excess output before target
+creation. Optional service retention uses a wall-clock cutoff on a timer, while
+manual retention retains its caller-supplied event-time semantics. Both use
+metadata to skip series without expired points, avoiding payload copies and
+snapshot rewrites on ordinary no-op ticks.
+
 ## See also
 
 - [Info.md](Info.md): CLI, Rust API, v3 file layout, and WAL.

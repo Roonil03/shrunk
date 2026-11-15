@@ -7,6 +7,22 @@
 shrunk stores time-stamped numbers in less space and answers questions without
 unpacking every reading.
 
+Run it as a persistent HTTP database with Docker after the first image is
+published (Linux amd64):
+
+```sh
+export SHRUNK_TOKEN="$(openssl rand -hex 32)"
+docker pull ghcr.io/shrunk-db/shrunk:latest
+docker run -d --name shrunk -p 127.0.0.1:8080:8080 \
+  -e SHRUNK_TOKEN -v shrunk-data:/data ghcr.io/shrunk-db/shrunk:latest
+curl -s http://127.0.0.1:8080/v1/series -H "Authorization: Bearer $SHRUNK_TOKEN"
+```
+
+See the [container and HTTP quick start](docs/Container.md) for writes, queries,
+deletes, downsampling, rollups, optional retention, Compose, persistence,
+backups, and image publication. Public GHCR packages allow
+anonymous pulls; a new package must first be made public by its owner.
+
 ## The problem, without the jargon
 
 Picture this. A small greenhouse has 100 temperature and humidity sensors. Each
@@ -84,7 +100,7 @@ the label on the box.
 
 - It is not a cloud service. It is one file and one local process.
 - It is not a replacement for Prometheus, InfluxDB, or TimescaleDB. There is no
-  replication, clustering, retention policy, or SQL.
+  replication, clustering, or SQL.
 - It is not lossless magic for every data set. Noisy floating point sensors get
   about 2x. Integer counters and flat signals get 10x to 200x.
 - It does not load every payload on open. `open` reads metadata only and reads a
@@ -95,6 +111,8 @@ the label on the box.
 
 - [Website](https://shrunk-db.vercel.app): a short tour of the block format.
 - [Install and first run](docs/Install.md): build, run the demo, and benchmark.
+- [Container and HTTP service](docs/Container.md): Docker, durable storage,
+  authenticated API, and publishing images.
 - [Architecture](docs/Architecture.md): blocks, codecs, headers, and the query
   path.
 - [CLI, library, and on-disk format](docs/Info.md): commands, the Rust API, the
@@ -116,6 +134,7 @@ src/block.rs     block construction, metadata, codec selection, lazy payloads
 src/codec.rs     gorilla, delta-varint, rle, gorilla-rle, dolphin, predictor, raw
 src/crc.rs       CRC-32
 src/db.rs        series, writes, queries, aggregates, format versions, checkpoints
+src/lifecycle.rs deletes, explicit retention, downsampling, materialized rollups
 src/gen.rs       deterministic synthetic data
 src/wal.rs       write-ahead log, replay, truncation
 src/main.rs      CLI
@@ -129,12 +148,16 @@ CONTRIBUTING.md  contribution guide and PR checklist
 These are deliberate for a small project:
 
 - One writer at a time. The WAL makes appends durable, but there is no
-  multi-writer coordination or transaction API beyond per-batch atomicity.
+  multi-writer coordination or general transaction API.
 - A checkpoint rewrites the whole snapshot. Incremental appends avoid that cost
   until you checkpoint, but the snapshot itself is still a full rewrite.
 - `open` reads metadata only, but the block index for every series is held in
   memory. The payloads are read lazily.
-- No deletes, retention windows, downsampling, or rollups.
+- Deletes and retention rewrite snapshots. Retention windows are applied
+  explicitly using caller-supplied event time; the HTTP service also supports
+  an opt-in policy using its wall clock, disabled by default.
+  Fixed-width downsampling and one-time materialized rollups support count,
+  sum, min, max, and average; rollups do not update when the source changes.
 - No multi-series joins or expression language. One series per query, one
   comparison per value filter.
 - Gorilla's advantage depends on data. Noisy f64 gauges get about 2x. Integer
