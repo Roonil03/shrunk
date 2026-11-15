@@ -87,9 +87,9 @@ class Server:
             self.stop()
         self.temp.cleanup()
 
-    def request(self, path, body=None, status=200, auth=True, raw=None, content_type="application/json"):
+    def request(self, path, body=None, status=200, auth=True, raw=None, content_type="application/json", method=None):
         data = raw if raw is not None else (json.dumps(body).encode() if body is not None else None)
-        request = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", data=data)
+        request = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", data=data, method=method)
         if auth:
             request.add_header("Authorization", "Bearer " + TOKEN)
         if data is not None:
@@ -112,6 +112,12 @@ def exercise(server):
     server.request("/v1/query", raw=b"{", status=400)
     server.request("/v1/query", {}, content_type="text/plain", status=415)
     server.request("/v1/write", raw=b" " * (1024 * 1024 + 1), status=413)
+    server.request("/v1/checkpoint", raw=b" " * (1024 * 1024 + 1), status=413)
+    server.request("/v1/checkpoint", raw=b"{", status=400)
+    server.request("/v1/checkpoint", {"unexpected": True}, status=400)
+    server.request("/v1/checkpoint", [], status=400)
+    server.request("/v1/checkpoint", {}, content_type="text/plain", status=415)
+    assert server.request("/v1/checkpoint", method="POST") == {"checkpointed": True}
     server.request("/v1/query", {"series": "absent"}, status=404)
     points = [{"ts": i, "value": i * 0.5} for i in range(1, 7)]
     assert server.request("/v1/write", {"series": "cpu", "points": points}) == {"written": 6}

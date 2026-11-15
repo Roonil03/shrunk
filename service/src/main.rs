@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use axum::body::to_bytes;
+use axum::body::{to_bytes, Bytes};
 use axum::extract::{FromRequest, Request, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
@@ -125,45 +125,61 @@ impl IntoResponse for ApiError {
 // Read bodies with a deadline as well as a size bound, including chunked bodies.
 struct Body<T>(T);
 
+fn json_content_type(request: &Request) -> bool {
+    request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(';').next())
+        .map(str::trim)
+        == Some("application/json")
+}
+
+fn require_json_content_type(request: &Request) -> Result<(), ApiError> {
+    if json_content_type(request) {
+        Ok(())
+    } else {
+        Err(ApiError(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "content_type",
+            "use Content-Type: application/json".into(),
+        ))
+    }
+}
+
+async fn read_request_bytes(request: Request) -> Result<Bytes, ApiError> {
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        to_bytes(request.into_body(), MAX_BODY_BYTES),
+    )
+    .await
+    .map_err(|_| {
+        ApiError(
+            StatusCode::REQUEST_TIMEOUT,
+            "body_timeout",
+            "request body timed out".into(),
+        )
+    })?
+    .map_err(|_| {
+        ApiError(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "body_limit",
+            format!("request body must not exceed {MAX_BODY_BYTES} bytes"),
+        )
+    })
+}
+
+fn parse_json<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, ApiError> {
+    serde_json::from_slice(bytes).map_err(|e| ApiError::bad(format!("invalid JSON: {e}")))
+}
+
 impl<T: DeserializeOwned + Send> FromRequest<AppState> for Body<T> {
     type Rejection = ApiError;
 
     async fn from_request(request: Request, _: &AppState) -> Result<Self, Self::Rejection> {
-        let content_type = request
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.split(';').next())
-            .map(str::trim);
-        if content_type != Some("application/json") {
-            return Err(ApiError(
-                StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                "content_type",
-                "use Content-Type: application/json".into(),
-            ));
-        }
-        let bytes = tokio::time::timeout(
-            Duration::from_secs(10),
-            to_bytes(request.into_body(), MAX_BODY_BYTES),
-        )
-        .await
-        .map_err(|_| {
-            ApiError(
-                StatusCode::REQUEST_TIMEOUT,
-                "body_timeout",
-                "request body timed out".into(),
-            )
-        })?
-        .map_err(|_| {
-            ApiError(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "body_limit",
-                format!("request body must not exceed {MAX_BODY_BYTES} bytes"),
-            )
-        })?;
-        serde_json::from_slice(&bytes)
-            .map(Self)
-            .map_err(|e| ApiError::bad(format!("invalid JSON: {e}")))
+        require_json_content_type(&request)?;
+        let bytes = read_request_bytes(request).await?;
+        parse_json(&bytes).map(Self)
     }
 }
 
@@ -409,7 +425,32 @@ async fn series(State(state): State<AppState>) -> Result<Json<Value>, ApiError> 
     }).await.map(Json)
 }
 
-async fn checkpoint(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+async fn checkpoint(
+    State(state): State<AppState>,
+    request: Request,
+) -> Result<Json<Value>, ApiError> {
+    // An omitted body is allowed. Any supplied body must follow the same
+    // content type, size, and deadline rules as the other POST endpoints.
+    let has_content_type = request.headers().contains_key(header::CONTENT_TYPE);
+    if has_content_type {
+        require_json_content_type(&request)?;
+    }
+    let bytes = read_request_bytes(request).await?;
+    if !bytes.is_empty() {
+        if !has_content_type {
+            return Err(ApiError(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "content_type",
+                "use Content-Type: application/json".into(),
+            ));
+        }
+        let value: Value = parse_json(&bytes)?;
+        if !matches!(value, Value::Object(ref fields) if fields.is_empty()) {
+            return Err(ApiError::bad(
+                "checkpoint body must be an empty JSON object",
+            ));
+        }
+    }
     state
         .run(|store| {
             store.db.checkpoint()?;
