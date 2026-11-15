@@ -26,6 +26,10 @@ event-time retention, one-time rollup retry behavior, unchanged compressed
 payloads, old readers, WAL-only starts, tail deletion followed by appends and
 reopen, and the CLI maintenance flow. Failure injection at each snapshot stage
 verifies that memory and recovery retain the same published generation.
+Additional fault tests require a directory durability barrier before appends,
+identical delete/retention retries, and a reopened writer can proceed after a
+failed post-rename sync. A reduced snapshot-size limit verifies that oversized
+rollups fail before publication and leave the prior snapshot readable.
 
 Run one test while iterating:
 

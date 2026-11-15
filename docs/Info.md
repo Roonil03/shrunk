@@ -208,7 +208,10 @@ an existing reader retains its old snapshot.
 
 As with checkpoint, an I/O error after rename can mean the new state is already
 visible. The writer retains that visible state in memory; an error before rename
-restores the old state. Reopen and inspect after an uncertain durability result.
+restores the old state. After a failed directory sync, the same writer retries
+that sync before acknowledging any new WAL append or successful maintenance
+retry. A reopened writer syncs the snapshot directory under its writer lock
+before replay or appends. Reopen and inspect after an uncertain durability result.
 Handles from `new` or `open` apply lifecycle changes in memory until explicitly
 saved. Retention and range deletion retain empty series names; `delete_series`
 removes them and permits fresh writes at any timestamp.
@@ -218,6 +221,8 @@ removes them and permits fresh writes at any timestamp.
 A database snapshot is one file. `save`/`checkpoint` streams its blocks to an
 exclusive same-directory temp file, fsyncs it, renames it, then fsyncs the
 directory. The current format is v3.
+The writer rejects a snapshot larger than the reader's 64 GiB limit before
+renaming it into place.
 `FORMAT_VERSION` is the single source of truth: the magic (`SHRUNK03`), the
 writer, and the reader all derive from it. v1 and v2 files are still readable
 and are upgraded on the next save.
