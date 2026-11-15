@@ -18,7 +18,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use shrunk::{Agg, Db, DeleteResult, Error, Point, Predicate, Query, QueryStats};
 use subtle::ConstantTimeEq;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 mod retention;
 use retention::RetentionPolicy;
@@ -54,6 +54,25 @@ impl AppState {
             .clone()
             .try_acquire_owned()
             .map_err(|_| ApiError::busy())?;
+        self.run_permitted(permit, operation).await
+    }
+
+    async fn acquire_maintenance_permit(&self) -> Result<OwnedSemaphorePermit, ApiError> {
+        self.operations
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| ApiError::busy())
+    }
+
+    async fn run_permitted<F>(
+        &self,
+        permit: OwnedSemaphorePermit,
+        operation: F,
+    ) -> Result<Value, ApiError>
+    where
+        F: FnOnce(&mut Store) -> Result<Value, ApiError> + Send + 'static,
+    {
         let store = self.store.clone();
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
