@@ -22,6 +22,10 @@ use crate::crc::crc32;
 use crate::wal::{self, Wal};
 use crate::Point;
 
+#[path = "lifecycle.rs"]
+mod lifecycle;
+pub use lifecycle::DeleteResult;
+
 pub type Result<T> = std::result::Result<T, Error>;
 
 const MAGIC_PREFIX: &[u8; 6] = b"SHRUNK";
@@ -888,7 +892,16 @@ impl Db {
     fn save_with_hook(
         &mut self,
         path: &Path,
+        hook: impl FnMut(SaveStage) -> Result<()>,
+    ) -> Result<()> {
+        self.save_with_status(path, hook, &mut false)
+    }
+
+    fn save_with_status(
+        &mut self,
+        path: &Path,
         mut hook: impl FnMut(SaveStage) -> Result<()>,
+        published: &mut bool,
     ) -> Result<()> {
         if self.wal.is_some() && !same_destination(self.path.as_deref().unwrap(), path)? {
             return Err(Error::InvalidInput(
@@ -952,6 +965,9 @@ impl Db {
             f.sync_all()?;
             hook(SaveStage::Rename)?;
             fs::rename(&tmp, path)?;
+            // A failure after rename must retain this generation in memory.
+            // Lifecycle changes use this to roll back only unpublished data.
+            *published = true;
             hook(SaveStage::DirectorySync)?;
             // Opening and syncing a directory is a Unix operation. On other
             // platforms rename alone is the durability boundary.
