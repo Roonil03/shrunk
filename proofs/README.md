@@ -17,9 +17,14 @@ lossless window packing under explicit bounds for the zero regions, and that a
 stateful list of XOR residuals reconstructs the original list.
 This is a local result: changing the stored window affects later residuals.
 `OptimalWindowPath.lean` adds a finite-horizon recurrence for the canonical
-fresh-window/reuse grammar. Its theorem says the recurrence costs no more than
-any valid path through that grammar. It does not include the wider fresh
-windows that Gorilla's wire format can also represent.
+fresh-window/reuse grammar. It proves both that the recurrence costs no more
+than any valid path and that a valid path attains that cost. The instantiated
+steps charge `13 + width` bits for a fresh tight window and `2 + old_width`
+for compatible reuse, starting with no window. Zero XORs are omitted because
+their one-bit cost leaves the window state unchanged. The supplied nonzero
+residuals must have the Rust-derived bounds `lz ≤ 31` and `lz + tz < 64` for
+these widths to describe actual encoding. Wider fresh windows allowed by the
+wire format remain outside this model.
 
 The model is handwritten; no theorem connects it mechanically to the Rust
 encoder, decoder, byte packing, floating-point bit conversions, or block
@@ -43,7 +48,7 @@ and are checked together by `scripts/verify-lean.sh`.
 | Module | Established property | Assumptions and boundary |
 |---|---|---|
 | `WindowChoice.lean` | Local compatible-window cost bounds and reuse on ties; XOR reconstruction and residual-list round trip; conditional window packing | Both window alternatives must be valid for the local cost comparison. Packing requires the explicit zero-region bounds. No Rust tags, window eligibility, or whole-stream optimality proof. |
-| `OptimalWindowPath.lean` | Abstract finite-horizon optimum is no greater than every valid canonical-window path | Models weighted fresh/reuse transitions, with validity supplied by the caller. It does not prove the Rust dynamic program implements the recurrence, nor cover byte packing or noncanonical fresh windows. |
+| `OptimalWindowPath.lean` | Finite-horizon recurrence is attained by a valid path and is no greater than every valid path; instantiated canonical steps use the Gorilla tag, metadata, width, and compatibility costs | Nonzero residuals supply valid tight windows; zero XORs add the same one-bit cost to every plan. It does not prove the Rust dynamic program implements the recurrence, nor cover byte packing or noncanonical fresh windows. |
 | `BitCodec.lean` | Eight Boolean writes pack into a byte read MSB first; partial-byte alignment and zero padding; abstract prefix consumption and one exhausted read | The list reader starts after byte expansion. No theorem links this abstraction to Rust, and no arbitrary-length stateful byte-writer theorem is claimed. |
 | `Storage.lean` | Ordered record partition equals filtering beyond a watermark; replay at a covered final timestamp adds nothing; time pruning and ordered-block break are safe; cache contribution replacement identity | Timestamps are mathematical integers, records strictly ordered where required, bounds honest, blocks ordered and non-overlapping. The cache identity assumes the old contribution is represented; it is not a proof of cache maintenance or filesystem replay. |
 

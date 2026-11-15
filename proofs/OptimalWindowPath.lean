@@ -6,12 +6,12 @@ import Std
    The concrete Rust implementation computes this recurrence forward and
    stores predecessors. This model does not specify Rust byte IO. -/
 
-structure WindowStep where
+structure WindowStep (State : Type) where
   freshCost : Nat
-  freshState : Nat
-  reuseCost : Nat → Option Nat
+  freshState : State
+  reuseCost : State → Option Nat
 
-def optimalCost : List WindowStep → Nat → Nat
+def optimalCost {State : Type} : List (WindowStep State) → State → Nat
   | [], _ => 0
   | step :: rest, state =>
     let fresh := step.freshCost + optimalCost rest step.freshState
@@ -19,7 +19,7 @@ def optimalCost : List WindowStep → Nat → Nat
     | none => fresh
     | some reuse => min fresh (reuse + optimalCost rest state)
 
-def planCost : List WindowStep → Nat → List Bool → Option Nat
+def planCost {State : Type} : List (WindowStep State) → State → List Bool → Option Nat
   | [], _, [] => some 0
   | [], _, _ :: _ => none
   | _ :: _, _, [] => none
@@ -30,7 +30,7 @@ def planCost : List WindowStep → Nat → List Bool → Option Nat
       (step.reuseCost state).bind fun reuse =>
         (planCost rest state choices).map (reuse + ·)
 
-theorem optimal_le_valid_plan (steps : List WindowStep) (state : Nat)
+theorem optimal_le_valid_plan {State : Type} (steps : List (WindowStep State)) (state : State)
     (choices : List Bool) (cost : Nat)
     (h : planCost steps state choices = some cost) :
     optimalCost steps state ≤ cost := by
@@ -68,4 +68,62 @@ theorem optimal_le_valid_plan (steps : List WindowStep) (state : Nat)
             simp [optimalCost, hre]
             omega
 
+theorem optimal_attained {State : Type} (steps : List (WindowStep State)) (state : State) :
+    ∃ choices, planCost steps state choices = some (optimalCost steps state) := by
+  induction steps generalizing state with
+  | nil => exact ⟨[], rfl⟩
+  | cons step rest ih =>
+    obtain ⟨freshChoices, hfresh⟩ := ih step.freshState
+    cases hre : step.reuseCost state with
+    | none =>
+      refine ⟨true :: freshChoices, ?_⟩
+      simp [planCost, optimalCost, hre, hfresh]
+    | some reuse =>
+      obtain ⟨reuseChoices, hreuse⟩ := ih state
+      by_cases hle : step.freshCost + optimalCost rest step.freshState ≤
+          reuse + optimalCost rest state
+      · refine ⟨true :: freshChoices, ?_⟩
+        simp [planCost, optimalCost, hre, hfresh]
+        omega
+      · refine ⟨false :: reuseChoices, ?_⟩
+        have hright : reuse + optimalCost rest state ≤
+            step.freshCost + optimalCost rest step.freshState := by omega
+        simp [planCost, optimalCost, hre, hreuse]
+        omega
+
+/- A nonzero XOR has canonical tight window (lz,tz), with lz capped at 31.
+   A zero XOR costs one bit and preserves the state, so omitting it from the
+   step list changes every plan cost by the same constant. The caller supplies
+   actual nonzero residuals satisfying lz + tz < 64. -/
+structure CanonicalWindow where
+  lz : Nat
+  tz : Nat
+  lz_le : lz ≤ 31
+  width_pos : lz + tz < 64
+
+def canonicalStep (window : CanonicalWindow) : WindowStep (Option CanonicalWindow) where
+  freshCost := 13 + (64 - window.lz - window.tz)
+  freshState := some window
+  reuseCost := fun state =>
+    match state with
+    | none => none
+    | some old =>
+      if old.lz ≤ window.lz ∧ old.tz ≤ window.tz then
+        some (2 + (64 - old.lz - old.tz))
+      else none
+
+theorem canonical_optimal_attained (windows : List CanonicalWindow) :
+    ∃ choices, planCost (windows.map canonicalStep) none choices =
+      some (optimalCost (windows.map canonicalStep) none) :=
+  optimal_attained _ _
+
+theorem canonical_optimal_le_valid_plan (windows : List CanonicalWindow)
+    (choices : List Bool) (cost : Nat)
+    (h : planCost (windows.map canonicalStep) none choices = some cost) :
+    optimalCost (windows.map canonicalStep) none ≤ cost :=
+  optimal_le_valid_plan _ _ _ _ h
+
 #print axioms optimal_le_valid_plan
+#print axioms optimal_attained
+#print axioms canonical_optimal_attained
+#print axioms canonical_optimal_le_valid_plan

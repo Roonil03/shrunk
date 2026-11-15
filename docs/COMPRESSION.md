@@ -28,8 +28,10 @@ Predictor candidates `Block::build` tries; the Gorilla-RLE candidate itself
 uses the optimized path. With the same candidate set and no larger Gorilla-RLE
 payload, selected block payload size cannot increase because of this change.
 The proof in
-`proofs/OptimalWindowPath.lean` establishes the abstract finite-horizon
-minimum is no greater than any valid path. Existing window reconstruction
+`proofs/OptimalWindowPath.lean` establishes that the canonical finite-horizon
+minimum is both attainable and no greater than any valid path. Its concrete
+step model charges the Gorilla fresh/reuse bit costs and checks compatibility,
+under valid tight-window bounds. Existing window reconstruction
 proofs remain in `proofs/WindowChoice.lean`. A machine-checked refinement from
 the Rust state table and byte writer to that abstract recurrence is still
 missing. Exhaustive tests compare the Rust choice with brute force on 1296
