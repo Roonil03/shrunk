@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>shrunk · a tiny time series database</title>
-<meta name="description" content="shrunk groups time-stamped numbers into compressed blocks and answers queries from a 58-byte label, without decoding every reading.">
+<meta name="description" content="shrunk stores time-stamped numbers in compressed blocks and answers queries from a small label on each block.">
 <meta name="theme-color" content="#07090D">
 <link rel="canonical" href="https://shrunk-db.vercel.app/">
 <meta property="og:type" content="website">
@@ -76,14 +76,6 @@
   .mono {
     font-family: var(--mono);
     font-variant-numeric: tabular-nums;
-  }
-
-  .eyebrow {
-    font-family: var(--mono);
-    font-size: 11.5px;
-    letter-spacing: 0.14em;
-    text-transform: uppercase;
-    color: var(--muted-dark);
   }
 
   /* ---------- top bar ---------- */
@@ -407,7 +399,7 @@
     display: grid;
     grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr);
     gap: 48px;
-    align-items: end;
+    align-items: start;
     margin-bottom: 48px;
   }
 
@@ -417,7 +409,7 @@
     font-size: clamp(1.7rem, 2.9vw, 2.35rem);
     line-height: 1.08;
     letter-spacing: -0.025em;
-    margin: 10px 0 0;
+    margin: 0;
     text-wrap: balance;
   }
 
@@ -622,8 +614,14 @@
     overflow-x: auto;
   }
 
-  .terminal .c { color: #6E7A88; }
-  .terminal .g { color: var(--mint); }
+  .terminal pre .t-p { color: #6B7885; }
+  .terminal pre .t-cmd { color: #E7EDF4; }
+  .terminal pre .t-sub { color: #6FB4FF; }
+  .terminal pre .t-flag { color: #B79CFF; }
+  .terminal pre .t-url { color: var(--mint); }
+  .terminal pre .t-num { color: var(--mint); }
+  .terminal pre .t-key { color: #6FB4FF; }
+  .terminal pre .t-out { color: #93A1B1; }
 
   .links {
     margin-top: 20px;
@@ -754,13 +752,12 @@
   <section class="hero">
     <div class="wrap">
       <div class="hero-copy">
-        <p class="eyebrow">A tiny time series database</p>
         <h1>Compress the readings. <em>Skip the rest.</em></h1>
         <p class="lede">
-          shrunk packs time-stamped numbers into 1,024-point blocks, encodes each
-          block with whichever codec produces the smallest output, and labels
-          every block with its time range, value range, count, and sum. Queries
-          read the labels and skip the blocks that cannot match.
+          shrunk is a tiny time series database. It puts readings into blocks of
+          1,024, compresses each block with the best codec, and writes a 58-byte
+          summary next to it. A query reads the summary before it touches the
+          block.
         </p>
         <div class="actions">
           <a class="btn btn-primary" href="https://github.com/shrunk-db/shrunk">
@@ -781,7 +778,7 @@
             <dd><b>2</b> of 196 blocks read</dd>
           </div>
           <div class="fact">
-            <dt>Block label</dt>
+            <dt>Block header</dt>
             <dd><b>58</b> bytes</dd>
           </div>
         </dl>
@@ -827,14 +824,12 @@
     <div class="wrap">
       <div class="sheet-head">
         <div>
-          <p class="eyebrow">The block</p>
-          <h2>Every block carries its own summary.</h2>
+          <h2>Every block has a label.</h2>
         </div>
         <p>
-          A block is an immutable run of 1,024 readings. When it fills, shrunk
-          writes a small header beside the compressed payload. Counts, sums, and
-          value ranges come from the header, and range checks use it to skip
-          blocks without touching the payload.
+          A block holds 1,024 readings and never changes. When it fills, shrunk
+          writes a 58-byte header next to the compressed data. The header gives
+          the block's time range, value range, count, and sum.
         </p>
       </div>
 
@@ -846,44 +841,44 @@
         </div>
         <div class="row" role="row">
           <span class="key" role="cell">t_min, t_max</span>
-          <span class="desc" role="cell">First and last timestamp in the block</span>
+          <span class="desc" role="cell">First and last timestamp</span>
           <span class="bytes" role="cell">16 B</span>
         </div>
         <div class="row" role="row">
           <span class="key" role="cell">v_min, v_max</span>
-          <span class="desc" role="cell">Lowest and highest value, ignored when the NaN flag is set</span>
+          <span class="desc" role="cell">Lowest and highest value; ignored when NaN is present</span>
           <span class="bytes" role="cell">16 B</span>
         </div>
         <div class="row" role="row">
           <span class="key" role="cell">count</span>
-          <span class="desc" role="cell">Readings in the block, used for counts and averages</span>
+          <span class="desc" role="cell">Number of readings</span>
           <span class="bytes" role="cell">4 B</span>
         </div>
         <div class="row" role="row">
           <span class="key" role="cell">sum</span>
-          <span class="desc" role="cell">Total of all finite values, used for averages</span>
+          <span class="desc" role="cell">Total of the finite values</span>
           <span class="bytes" role="cell">8 B</span>
         </div>
         <div class="row" role="row">
           <span class="key" role="cell">codec, flags</span>
-          <span class="desc" role="cell">Which encoder won, plus sum-present and has-NaN bits</span>
+          <span class="desc" role="cell">Codec id, sum flag, NaN flag</span>
           <span class="bytes" role="cell">2 B</span>
         </div>
         <div class="row" role="row">
           <span class="key" role="cell">payload_len</span>
-          <span class="desc" role="cell">Compressed size of the payload that follows</span>
+          <span class="desc" role="cell">Size of the compressed data</span>
           <span class="bytes" role="cell">4 B</span>
         </div>
         <div class="row" role="row">
           <span class="key" role="cell">crc32 × 2</span>
-          <span class="desc" role="cell">One checksum for the header, one for the payload</span>
+          <span class="desc" role="cell">Checksums for header and data</span>
           <span class="bytes" role="cell">8 B</span>
         </div>
       </div>
 
       <p class="callout">
-        That is <code>58 bytes</code> per block, header and checksums. For 1,024
-        readings it costs about <code>0.45 bits</code> per point.
+        <code>58 bytes</code> per block, checksums included. At 1,024 readings
+        that is about <code>0.45 bits</code> each.
       </p>
     </div>
   </section>
@@ -892,31 +887,30 @@
     <div class="wrap">
       <div class="sheet-head">
         <div>
-          <p class="eyebrow">The query</p>
-          <h2>Questions get answered at the lid.</h2>
+          <h2>Queries check the label first.</h2>
         </div>
         <p>
-          No index server, no column scan. The query path walks block headers in
-          order and decodes only the blocks that can still contain an answer.
+          No index server and no column scan. shrunk walks the headers in order
+          and decodes only blocks that can still contain an answer.
         </p>
       </div>
 
       <div class="split">
         <div class="qcard">
           <p class="q">avg(cpu.load) over all points</p>
-          <h3>Divide the sums by the counts</h3>
+          <h3>Use the sums and counts</h3>
           <p>
-            Every block already stores its total and its point count. A covered
-            block is answered from the header, so nothing is unpacked.
+            Each header holds the block total and its reading count, so a
+            covered block needs no reads.
           </p>
-          <div class="answer"><b>196 of 196</b> blocks read from metadata</div>
+          <div class="answer"><b>196 of 196</b> blocks need no reads</div>
         </div>
         <div class="qcard">
           <p class="q">cpu.load over 300 seconds</p>
-          <h3>Skip by time, then decode</h3>
+          <h3>Skip by time</h3>
           <p>
-            A binary search lands on the first block whose range can overlap the
-            window. Blocks outside it are never opened.
+            A binary search finds the first block that can overlap the window.
+            Blocks outside it stay closed.
           </p>
           <div class="answer"><b>2 decoded · 194 skipped</b> blocks</div>
         </div>
@@ -928,13 +922,12 @@
     <div class="wrap">
       <div class="sheet-head">
         <div>
-          <p class="eyebrow">The codecs</p>
-          <h2>Seven encoders. The smallest result wins.</h2>
+          <h2>Seven codecs. Keep the smallest.</h2>
         </div>
         <p>
-          Each block is encoded with every codec that can represent it, and the
-          shortest output is kept. Flat sensors and counters compress far better
-          than noisy floats, and the format adapts per block.
+          shrunk tries every codec that fits a block and keeps the shortest
+          result. Flat signals and counters compress much better than noisy
+          floats.
         </p>
       </div>
 
@@ -988,11 +981,10 @@
   <section class="sheet" id="build">
     <div class="wrap build">
       <div>
-        <p class="eyebrow">Run it</p>
-        <h2>One binary, one file, no server.</h2>
+        <h2>Build and run it.</h2>
         <p style="color:var(--muted); max-width:42ch; margin:18px 0 0;">
-          shrunk is a Rust crate and CLI with no runtime dependencies. Build it,
-          run the demo, and read the format. GPL-3.0.
+          shrunk is a Rust crate and CLI. It has no runtime dependencies and is
+          GPL-3.0.
         </p>
         <div class="links">
           <a href="https://github.com/shrunk-db/shrunk/blob/main/docs/Install.md">Install guide</a>
@@ -1006,13 +998,13 @@
           <i></i><i></i><i></i>
           <span>sh</span>
         </div>
-        <pre><span class="c">$</span> git clone https://github.com/shrunk-db/shrunk.git
-<span class="c">$</span> cd shrunk
-<span class="c">$</span> cargo build --release
-<span class="c">$</span> ./target/release/shrunk demo
-<span class="g">seeded 3 series x 200000 points in 76 ms; file 1.4 MiB</span>
-<span class="c">…</span>
-blocks: 196 total, 2 visited, 2 decoded, 194 skipped</pre>
+        <pre><span class="t-p">$</span> <span class="t-cmd">git</span> <span class="t-sub">clone</span> <span class="t-url">https://github.com/shrunk-db/shrunk.git</span>
+<span class="t-p">$</span> <span class="t-cmd">cd</span> shrunk
+<span class="t-p">$</span> <span class="t-cmd">cargo</span> <span class="t-sub">build</span> <span class="t-flag">--release</span>
+<span class="t-p">$</span> <span class="t-cmd">./target/release/shrunk</span> <span class="t-sub">demo</span>
+<span class="t-out"><span class="t-sub">seeded</span> <span class="t-num">3</span> series x <span class="t-num">200000</span> points in <span class="t-num">76 ms</span>; file <span class="t-num">1.4 MiB</span></span>
+<span class="t-out">…</span>
+<span class="t-out"><span class="t-key">blocks:</span> <span class="t-num">196</span> total, <span class="t-num">2</span> visited, <span class="t-num">2</span> decoded, <span class="t-num">194</span> skipped</span></pre>
       </div>
     </div>
   </section>
