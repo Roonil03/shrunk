@@ -465,6 +465,7 @@ impl Db {
     /// unchanged. Timestamps must be strictly increasing, both within the
     /// batch and relative to the series' last timestamp.
     pub fn write_many(&mut self, series: &str, points: &[Point]) -> Result<()> {
+        self.ensure_writable()?;
         if points.is_empty() {
             return Ok(());
         }
@@ -554,6 +555,7 @@ impl Db {
     }
 
     pub fn flush(&mut self, series: &str) -> Result<()> {
+        self.ensure_writable()?;
         let block_size = self.block_size;
         let extra = self
             .series
@@ -568,6 +570,7 @@ impl Db {
     }
 
     pub fn flush_all(&mut self) -> Result<()> {
+        self.ensure_writable()?;
         let extra = self
             .series
             .values()
@@ -904,7 +907,15 @@ impl Db {
         self.save_with_hook(path, |_| Ok(()))
     }
 
+    fn ensure_writable(&self) -> Result<()> {
+        if let Some(wal) = &self.wal {
+            wal.ensure_healthy()?;
+        }
+        Ok(())
+    }
+
     fn ensure_snapshot_dir_durable(&mut self) -> Result<()> {
+        self.ensure_writable()?;
         if let Some(path) = self.pending_snapshot_dir_sync.as_ref() {
             #[cfg(test)]
             if self.fail_snapshot_dir_sync {
@@ -932,7 +943,10 @@ impl Db {
         mut hook: impl FnMut(SaveStage) -> Result<()>,
         published: &mut bool,
     ) -> Result<()> {
-        if self.wal.is_some() && !same_destination(self.path.as_deref().unwrap(), path)? {
+        self.ensure_writable()?;
+        let destination = resolve_destination(path)?;
+        let path = destination.as_path();
+        if self.wal.is_some() && self.path.as_deref() != Some(path) {
             return Err(Error::InvalidInput(
                 "cannot save a WAL-bound database to a different path".into(),
             ));
@@ -1093,6 +1107,10 @@ impl Db {
         block_size: usize,
         before_directory_sync: impl FnOnce() -> Result<()>,
     ) -> Result<Db> {
+        // Bind the parent before opening the WAL. Canonicalizing the final
+        // component would follow a snapshot symlink and bypass alias checks.
+        let destination = resolve_destination(path)?;
+        let path = destination.as_path();
         reject_symlink(path)?;
         let wal_path = wal::wal_path(path);
         // Take the exclusive lock before reading the snapshot so a stale
@@ -1381,18 +1399,15 @@ fn reject_symlink(path: &Path) -> Result<()> {
     }
 }
 
-fn same_destination(a: &Path, b: &Path) -> Result<bool> {
-    let key = |p: &Path| -> Result<PathBuf> {
-        let name = p
-            .file_name()
-            .ok_or_else(|| Error::InvalidInput("path has no filename".into()))?;
-        let parent = p
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
-        Ok(fs::canonicalize(parent)?.join(name))
-    };
-    Ok(key(a)? == key(b)?)
+fn resolve_destination(path: &Path) -> Result<PathBuf> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| Error::InvalidInput("path has no filename".into()))?;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    Ok(fs::canonicalize(parent)?.join(name))
 }
 
 fn replay_wal_into(db: &mut Db, wal_path: &Path) -> Result<()> {
@@ -2391,6 +2406,194 @@ mod tests {
         assert!(Db::open_rw(&alias).is_err());
         fs::remove_file(&alias).unwrap();
         fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn partial_wal_header_writes_roll_back_before_retry() {
+        use crate::wal::Fault;
+
+        for prefix in 1..16 {
+            let (dir, path, mut db) = wal_failure_fixture("header-prefix");
+            db.checkpoint().unwrap();
+            let wal_path = wal::wal_path(&path);
+            assert_eq!(fs::metadata(&wal_path).unwrap().len(), 0);
+            db.wal
+                .as_mut()
+                .unwrap()
+                .inject_faults([Fault::WritePrefix(prefix)]);
+            assert!(db.write("s", 2, 2.0).is_err(), "prefix {prefix}");
+            assert_eq!(db.point_count(), 1);
+            assert_eq!(fs::metadata(&wal_path).unwrap().len(), 0);
+            db.write("s", 2, 2.0).unwrap();
+            db.write("s", 3, 3.0).unwrap();
+            drop(db);
+            assert_reopened_points(&path, &[1, 2, 3]);
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn partial_wal_records_roll_back_before_retry() {
+        use crate::wal::Fault;
+
+        // One point in series "s" occupies 34 bytes, including framing.
+        for prefix in 0..=34 {
+            let (dir, path, mut db) = wal_failure_fixture("record-prefix");
+            let wal_path = wal::wal_path(&path);
+            let before = fs::read(&wal_path).unwrap();
+            db.wal
+                .as_mut()
+                .unwrap()
+                .inject_faults([Fault::WritePrefix(prefix)]);
+            assert!(db.write("s", 2, 2.0).is_err(), "prefix {prefix}");
+            assert_eq!(db.point_count(), 1);
+            assert_eq!(fs::read(&wal_path).unwrap(), before);
+            db.write("s", 2, 2.0).unwrap();
+            drop(db);
+            assert_reopened_points(&path, &[1, 2]);
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn wal_sync_failures_roll_back_before_retry() {
+        use crate::wal::Fault;
+
+        for header in [false, true] {
+            let (dir, path, mut db) = wal_failure_fixture("sync-retry");
+            if header {
+                db.checkpoint().unwrap();
+            }
+            let wal_path = wal::wal_path(&path);
+            let before = fs::read(&wal_path).unwrap();
+            db.wal.as_mut().unwrap().inject_faults([Fault::SyncData]);
+            assert!(db.write("s", 2, 2.0).is_err());
+            assert_eq!(db.point_count(), 1);
+            assert_eq!(fs::read(&wal_path).unwrap(), before);
+            db.write("s", 2, 2.0).unwrap();
+            drop(db);
+            assert_reopened_points(&path, &[1, 2]);
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn failed_wal_rollback_blocks_mutations_until_reopen() {
+        use crate::wal::Fault;
+
+        for header in [false, true] {
+            for faults in [
+                [Fault::WritePrefix(8), Fault::SetLen],
+                [Fault::WritePrefix(8), Fault::SyncData],
+                [Fault::SyncData, Fault::SetLen],
+                [Fault::SyncData, Fault::SyncData],
+            ] {
+                let (dir, path, mut db) = wal_failure_fixture("rollback-poison");
+                if header {
+                    db.checkpoint().unwrap();
+                }
+                db.wal.as_mut().unwrap().inject_faults(faults);
+                let error = db.write("s", 2, 2.0).unwrap_err();
+                assert!(error.to_string().contains("WAL rollback failed"), "{error}");
+                assert_poisoned_mutations_leave_files_unchanged(&mut db, &path);
+                drop(db);
+
+                // A failed operation is unacknowledged and can be present if
+                // its complete record survived a failed rollback. Previously
+                // acknowledged data must always survive, and reopen restores
+                // a usable writer after repairing any partial header/tail.
+                let mut reopened = Db::open_rw(&path).unwrap();
+                let recovered = reopened.query(&Query::new("s", 1, 2)).unwrap().points;
+                assert_eq!(recovered[0], Point::new(1, 1.0));
+                assert!(recovered.len() <= 2);
+                reopened.write("s", 3, 3.0).unwrap();
+                drop(reopened);
+                let read = Db::open(&path).unwrap();
+                assert_eq!(
+                    read.query(&Query::new("s", 3, 3)).unwrap().points,
+                    [Point::new(3, 3.0)]
+                );
+                fs::remove_dir_all(dir).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn failed_checkpoint_wal_truncation_blocks_mutations_until_reopen() {
+        use crate::wal::Fault;
+
+        for fault in [Fault::SetLen, Fault::SyncAll] {
+            let (dir, path, mut db) = wal_failure_fixture("checkpoint-poison");
+            db.wal.as_mut().unwrap().inject_faults([fault]);
+            assert!(db.checkpoint().is_err());
+            assert_poisoned_mutations_leave_files_unchanged(&mut db, &path);
+            drop(db);
+            assert_reopened_points(&path, &[1]);
+            let mut reopened = Db::open_rw(&path).unwrap();
+            reopened.write("s", 2, 2.0).unwrap();
+            reopened.checkpoint().unwrap();
+            drop(reopened);
+            assert_reopened_points(&path, &[1, 2]);
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    fn wal_failure_fixture(label: &str) -> (PathBuf, PathBuf, Db) {
+        let dir = std::env::temp_dir().join(format!(
+            "shrunk-{label}-{}-{}",
+            std::process::id(),
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("db.shrunk");
+        let mut db = Db::open_rw_with_block_size(&path, 4).unwrap();
+        db.write("s", 1, 1.0).unwrap();
+        (dir, path, db)
+    }
+
+    fn assert_reopened_points(path: &Path, timestamps: &[i64]) {
+        let expected: Vec<_> = timestamps
+            .iter()
+            .map(|&ts| Point::new(ts, ts as f64))
+            .collect();
+        for db in [Db::open(path).unwrap(), Db::open_rw(path).unwrap()] {
+            assert_eq!(
+                db.query(&Query::new("s", i64::MIN, i64::MAX))
+                    .unwrap()
+                    .points,
+                expected
+            );
+        }
+    }
+
+    fn assert_poisoned_mutations_leave_files_unchanged(db: &mut Db, path: &Path) {
+        let snapshot = fs::read(path).ok();
+        let wal_path = wal::wal_path(path);
+        let wal_before = fs::read(&wal_path).unwrap();
+        let count = db.point_count();
+        let results = [
+            db.write("s", 3, 3.0),
+            db.write_many("s", &[]),
+            db.append("s", &[Point::new(3, 3.0)]),
+            db.flush("s"),
+            db.flush_all(),
+            db.checkpoint(),
+            db.save(path),
+            db.delete_range("s", 1, 3).map(|_| ()),
+            db.delete_range("s", 3, 1).map(|_| ()),
+            db.delete_series("s").map(|_| ()),
+            db.retain_since(i64::MIN).map(|_| ()),
+            db.rollup("s", "rollup", 1, 3, 1, Agg::Sum).map(|_| ()),
+        ];
+        for result in results {
+            assert!(matches!(&result, Err(Error::Io(_))), "{result:?}");
+            assert!(result.unwrap_err().to_string().contains("reopen"));
+        }
+        assert_eq!(db.point_count(), count);
+        assert_eq!(db.series_names(), ["s"]);
+        assert_eq!(fs::read(path).ok(), snapshot);
+        assert_eq!(fs::read(&wal_path).unwrap(), wal_before);
+        assert!(db.query(&Query::new("s", 1, 1)).is_ok());
     }
 
     #[test]
