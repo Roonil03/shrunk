@@ -1,77 +1,35 @@
-"use client";
-import React from "react";
-import { motion } from "framer-motion";
+import type { ReactNode } from "react";
 
-const EASE = [0.22, 1, 0.36, 1] as const;
-
-const container = (stagger: number, delay: number) => ({
-  hidden: {},
-  show: {
-    transition: {
-      staggerChildren: stagger,
-      delayChildren: delay,
-    },
-  },
-});
-
-const item = {
-  hidden: { y: "110%" },
-  show: {
-    y: "0%",
-    transition: { duration: 0.6, ease: EASE },
-  },
-};
-
-const TextAnimation = ({
+export default function StaggerText({
   children,
   delay = 0,
-  divideBy = "word",
+  className,
 }: {
-  children: React.ReactNode;
+  children: ReactNode;
   delay?: number;
-  divideBy?: "word" | "letter";
-}) => {
-  if (typeof children !== "string") {
-    if (typeof children === "number" || typeof children === "boolean") {
-      children = String(children);
-    } else {
-      console.warn("TextAnimation only supports plain text/string children.");
-      return <>{children}</>;
-    }
-  }
+  className?: string;
+}) {
+  if (typeof children !== "string") return <>{children}</>;
 
-  const text = children as string;
-  const parts = divideBy === "letter" ? text.split("") : text.split(" ");
-  const stagger = divideBy === "letter" ? 0.02 : 0.05;
+  const words = children.split(" ");
 
   return (
-    <motion.span
-      variants={container(stagger, delay)}
-      initial="hidden"
-      whileInView="show"
-      viewport={{ once: true }}
-      style={{ display: "inline-block" }}
-    >
-      {parts.map((part, i) => (
+    <span className={className} style={{ display: "inline-block" }}>
+      {words.map((word, i) => (
         <span
           key={i}
-          className="inline-block overflow-hidden relative"
+          className="relative inline-block overflow-hidden"
           style={{ verticalAlign: "top" }}
         >
-          <motion.span
-            variants={item}
-            className="inline-block will-change-transform"
+          <span
+            className="word inline-block will-change-transform"
+            style={{ animationDelay: `${delay + i * 50}ms` }}
           >
-            {divideBy === "letter"
-              ? part === " "
-                ? "\u00A0"
-                : part
-              : part + "\u00A0"}
-          </motion.span>
+            {word}
+            {i < words.length - 1 ? "\u00A0" : ""}
+          </span>
         </span>
       ))}
-    </motion.span>
+    </span>
   );
-};
-
-export default TextAnimation;
+}
