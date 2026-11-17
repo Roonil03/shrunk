@@ -783,8 +783,9 @@
 .site-head {
   background: var(--ink);
   border-bottom: 1px solid var(--line-dark);
-  position: relative;
-  z-index: 20;
+  position: sticky;
+  top: 0;
+  z-index: 50;
 }
 .head-inner {
   display: flex;
@@ -797,3 +798,12 @@
 .fact dd .fact-num { color: var(--mint); font-weight: 500; }
 .hero-copy > h1 { animation: none; }
 .hero h1 .grad { animation: rise 700ms cubic-bezier(.2,.7,.3,1) 240ms both; }
+
+@media (max-width: 380px) {
+  .head-inner { gap: 8px; }
+  .brand span { display: none; }
+  .spotlight-nav a { padding: 7px 9px; font-size: 12.5px; }
+}
+
+section[id] { scroll-margin-top: 88px; }
+@media (max-width: 380px) { section[id] { scroll-margin-top: 84px; } }
