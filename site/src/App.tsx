@@ -1,3 +1,4 @@
+import { useEffect, useState } from "react";
 import { SpotlightNavbar, type NavItem } from "@/components/ui/spotlight-navbar";
 import TextAnimation from "@/components/ui/stagger-text";
 import StatsCounter from "@/components/ui/stats-counter";
@@ -25,6 +26,39 @@ function onNav(item: NavItem) {
 }
 
 export default function App() {
+  const [active, setActive] = useState(0);
+
+  useEffect(() => {
+    const ids = ["label", "queries", "codecs", "build"];
+    const update = () => {
+      let next = 0;
+      for (let i = 0; i < ids.length; i++) {
+        const el = document.getElementById(ids[i]);
+        if (el && el.getBoundingClientRect().top <= 96) next = i;
+      }
+      const atBottom =
+        window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 4;
+      if (atBottom) next = ids.length - 1;
+      setActive(next);
+    };
+    update();
+    let raf = 0;
+    const onScroll = () => {
+      if (raf) return;
+      raf = window.requestAnimationFrame(() => {
+        raf = 0;
+        update();
+      });
+    };
+    window.addEventListener("scroll", onScroll, { passive: true });
+    window.addEventListener("resize", onScroll);
+    return () => {
+      window.removeEventListener("scroll", onScroll);
+      window.removeEventListener("resize", onScroll);
+      if (raf) window.cancelAnimationFrame(raf);
+    };
+  }, []);
+
   return (
     <>
       <header className="site-head">
@@ -33,7 +67,7 @@ export default function App() {
             <img src="/logo.svg" alt="" width={28} height={28} />
             <span>shrunk</span>
           </a>
-          <SpotlightNavbar items={NAV} onItemClick={onNav} className="nav-spotlight" />
+          <SpotlightNavbar items={NAV} activeIndex={active} onItemClick={onNav} className="nav-spotlight" />
         </div>
       </header>
 
