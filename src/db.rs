@@ -944,7 +944,9 @@ impl Db {
         published: &mut bool,
     ) -> Result<()> {
         self.ensure_writable()?;
-        if self.wal.is_some() && !same_destination(self.path.as_deref().unwrap(), path)? {
+        let destination = resolve_destination(path)?;
+        let path = destination.as_path();
+        if self.wal.is_some() && self.path.as_deref() != Some(path) {
             return Err(Error::InvalidInput(
                 "cannot save a WAL-bound database to a different path".into(),
             ));
@@ -1105,6 +1107,10 @@ impl Db {
         block_size: usize,
         before_directory_sync: impl FnOnce() -> Result<()>,
     ) -> Result<Db> {
+        // Bind the parent before opening the WAL. Canonicalizing the final
+        // component would follow a snapshot symlink and bypass alias checks.
+        let destination = resolve_destination(path)?;
+        let path = destination.as_path();
         reject_symlink(path)?;
         let wal_path = wal::wal_path(path);
         // Take the exclusive lock before reading the snapshot so a stale
@@ -1393,18 +1399,15 @@ fn reject_symlink(path: &Path) -> Result<()> {
     }
 }
 
-fn same_destination(a: &Path, b: &Path) -> Result<bool> {
-    let key = |p: &Path| -> Result<PathBuf> {
-        let name = p
-            .file_name()
-            .ok_or_else(|| Error::InvalidInput("path has no filename".into()))?;
-        let parent = p
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
-        Ok(fs::canonicalize(parent)?.join(name))
-    };
-    Ok(key(a)? == key(b)?)
+fn resolve_destination(path: &Path) -> Result<PathBuf> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| Error::InvalidInput("path has no filename".into()))?;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    Ok(fs::canonicalize(parent)?.join(name))
 }
 
 fn replay_wal_into(db: &mut Db, wal_path: &Path) -> Result<()> {

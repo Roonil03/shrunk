@@ -166,8 +166,13 @@ use `Db::open_rw` and `checkpoint` to persist recovered appends. A WAL-bound
 handle can save only to its bound destination. The CLI `seed` requires an unused
 snapshot path and also refuses an existing WAL. `open_rw` holds an exclusive WAL
 file lock from recovery through append and checkpoint, so a second writer to
-the same WAL fails. Snapshot symlinks and hard-link aliases are rejected for
-writes. This is a single-writer API; separate names referring to the same
+the same WAL fails. Before opening the WAL, it binds the canonical parent
+directory and original filename. Later cwd changes or retargeting a parent
+symlink do not redirect checkpoint or lifecycle writes. A successful `save`
+keeps that binding; a relative save path is resolved from the cwd at the time
+of that call and must still name the bound destination. Snapshot symlinks and
+hard-link aliases are rejected for writes. This is a single-writer API;
+separate names referring to the same
 storage through other alias mechanisms are outside its coordination contract.
 
 ### Lifecycle API and durability
@@ -299,7 +304,7 @@ repeated:
 Each batch is fsynced before the in-memory series is updated. There is no group
 commit. Failed header or record writes, including sync failures, truncate and
 sync back to the previous valid length before the writer permits a retry. If
-that rollback fails, or checkpoint WAL truncation cannot be synced, the writer
+that rollback fails, or WAL truncation during checkpoint fails, the writer
 rejects further mutations with an I/O error until it is closed and reopened.
 Queries remain available. An operation that returned an I/O error is
 unacknowledged; if rollback failed, recovery may include its complete record.

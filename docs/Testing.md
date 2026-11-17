@@ -22,7 +22,11 @@ from 1 through 15 bytes, every boundary of a single-point record, header/record
 sync failures, rollback truncate/sync failures, and checkpoint truncate/sync
 failures. They verify safe retry after durable rollback, mutation rejection
 before memory or files change when rollback fails, and acknowledged data after
-read-only and writer reopen.
+read-only and writer reopen. Isolated subprocess tests change cwd after opening
+both WAL-only and snapshot-backed writers, then checkpoint, run lifecycle
+maintenance, and reopen while checking that a same-named database in the new
+cwd remains unchanged. A parent-symlink case also checks that successful save
+does not rebind the writer before the symlink is retargeted.
 
 Lifecycle tests compare range deletion and every downsampling aggregate with
 independent reference results across block sizes, pending points, negative and
