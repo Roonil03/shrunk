@@ -31,4 +31,4 @@ todo = "deny"
 unimplemented = "deny"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["test-util"] }
+tokio = { version = "1", features = ["test-util", "io-util"] }

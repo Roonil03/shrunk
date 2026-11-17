@@ -22,7 +22,9 @@ use subtle::ConstantTimeEq;
 use tokio::sync::Semaphore;
 
 mod admission;
+mod connections;
 use admission::{Config, Executor};
+use connections::LimitedListener;
 
 mod retention;
 #[cfg(test)]
@@ -90,7 +92,6 @@ impl From<Error> for ApiError {
             }
             Error::InvalidInput(_) => (StatusCode::BAD_REQUEST, "invalid_request"),
             Error::Limit(_) => (StatusCode::PAYLOAD_TOO_LARGE, "limit_exceeded"),
-            Error::Locked(_) => return Self::busy(),
             _ => {
                 eprintln!("database operation failed: {error}");
                 return Self::internal("database operation failed; check server logs");
@@ -253,7 +254,18 @@ struct WriteRequest {
     points: Vec<InputPoint>,
 }
 
-fn check_series(series: &str) -> Result<(), ApiError> {
+// References must cover every name admitted by the storage format, including
+// empty/control names from CLI/library snapshots. Creation stays stricter.
+fn check_reference(series: &str) -> Result<(), ApiError> {
+    if series.len() > 1024 {
+        return Err(ApiError::bad(
+            "series reference must not exceed 1024 UTF-8 bytes",
+        ));
+    }
+    Ok(())
+}
+
+fn check_new_series(series: &str) -> Result<(), ApiError> {
     if series.is_empty() || series.len() > 255 || series.chars().any(char::is_control) {
         return Err(ApiError::bad(
             "series must contain 1..255 UTF-8 bytes without control characters",
@@ -266,7 +278,7 @@ async fn write(
     State(state): State<AppState>,
     Body(input): Body<WriteRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    check_series(&input.series)?;
+    check_reference(&input.series)?;
     if input.points.is_empty() || input.points.len() > MAX_BATCH_POINTS {
         return Err(ApiError::bad(format!(
             "points must contain 1..{MAX_BATCH_POINTS} samples"
@@ -279,6 +291,9 @@ async fn write(
         .run(move |store| {
             let names = store.db.series_names();
             let exists = names.contains(&input.series.as_str());
+            if !exists {
+                check_new_series(&input.series)?;
+            }
             if names.len() >= MAX_SERIES && !exists {
                 return Err(ApiError::bad(format!(
                     "database supports at most {MAX_SERIES} series"
@@ -342,7 +357,7 @@ struct QueryRequest {
 }
 
 fn check_range(series: &str, from: Option<i64>, to: Option<i64>) -> Result<(i64, i64), ApiError> {
-    check_series(series)?;
+    check_reference(series)?;
     let from = from.unwrap_or(i64::MIN);
     let to = to.unwrap_or(i64::MAX);
     if from > to {
@@ -475,7 +490,7 @@ async fn delete_series(
     State(state): State<AppState>,
     Body(input): Body<SeriesRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    check_series(&input.series)?;
+    check_reference(&input.series)?;
     state
         .run(move |store| {
             let deleted = store.db.delete_series(&input.series)?;
@@ -604,7 +619,7 @@ async fn rollup(
     Body(input): Body<RollupRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let (from, to) = check_range(&input.series, input.from, input.to)?;
-    check_series(&input.target)?;
+    check_new_series(&input.target)?;
     let max_buckets = input.max_buckets.unwrap_or(MAX_QUERY_POINTS);
     let agg = check_bucket_options(input.interval_ms, &input.agg, max_buckets)?;
     state
@@ -777,6 +792,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         requests: Arc::new(Semaphore::new(16)),
     };
     eprintln!("shrunk-server listening on {}", listener.local_addr()?);
+    let listener = LimitedListener::new(listener, config.max_connections, state.executor.metrics());
     let retention = policy.map(|policy| policy.start(state.clone()));
     let stop_retention = retention.as_ref().map(|(stop, _)| stop.clone());
     let shutdown_executor = state.executor.clone();
@@ -792,14 +808,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         })
         .await;
     state.executor.close();
-    if let Some((stop, task)) = retention {
+    let retention_result = if let Some((stop, task)) = retention {
         let _ = stop.send(true);
-        task.await?;
-    }
+        task.await
+    } else {
+        Ok(())
+    };
     // The dedicated worker drains accepted commands and then checkpoints,
     // including running mutations whose clients disconnected.
     let drained = worker.finish().await;
     result?;
+    retention_result?;
     drained.map_err(|e| e.2)?;
     Ok(())
 }
@@ -822,4 +841,230 @@ fn healthcheck(mut address: SocketAddr) -> Result<(), Box<dyn std::error::Error>
         return Err("health check did not receive HTTP 200".into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::TestStore;
+
+    fn state(executor: Executor) -> AppState {
+        AppState {
+            executor,
+            token: Arc::from(&b"test-token"[..]),
+            requests: Arc::new(Semaphore::new(16)),
+        }
+    }
+
+    fn write_input(series: &str, ts: i64) -> Body<WriteRequest> {
+        Body(WriteRequest {
+            series: series.into(),
+            points: vec![InputPoint {
+                ts,
+                value: ts as f64,
+            }],
+        })
+    }
+
+    #[tokio::test]
+    async fn imported_names_remain_addressable_but_http_creation_is_strict() {
+        let database = TestStore::new();
+        let mut store = database.store();
+        let names = [
+            "".to_owned(),
+            "line\ncontrol".to_owned(),
+            "x".repeat(256),
+            "🦀".repeat(256),
+        ];
+        for name in &names {
+            store.db.append(name, &[Point::new(1, 1.0)]).unwrap();
+        }
+        let (executor, worker) = Executor::start(
+            store,
+            Config {
+                max_inflight: 8,
+                queue_timeout: Duration::from_secs(60),
+                max_connections: 16,
+            },
+        )
+        .unwrap();
+        let state = state(executor);
+        for (n, name) in names.iter().enumerate() {
+            assert_eq!(
+                write(State(state.clone()), write_input(name, 2))
+                    .await
+                    .unwrap()
+                    .0,
+                json!({"written": 1})
+            );
+            let queried = query(
+                State(state.clone()),
+                Body(QueryRequest {
+                    series: name.clone(),
+                    from: None,
+                    to: None,
+                    limit: None,
+                    filter: None,
+                }),
+            )
+            .await
+            .unwrap()
+            .0;
+            assert_eq!(queried["points"].as_array().unwrap().len(), 2);
+            assert_eq!(
+                aggregate(
+                    State(state.clone()),
+                    Body(AggregateRequest {
+                        series: name.clone(),
+                        from: None,
+                        to: None,
+                        agg: "count".into(),
+                        filter: None
+                    })
+                )
+                .await
+                .unwrap()
+                .0["value"],
+                2.0
+            );
+            assert_eq!(
+                downsample(
+                    State(state.clone()),
+                    Body(DownsampleRequest {
+                        series: name.clone(),
+                        from: None,
+                        to: None,
+                        interval_ms: 10,
+                        agg: "sum".into(),
+                        limit: None
+                    })
+                )
+                .await
+                .unwrap()
+                .0["points"][0]["value"],
+                3.0
+            );
+            let target = format!("valid-{n}");
+            assert_eq!(
+                rollup(
+                    State(state.clone()),
+                    Body(RollupRequest {
+                        series: name.clone(),
+                        target,
+                        from: None,
+                        to: None,
+                        interval_ms: 10,
+                        agg: "sum".into(),
+                        max_buckets: None
+                    })
+                )
+                .await
+                .unwrap()
+                .0["written"],
+                1
+            );
+            assert_eq!(
+                delete_range(
+                    State(state.clone()),
+                    Body(DeleteRequest {
+                        series: name.clone(),
+                        from: Some(1),
+                        to: Some(1)
+                    })
+                )
+                .await
+                .unwrap()
+                .0["points_deleted"],
+                1
+            );
+            assert_eq!(
+                delete_series(
+                    State(state.clone()),
+                    Body(SeriesRequest {
+                        series: name.clone()
+                    })
+                )
+                .await
+                .unwrap()
+                .0["points_deleted"],
+                1
+            );
+            assert_eq!(
+                write(State(state.clone()), write_input(name, 3))
+                    .await
+                    .unwrap_err()
+                    .0,
+                StatusCode::BAD_REQUEST
+            );
+        }
+        assert!(check_reference(&"x".repeat(1025)).is_err());
+        assert!(check_new_series(&"🦀".repeat(64)).is_err());
+        worker.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn status_bypasses_busy_store_and_new_name_validation_uses_executor_membership() {
+        let database = TestStore::new();
+        let mut store = database.store();
+        store.db.append("", &[Point::new(1, 1.0)]).unwrap();
+        let (executor, worker) = Executor::start(
+            store,
+            Config {
+                max_inflight: 2,
+                queue_timeout: Duration::from_secs(60),
+                max_connections: 16,
+            },
+        )
+        .unwrap();
+        let state = state(executor);
+        let (release, wait) = std::sync::mpsc::channel();
+        let (started, running) = tokio::sync::oneshot::channel();
+        let deletion = tokio::spawn({
+            let state = state.clone();
+            async move {
+                state
+                    .run(move |store| {
+                        let _ = started.send(());
+                        wait.recv().unwrap();
+                        store.db.delete_series("")?;
+                        Ok(Value::Null)
+                    })
+                    .await
+            }
+        });
+        running.await.unwrap();
+        let snapshot = status(State(state.clone())).await.0;
+        assert_eq!(snapshot["running_operations"], 1);
+        let append = tokio::spawn({
+            let state = state.clone();
+            async move { write(State(state), write_input("", 2)).await }
+        });
+        for _ in 0..10000 {
+            if state.executor.status()["queued_operations"] == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(state.executor.status()["queued_operations"], 1);
+        release.send(()).unwrap();
+        deletion.await.unwrap().unwrap();
+        // It was imported when the request arrived, but deleted before this
+        // command executes; appending would now create a new invalid name.
+        assert_eq!(
+            append.await.unwrap().unwrap_err().0,
+            StatusCode::BAD_REQUEST
+        );
+        worker.finish().await.unwrap();
+    }
+
+    #[test]
+    fn only_admission_unavailability_advises_retry() {
+        let response = ApiError::busy().into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+        let response =
+            ApiError::from(Error::Locked("unexpected storage error".into())).into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!response.headers().contains_key(header::RETRY_AFTER));
+    }
 }

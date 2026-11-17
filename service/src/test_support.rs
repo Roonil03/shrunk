@@ -32,7 +32,7 @@ impl TestStore {
             self.store(),
             Config {
                 max_inflight: maximum,
-                queue_timeout: Duration::from_millis(100),
+                queue_timeout: Duration::from_secs(60),
                 max_connections: 16,
             },
         )

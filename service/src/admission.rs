@@ -567,7 +567,7 @@ mod tests {
             }
         });
         queued(&executor, 1).await;
-        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::time::advance(Duration::from_secs(61)).await;
         assert_eq!(
             task.await.unwrap().unwrap_err().0,
             axum::http::StatusCode::SERVICE_UNAVAILABLE
@@ -595,7 +595,7 @@ mod tests {
         let (executor, worker) = database.executor(1);
         let (release, task) = blocked(&executor).await;
         tokio::time::pause();
-        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::time::advance(Duration::from_secs(61)).await;
         tokio::task::yield_now().await;
         assert!(!task.is_finished());
         assert_eq!(executor.status()["queue_expiries"], 0);
