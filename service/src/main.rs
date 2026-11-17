@@ -3,7 +3,8 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::{to_bytes, Bytes};
@@ -18,9 +19,14 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use shrunk::{Agg, Db, DeleteResult, Error, Point, Predicate, Query, QueryStats};
 use subtle::ConstantTimeEq;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::Semaphore;
+
+mod admission;
+use admission::{Config, Executor};
 
 mod retention;
+#[cfg(test)]
+mod test_support;
 use retention::RetentionPolicy;
 
 const MAX_BODY_BYTES: usize = 1024 * 1024;
@@ -31,10 +37,9 @@ const CHECKPOINT_WAL_BYTES: u64 = 32 * 1024 * 1024;
 
 #[derive(Clone)]
 struct AppState {
-    store: Arc<Mutex<Store>>,
+    executor: Executor,
     token: Arc<[u8]>,
     requests: Arc<Semaphore>,
-    operations: Arc<Semaphore>,
 }
 
 struct Store {
@@ -47,43 +52,11 @@ impl AppState {
     where
         F: FnOnce(&mut Store) -> Result<Value, ApiError> + Send + 'static,
     {
-        // Keep the permit inside the blocking operation: a disconnected client
-        // cannot leave unlimited queued work behind.
-        let permit = self
-            .operations
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| ApiError::busy())?;
-        self.run_permitted(permit, operation).await
-    }
-
-    async fn acquire_maintenance_permit(&self) -> Result<OwnedSemaphorePermit, ApiError> {
-        self.operations
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| ApiError::busy())
-    }
-
-    async fn run_permitted<F>(
-        &self,
-        permit: OwnedSemaphorePermit,
-        operation: F,
-    ) -> Result<Value, ApiError>
-    where
-        F: FnOnce(&mut Store) -> Result<Value, ApiError> + Send + 'static,
-    {
-        let store = self.store.clone();
-        tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            let mut store = store.lock().map_err(|_| ApiError::busy())?;
-            operation(&mut store)
-        })
-        .await
-        .map_err(|_| ApiError::internal("database worker failed"))?
+        self.executor.run(operation).await
     }
 }
 
+#[derive(Debug)]
 struct ApiError(StatusCode, &'static str, String);
 
 impl ApiError {
@@ -134,6 +107,11 @@ impl IntoResponse for ApiError {
             Json(json!({"error": {"code": self.1, "message": self.2}})),
         )
             .into_response();
+        if self.0 == StatusCode::SERVICE_UNAVAILABLE {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, header::HeaderValue::from_static("1"));
+        }
         if self.0 == StatusCode::UNAUTHORIZED {
             response.headers_mut().insert(
                 header::WWW_AUTHENTICATE,
@@ -221,6 +199,11 @@ async fn authorize(State(state): State<AppState>, request: Request, next: Next) 
         .into_response();
     }
     let Ok(_permit) = state.requests.try_acquire() else {
+        state
+            .executor
+            .metrics()
+            .http_rejections
+            .fetch_add(1, Ordering::Relaxed);
         return ApiError::busy().into_response();
     };
     let mut response = next.run(request).await;
@@ -242,6 +225,7 @@ fn app(state: AppState) -> Router {
         .route("/v1/downsample", post(downsample))
         .route("/v1/rollup", post(rollup))
         .route("/v1/series", get(series))
+        .route("/v1/status", get(status))
         .route("/v1/checkpoint", post(checkpoint))
         .route_layer(middleware::from_fn_with_state(state.clone(), authorize))
         .route("/healthz", get(|| async { Json(json!({"status": "ok"})) }))
@@ -294,7 +278,8 @@ async fn write(
     state
         .run(move |store| {
             let names = store.db.series_names();
-            if names.len() >= MAX_SERIES && !names.contains(&input.series.as_str()) {
+            let exists = names.contains(&input.series.as_str());
+            if names.len() >= MAX_SERIES && !exists {
                 return Err(ApiError::bad(format!(
                     "database supports at most {MAX_SERIES} series"
                 )));
@@ -651,6 +636,10 @@ async fn rollup(
         .map(Json)
 }
 
+async fn status(State(state): State<AppState>) -> Json<Value> {
+    Json(state.executor.status())
+}
+
 async fn series(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     state.run(|store| {
         let series: Vec<_> = store.db.summaries().into_iter().map(|s| json!({
@@ -762,6 +751,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         None => {}
     }
     let token = token()?;
+    let config = Config::from_env()?;
     let data_dir = PathBuf::from(env::var_os("SHRUNK_DATA_DIR").unwrap_or_else(|| "data".into()));
     fs::create_dir_all(&data_dir)?;
     let path = data_dir.join("shrunk.db");
@@ -774,32 +764,43 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(policy) = policy {
         RetentionPolicy::report(policy.sweep(&mut db).map_err(|error| error.2)?);
     }
-    let state = AppState {
-        store: Arc::new(Mutex::new(Store {
+    let (executor, worker) = Executor::start(
+        Store {
             db,
             wal_path: data_dir.join("shrunk.db.wal"),
-        })),
+        },
+        config,
+    )?;
+    let state = AppState {
+        executor,
         token: token.into(),
         requests: Arc::new(Semaphore::new(16)),
-        operations: Arc::new(Semaphore::new(8)),
     };
     eprintln!("shrunk-server listening on {}", listener.local_addr()?);
     let retention = policy.map(|policy| policy.start(state.clone()));
+    let stop_retention = retention.as_ref().map(|(stop, _)| stop.clone());
+    let shutdown_executor = state.executor.clone();
     let result = axum::serve(listener, app(state.clone()))
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            // Stop all producers at signal time. Existing HTTP bodies may
+            // finish reading, but cannot submit new database commands.
+            shutdown_executor.close();
+            if let Some(stop) = stop_retention {
+                let _ = stop.send(true);
+            }
+        })
         .await;
+    state.executor.close();
     if let Some((stop, task)) = retention {
         let _ = stop.send(true);
         task.await?;
     }
+    // The dedicated worker drains accepted commands and then checkpoints,
+    // including running mutations whose clients disconnected.
+    let drained = worker.finish().await;
     result?;
-    state
-        .run(|store| {
-            store.db.checkpoint()?;
-            Ok(json!(null))
-        })
-        .await
-        .map_err(|e| e.2)?;
+    drained.map_err(|e| e.2)?;
     Ok(())
 }
 
