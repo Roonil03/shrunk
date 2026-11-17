@@ -17,7 +17,12 @@ idempotent replay after a checkpoint, and snapshot-safe readers. Bounded
 synthetic cases also cover float-bit preservation, varint boundaries, sparse
 WALs, WAL symlinks and permissions, writer locking, stale destination WALs,
 and injected snapshot failures before write, sync, rename, directory sync,
-and WAL truncation.
+and WAL truncation. Deterministic WAL faults cover each partial header length
+from 1 through 15 bytes, every boundary of a single-point record, header/record
+sync failures, rollback truncate/sync failures, and checkpoint truncate/sync
+failures. They verify safe retry after durable rollback, mutation rejection
+before memory or files change when rollback fails, and acknowledged data after
+read-only and writer reopen.
 
 Lifecycle tests compare range deletion and every downsampling aggregate with
 independent reference results across block sizes, pending points, negative and

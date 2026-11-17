@@ -297,7 +297,13 @@ repeated:
 ```
 
 Each batch is fsynced before the in-memory series is updated. There is no group
-commit. WAL version 1 framing and codec IDs are unchanged. Replay ignores a
+commit. Failed header or record writes, including sync failures, truncate and
+sync back to the previous valid length before the writer permits a retry. If
+that rollback fails, or checkpoint WAL truncation cannot be synced, the writer
+rejects further mutations with an I/O error until it is closed and reopened.
+Queries remain available. An operation that returned an I/O error is
+unacknowledged; if rollback failed, recovery may include its complete record.
+WAL version 1 framing and codec IDs are unchanged. Replay ignores a
 torn terminal record after a suffix resync finds no later valid record, and
 `open_rw` copies that tail to `<db>.wal.torn` (or a numbered `.torn.N` backup if that name exists) before truncating. Damage with
 a later valid record errors out and is preserved. WAL creation uses mode
