@@ -14,6 +14,8 @@ export interface SpotlightNavbarProps {
   className?: string;
   onItemClick?: (item: NavItem, index: number) => void;
   defaultActiveIndex?: number;
+  /** Controlled active item. Omit for uncontrolled behavior. */
+  activeIndex?: number;
 }
 
 export function SpotlightNavbar({
@@ -27,9 +29,11 @@ export function SpotlightNavbar({
   className,
   onItemClick,
   defaultActiveIndex = 0,
+  activeIndex: controlledActiveIndex,
 }: SpotlightNavbarProps) {
   const navRef = useRef<HTMLDivElement>(null);
-  const [activeIndex, setActiveIndex] = useState(defaultActiveIndex);
+  const [internalActiveIndex, setInternalActiveIndex] = useState(defaultActiveIndex);
+  const activeIndex = controlledActiveIndex ?? internalActiveIndex;
   const [hoverX, setHoverX] = useState<number | null>(null);
 
   const spotlightX = useRef(0);
@@ -99,7 +103,7 @@ export function SpotlightNavbar({
   }, [activeIndex]);
 
   const handleItemClick = (item: NavItem, index: number) => {
-    setActiveIndex(index);
+    setInternalActiveIndex(index);
     onItemClick?.(item, index);
   };
 
