@@ -350,7 +350,7 @@ export default function App() {
       <footer>
         <div className="wrap">
           <span>shrunk · a tiny time series database · GPL-3.0</span>
-          <nav>
+          <nav aria-label="Footer">
             <a href="https://github.com/shrunk-db/shrunk">GitHub</a>
             <a href="https://github.com/shrunk-db/shrunk/tree/main/docs">Docs</a>
             <a href="https://github.com/shrunk-db/shrunk/blob/main/LICENSE">License</a>

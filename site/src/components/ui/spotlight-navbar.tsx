@@ -74,6 +74,7 @@ export function SpotlightNavbar({
     <div className={cn("relative flex justify-center", className)}>
       <nav
         ref={navRef}
+        aria-label="Primary"
         className="spotlight-nav spotlight-nav-bg glass-border spotlight-nav-shadow relative h-11 overflow-hidden rounded-full transition-all duration-300"
       >
         <ul className="relative z-10 flex h-full items-center px-2">
@@ -88,6 +89,15 @@ export function SpotlightNavbar({
                 }}
                 href={item.href}
                 onClick={(event) => {
+                  if (
+                    event.metaKey ||
+                    event.ctrlKey ||
+                    event.shiftKey ||
+                    event.altKey
+                  ) {
+                    return;
+                  }
+                  if (item.href.startsWith("#")) return;
                   event.preventDefault();
                   onItemClick?.(item, idx);
                 }}
