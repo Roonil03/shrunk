@@ -17,6 +17,12 @@ const MAX_BATCH_BLOCKS: usize = 8;
 // most 16 MiB (plus small channel, container, and OS thread-stack overhead).
 const SLOT_BYTES: usize = 4 * 1024 * 1024;
 const CODEC_SCRATCH_BYTES: usize = 64 * 1024;
+
+#[cfg(all(test, feature = "experimental-parallel-aggregate"))]
+thread_local! {
+    static TEST_SUBMITTED_JOBS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static TEST_AVAILABLE_CPUS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
 #[cfg(feature = "experimental-parallel-aggregate")]
 const MIN_OVERLAP_BLOCKS: usize = 16;
 #[cfg(feature = "experimental-parallel-aggregate")]
@@ -124,13 +130,29 @@ fn eligible_workers(blocks: &[Block], predicate: Predicate) -> Option<usize> {
     if useful < 2 || points * (blocks.len() as u64) / (samples as u64) < MIN_ESTIMATED_POINTS {
         return None;
     }
-    static WORKERS: OnceLock<usize> = OnceLock::new();
-    let workers = *WORKERS.get_or_init(|| {
-        thread::available_parallelism()
-            .map(|n| n.get().saturating_sub(1).min(MAX_WORKERS))
-            .unwrap_or(0)
-    });
+    #[cfg(test)]
+    let workers = TEST_AVAILABLE_CPUS
+        .with(std::cell::Cell::get)
+        .map(worker_budget)
+        .unwrap_or_else(detected_workers);
+    #[cfg(not(test))]
+    let workers = detected_workers();
     (workers >= 2).then_some(workers)
+}
+
+#[cfg(feature = "experimental-parallel-aggregate")]
+fn worker_budget(cpus: usize) -> usize {
+    cpus.saturating_sub(1).min(MAX_WORKERS)
+}
+
+#[cfg(feature = "experimental-parallel-aggregate")]
+fn detected_workers() -> usize {
+    static WORKERS: OnceLock<usize> = OnceLock::new();
+    *WORKERS.get_or_init(|| {
+        thread::available_parallelism()
+            .map(|n| worker_budget(n.get()))
+            .unwrap_or(0)
+    })
 }
 
 fn estimated_bytes(block: &Block) -> usize {
@@ -240,6 +262,8 @@ fn run(
                 }
                 let (batch, tail) = remaining.split_at(len);
                 worker.jobs.send(batch).map_err(|_| channel_closed())?;
+                #[cfg(all(test, feature = "experimental-parallel-aggregate"))]
+                TEST_SUBMITTED_JOBS.with(|jobs| jobs.set(jobs.get() + 1));
                 remaining = tail;
                 submitted += 1;
             }
@@ -268,6 +292,10 @@ mod tests {
     use std::fs::{self, OpenOptions};
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::Arc;
+
+    // The automatic-dispatch and lease tests both use the process-wide slot.
+    #[cfg(feature = "experimental-parallel-aggregate")]
+    static TEST_LEASE_USERS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn assert_same(left: AggResult, right: AggResult) {
         assert_eq!(left.value.map(f64::to_bits), right.value.map(f64::to_bits));
@@ -440,7 +468,68 @@ mod tests {
 
     #[cfg(feature = "experimental-parallel-aggregate")]
     #[test]
+    fn public_aggregate_dispatches_workers_for_an_eligible_file_backed_scan() {
+        let _exclusive = TEST_LEASE_USERS.lock().unwrap();
+        let mut db = Db::with_block_size(1024);
+        let points: Vec<_> = (0..(160 * 1024))
+            .map(|i| {
+                Point::new(
+                    i,
+                    match i % 7 {
+                        0 => -0.0,
+                        1 => 0.0,
+                        _ => (i % 17) as f64 * 0.25,
+                    },
+                )
+            })
+            .collect();
+        db.write_many("telemetry", &points).unwrap();
+        let dir = private_temp();
+        let path = dir.join("natural-dispatch.shrunk");
+        db.save(&path).unwrap();
+        drop(db);
+        let mut db = Db::open(&path).unwrap();
+        assert!(matches!(
+            db.series["telemetry"].blocks[0].payload,
+            super::super::Payload::File { .. }
+        ));
+        let last = points.last().unwrap().ts + 2;
+        db.write("telemetry", last - 1, -0.0).unwrap();
+        db.write("telemetry", last, 0.0).unwrap();
+        let pred = Some(Predicate::Eq(0.0));
+        for agg in [Agg::Avg, Agg::Min, Agg::Max] {
+            for (cpus, uses_workers) in [(2, false), (4, true)] {
+                let reference = db
+                    .aggregate_serial("telemetry", 0, last, agg, pred)
+                    .unwrap();
+                let before = TEST_SUBMITTED_JOBS.with(std::cell::Cell::get);
+                let actual = TEST_AVAILABLE_CPUS
+                    .with(|available| {
+                        let old = available.replace(Some(cpus));
+                        let result = db.aggregate("telemetry", 0, last, agg, pred);
+                        available.set(old);
+                        result
+                    })
+                    .unwrap();
+                let submitted = TEST_SUBMITTED_JOBS.with(std::cell::Cell::get) - before;
+                assert_eq!(actual.stats.blocks_decoded, 160);
+                assert_eq!(actual.stats.pending_points, 2);
+                assert_same(reference, actual);
+                assert_eq!(
+                    submitted > 0,
+                    uses_workers,
+                    "public aggregate did not respect the {cpus}-CPU budget"
+                );
+            }
+        }
+        drop(db);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(feature = "experimental-parallel-aggregate")]
+    #[test]
     fn one_process_wide_slot_is_released() {
+        let _exclusive = TEST_LEASE_USERS.lock().unwrap();
         let lease = Lease::try_acquire().unwrap();
         assert!(std::thread::spawn(|| Lease::try_acquire().is_none())
             .join()
