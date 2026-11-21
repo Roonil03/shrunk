@@ -26,6 +26,10 @@ use crate::Point;
 mod lifecycle;
 pub use lifecycle::DeleteResult;
 
+#[cfg(all(unix, any(feature = "experimental-parallel-aggregate", test)))]
+#[path = "aggregate_parallel.rs"]
+mod aggregate_parallel;
+
 pub type Result<T> = std::result::Result<T, Error>;
 
 const MAGIC_PREFIX: &[u8; 6] = b"SHRUNK";
@@ -719,7 +723,28 @@ impl Db {
     /// predicate are answered from block metadata and never decoded.
     /// Floating-point sum and average depend on accumulation order: block
     /// boundaries and a value predicate can change rounding and the result.
+    /// The Unix opt-in `experimental-parallel-aggregate` feature may decode
+    /// long, filtered scans on bounded workers without changing the fold order.
     pub fn aggregate(
+        &self,
+        series: &str,
+        start: i64,
+        end: i64,
+        agg: Agg,
+        predicate: Option<Predicate>,
+    ) -> Result<AggResult> {
+        #[cfg(all(unix, feature = "experimental-parallel-aggregate"))]
+        if let Some(pred) = predicate {
+            if let Some(result) =
+                self.try_aggregate_parallel(series, start..=end, agg, pred, false)?
+            {
+                return Ok(result);
+            }
+        }
+        self.aggregate_serial(series, start, end, agg, predicate)
+    }
+
+    fn aggregate_serial(
         &self,
         series: &str,
         start: i64,
@@ -836,31 +861,75 @@ impl Db {
         }
 
         stats.blocks_skipped_time = stats.blocks_total.saturating_sub(stats.blocks_visited);
-        let value = match agg {
-            Agg::Count => {
-                if matched {
-                    Some(count as f64)
-                } else {
-                    None
-                }
-            }
-            Agg::Sum => {
-                if matched {
-                    Some(sum)
-                } else {
-                    None
-                }
-            }
-            Agg::Avg => {
-                if count > 0 {
-                    Some(sum / count as f64)
-                } else {
-                    None
-                }
-            }
-            Agg::Min | Agg::Max => extreme,
-        };
+        let value = aggregate_value(agg, count, sum, extreme, matched);
         Ok(AggResult { value, stats })
+    }
+
+    #[cfg(all(unix, any(feature = "experimental-parallel-aggregate", test)))]
+    #[inline(never)]
+    fn try_aggregate_parallel(
+        &self,
+        series: &str,
+        range: std::ops::RangeInclusive<i64>,
+        agg: Agg,
+        pred: Predicate,
+        force_for_test: bool,
+    ) -> Result<Option<AggResult>> {
+        let (start, end) = (*range.start(), *range.end());
+        if start > end {
+            return Ok(None);
+        }
+        let s = self
+            .series
+            .get(series)
+            .ok_or_else(|| Error::UnknownSeries(series.to_string()))?;
+        let mut count = 0;
+        let mut sum = 0.0;
+        let mut extreme = None;
+        let mut matched = false;
+        let mut fold_value = |p: Point| {
+            fold(
+                agg,
+                p.value,
+                &mut count,
+                &mut sum,
+                &mut extreme,
+                &mut matched,
+            )
+        };
+        let first = s.blocks.partition_point(|b| b.t_max < start);
+        let Some(merged) = aggregate_parallel::try_fold(
+            &s.blocks[first..],
+            start,
+            end,
+            pred,
+            force_for_test,
+            &mut fold_value,
+        )?
+        else {
+            return Ok(None);
+        };
+        for p in &s.pending {
+            if p.ts > end {
+                break;
+            }
+            if p.ts >= start && pred.matches(p.value) {
+                fold_value(*p);
+            }
+        }
+        let stats = QueryStats {
+            blocks_total: s.blocks.len(),
+            blocks_visited: merged.visited,
+            blocks_decoded: merged.decoded,
+            blocks_skipped_time: s.blocks.len().saturating_sub(merged.visited),
+            blocks_skipped_value: merged.skipped,
+            points_decoded: merged.points,
+            pending_points: s.pending.len(),
+            bytes_decoded: merged.bytes,
+            ..QueryStats::default()
+        };
+        let value = aggregate_value(agg, count, sum, extreme, matched);
+        Ok(Some(AggResult { value, stats }))
     }
 
     pub fn summaries(&self) -> Vec<SeriesSummary> {
@@ -1441,6 +1510,23 @@ fn recover_from_wal(wal_path: &Path) -> Result<Db> {
         db.replay_record(series, points)
     })?;
     Ok(db)
+}
+
+#[inline]
+fn aggregate_value(
+    agg: Agg,
+    count: u64,
+    sum: f64,
+    extreme: Option<f64>,
+    matched: bool,
+) -> Option<f64> {
+    match agg {
+        Agg::Count if matched => Some(count as f64),
+        Agg::Sum if matched => Some(sum),
+        Agg::Avg if count > 0 => Some(sum / count as f64),
+        Agg::Min | Agg::Max => extreme,
+        _ => None,
+    }
 }
 
 fn fold(

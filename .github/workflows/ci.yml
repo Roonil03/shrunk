@@ -69,6 +69,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --all-targets --locked
       - run: cargo test --doc --locked
+      - name: Test opt-in parallel aggregates (core)
+        run: cargo test --all-targets --locked --features experimental-parallel-aggregate
+      - name: Test opt-in parallel aggregates (HTTP service)
+        run: cargo test --manifest-path service/Cargo.toml --all-targets --locked --features shrunk/experimental-parallel-aggregate
 
   lean:
     name: Lean proofs
