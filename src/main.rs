@@ -240,7 +240,7 @@ fn cmd_query(args: &[String]) -> Result<(), String> {
             .aggregate(series, from, to, agg, pred)
             .map_err(|e| e.to_string())?;
         let emitted = match res.value {
-            Some(v) => emit_line(format!("{v:.6}"))?,
+            Some(v) => emit_line(format_aggregate(v))?,
             None => emit_line("null")?,
         };
         if !emitted {
@@ -262,6 +262,14 @@ fn cmd_query(args: &[String]) -> Result<(), String> {
     let res = db.query(&q).map_err(|e| e.to_string())?;
 
     print_points(&res, csv, explain)
+}
+
+fn format_aggregate(value: f64) -> String {
+    let fixed = format!("{value:.6}");
+    match fixed.parse::<f64>() {
+        Ok(rounded) if rounded.to_bits() == value.to_bits() => fixed,
+        _ => value.to_string(),
+    }
 }
 
 fn print_points(res: &shrunk::QueryResult, csv: bool, explain: bool) -> Result<(), String> {

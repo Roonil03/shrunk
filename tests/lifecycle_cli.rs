@@ -139,3 +139,57 @@ fn cli_exposes_buckets_rollups_deletion_and_event_time_retention() {
     .status
     .success());
 }
+
+#[test]
+fn cli_aggregate_preserves_small_values_without_changing_common_format() {
+    use std::process::{Command, Output};
+
+    fn run(path: &std::path::Path, command: &str, args: &[&str]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_shrunk"))
+            .arg(command)
+            .arg(path)
+            .args(args)
+            .output()
+            .unwrap()
+    }
+
+    fn successful(output: Output) -> String {
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    let files = Files::new();
+    let path = files.db();
+    let csv = files.0.join("points.csv");
+    fs::write(&csv, "0,0.000000125\n1,0.000000125\n2,1.25\n3,1.25\n").unwrap();
+    successful(run(
+        &path,
+        "ingest",
+        &["--series", "metric", "--file", csv.to_str().unwrap()],
+    ));
+
+    assert_eq!(
+        successful(run(&path, "query", &["--series", "metric", "--agg", "avg"])),
+        "0.6250000625000001\n"
+    );
+    assert_eq!(
+        successful(run(
+            &path,
+            "query",
+            &["--series", "metric", "--from", "2", "--agg", "avg"],
+        )),
+        "1.250000\n"
+    );
+    assert_eq!(
+        successful(run(
+            &path,
+            "query",
+            &["--series", "metric", "--from", "99", "--agg", "avg"],
+        )),
+        "null\n"
+    );
+}
