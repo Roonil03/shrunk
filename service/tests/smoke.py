@@ -3,6 +3,8 @@
 
 import argparse
 import concurrent.futures
+import errno
+import http.client
 import json
 import os
 from pathlib import Path
@@ -57,6 +59,9 @@ class Server:
             env.pop("SHRUNK_TOKEN_FILE", None)
             env.pop("SHRUNK_RETENTION_MS", None)
             env.pop("SHRUNK_RETENTION_INTERVAL_MS", None)
+            env.pop("SHRUNK_MAX_INFLIGHT_OPERATIONS", None)
+            env.pop("SHRUNK_QUEUE_TIMEOUT_MS", None)
+            env.pop("SHRUNK_MAX_CONNECTIONS", None)
             env.update(self.environment)
             self.log = open(Path(self.temp.name) / "server.log", "ab")
             self.process = subprocess.Popen([self.binary], env=env, stdout=self.log, stderr=self.log)
@@ -151,7 +156,26 @@ def exercise(server):
     assert server.request("/v1/query", {"series": "cpu"})["points"] == points + [tail]
     # Independent clients share one writer and cannot lose each other's writes.
     def write_series(i):
-        return server.request("/v1/write", {"series": f"worker-{i}", "points": points})
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{server.port}/v1/write",
+            data=json.dumps({"series": f"worker-{i}", "points": points}).encode(),
+            headers={"Authorization": "Bearer " + TOKEN, "Content-Type": "application/json"},
+        )
+        for attempt in range(5):
+            try:
+                with urllib.request.urlopen(request, timeout=30) as response:
+                    assert response.status == 200, (response.status, response.read())
+                    return json.loads(response.read())
+            except urllib.error.HTTPError as error:
+                with error:
+                    payload = error.read()
+                # Only this documented pre-execution rejection is safe to
+                # retry. Transport failures may have committed the batch.
+                if (error.code != 503 or error.headers.get("Retry-After") != "1"
+                        or json.loads(payload) != {"error": {"code": "busy", "message": "database busy; retry later"}}
+                        or attempt == 4):
+                    raise
+                time.sleep(1)
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
         assert all(result == {"written": 6} for result in pool.map(write_series, range(8)))
     assert server.request("/v1/series")["points"] == 55
@@ -256,7 +280,10 @@ def exercise_retention_policy(server):
             env.pop("SHRUNK_TOKEN_FILE", None)
             env.update(server.environment)
             failed = subprocess.run([server.binary], env=env, capture_output=True, timeout=10)
-            assert failed.returncode != 0 and b"Address already in use" in failed.stderr, failed.stderr
+            # libc variants use different text for EADDRINUSE; Rust also
+            # includes the platform's numeric OS error in the diagnostic.
+            address_in_use = f"(os error {errno.EADDRINUSE})".encode()
+            assert failed.returncode != 0 and address_in_use in failed.stderr, failed.stderr
         server.environment = {}
         server.start()
         assert server.request("/v1/query", {"series": "policy"})["points"] == [
@@ -287,14 +314,138 @@ def exercise_retention_policy(server):
     server.stop()
 
 
+def raw_status(server):
+    with socket.create_connection(("127.0.0.1", server.port), timeout=5) as sock:
+        sock.sendall(("GET /v1/status HTTP/1.1\r\nHost: localhost\r\n"
+                      "Authorization: Bearer " + TOKEN + "\r\nConnection: close\r\n\r\n").encode())
+        response = http.client.HTTPResponse(sock)
+        response.begin()
+        return response.status, dict(response.getheaders()), response.read()
+
+
+def admitted_socket(server, minimum_connections):
+    # A TCP connect may finish at Docker's forwarder before the server accepts
+    # it. A complete keep-alive response confirms that this socket holds a permit.
+    deadline = time.monotonic() + 5
+    while True:
+        sock = socket.create_connection(("127.0.0.1", server.port), timeout=5)
+        try:
+            sock.sendall(("GET /v1/status HTTP/1.1\r\nHost: localhost\r\n"
+                          "Authorization: Bearer " + TOKEN + "\r\nConnection: keep-alive\r\n\r\n").encode())
+            with http.client.HTTPResponse(sock) as response:
+                response.begin()
+                assert response.status == 200, response.status
+                assert response.version == 11 and not response.will_close, response.getheaders()
+                snapshot = json.loads(response.read())
+            assert minimum_connections <= snapshot["active_connections"] <= snapshot["max_connections"], snapshot
+            return sock
+        except (ConnectionResetError, BrokenPipeError, http.client.RemoteDisconnected):
+            # A just-closed readiness/request socket can briefly retain its
+            # permit. Retry only transport rejection, never an invalid response.
+            sock.close()
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.01)
+        except BaseException:
+            sock.close()
+            raise
+
+
+def exercise_admission(server):
+    server.environment = {"SHRUNK_MAX_CONNECTIONS": "4",
+                          "SHRUNK_MAX_INFLIGHT_OPERATIONS": "2",
+                          "SHRUNK_QUEUE_TIMEOUT_MS": "250"}
+    server.start()
+    server.request("/v1/status", auth=False, status=401)
+    snapshot = server.request("/v1/status")
+    assert snapshot["max_connections"] == 4
+    assert snapshot["max_inflight_operations"] == 2
+    assert snapshot["queue_timeout_ms"] == 250
+    server.request("/v1/write", {"series": "survives", "points": [{"ts": 1, "value": 1}]})
+    held = []
+    try:
+        # Confirm all four permits before probing overflow; then leave partial
+        # headers on each keep-alive socket before HTTP authentication/admission.
+        for _ in range(4):
+            sock = admitted_socket(server, len(held) + 1)
+            held.append(sock)
+            sock.sendall(b"GET /v1/status HTTP/1.1\r\nHost: localhost\r\n")
+        with socket.create_connection(("127.0.0.1", server.port), timeout=5) as overflow:
+            try:
+                overflow.sendall(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                assert overflow.recv(1) == b"", "overflow socket received an HTTP response"
+            except (ConnectionResetError, BrokenPipeError):
+                pass
+    finally:
+        for sock in held:
+            sock.close()
+    deadline = time.monotonic() + 5
+    while True:
+        try:
+            snapshot = server.request("/v1/status")
+            break
+        except (OSError, http.client.HTTPException):
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.01)
+    assert snapshot["active_connections"] <= 4
+    assert snapshot["connection_rejections"] >= 1
+    assert snapshot["running_operations"] == 0
+    assert snapshot["queued_operations"] == 0
+    server.stop()
+    server.environment["SHRUNK_MAX_CONNECTIONS"] = "20"
+    server.start()
+    assert server.request("/v1/query", {"series": "survives"})["points"] == [{"ts": 1, "value": 1.0}]
+    held = []
+    try:
+        # First confirm all sockets, then confirm each body reader has entered
+        # its handler. A 100 Continue is emitted when the body is polled, after
+        # authentication and HTTP admission, so a probe cannot steal its slot.
+        for _ in range(16):
+            held.append(admitted_socket(server, len(held) + 1))
+        for sock in held:
+            sock.sendall(("POST /v1/write HTTP/1.1\r\nHost: localhost\r\n"
+                          "Authorization: Bearer " + TOKEN + "\r\nContent-Type: application/json\r\n"
+                          "Content-Length: 100\r\nExpect: 100-continue\r\n\r\n").encode())
+            with sock.makefile("rb") as response:
+                status_line = response.readline()
+                assert status_line == b"HTTP/1.1 100 Continue\r\n", status_line
+                assert response.readline() == b"\r\n", "unexpected interim response headers"
+            sock.sendall(b"{")
+        # All sixteen authenticated, incomplete bodies now hold handler slots,
+        # leaving the database executor idle and socket headroom for this probe.
+        status, headers, payload = raw_status(server)
+        assert status == 503, (status, payload)
+        assert headers.get("retry-after") == "1", headers
+        assert json.loads(payload)["error"]["code"] == "busy"
+    finally:
+        for sock in held:
+            sock.close()
+    deadline = time.monotonic() + 5
+    while True:
+        status, _, payload = raw_status(server)
+        if status == 200:
+            snapshot = json.loads(payload)
+            break
+        assert status == 503 and time.monotonic() < deadline
+        time.sleep(0.01)
+    assert snapshot["http_rejections"] >= 1
+    assert snapshot["running_operations"] == 0
+    assert snapshot["queued_operations"] == 0
+    server.stop()
+    server.start()
+    assert server.request("/v1/query", {"series": "survives"})["points"] == [{"ts": 1, "value": 1.0}]
+    server.stop()
+
+
 def main():
     parser = argparse.ArgumentParser()
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--binary", type=lambda p: str(Path(p).resolve()))
     source.add_argument("--image")
-    parser.add_argument("--scenario", choices=["all", "base", "lifecycle", "retention"], default="all")
+    parser.add_argument("--scenario", choices=["all", "base", "lifecycle", "retention", "admission"], default="all")
     args = parser.parse_args()
-    scenarios = {"base": exercise, "lifecycle": exercise_lifecycle, "retention": exercise_retention_policy}
+    scenarios = {"base": exercise, "lifecycle": exercise_lifecycle, "retention": exercise_retention_policy, "admission": exercise_admission}
     for name, scenario in scenarios.items():
         if args.scenario not in ("all", name):
             continue

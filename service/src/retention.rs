@@ -90,25 +90,19 @@ impl RetentionPolicy {
                 tokio::select! {
                     _ = receiver.changed() => break,
                     _ = ticks.tick() => {
-                        // Wait in the semaphore's FIFO queue instead of
-                        // losing every tick while HTTP requests are busy.
-                        // Shutdown can cancel this wait; once admitted, the
-                        // sweep finishes before the task exits.
-                        let permit = tokio::select! {
-                            biased;
-                            _ = receiver.changed() => break,
-                            result = state.acquire_maintenance_permit() => match result {
-                                Ok(permit) => permit,
-                                Err(error) => {
-                                    eprintln!("retention permit failed: {}", error.2);
-                                    break;
-                                }
-                            }
-                        };
-                        let result = state.run_permitted(permit, move |store| {
+                        // One producer coalesces missed ticks. Waiting work
+                        // takes priority over new HTTP admissions; accepted
+                        // sweeps share the actual FIFO database executor.
+                        let sweep = state.executor.maintenance(move |store| {
                             Self::report(self.sweep(&mut store.db)?);
                             Ok(serde_json::Value::Null)
-                        }).await;
+                        });
+                        tokio::pin!(sweep);
+                        let result = tokio::select! {
+                            biased;
+                            _ = receiver.changed() => break,
+                            result = &mut sweep => result,
+                        };
                         if let Err(error) = result {
                             eprintln!("retention sweep failed; will retry at next interval: {}", error.2);
                         }
@@ -123,11 +117,7 @@ impl RetentionPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Store;
     use shrunk::{Point, Query};
-    use std::path::PathBuf;
-    use std::sync::{Arc, Mutex};
-    use tokio::sync::Semaphore;
 
     #[test]
     fn configuration_is_opt_in_and_rejects_invalid_durations() {
@@ -183,39 +173,5 @@ mod tests {
                 .points_deleted,
             0
         );
-    }
-
-    #[tokio::test]
-    async fn maintenance_waits_for_an_operation_permit() {
-        let state = AppState {
-            store: Arc::new(Mutex::new(Store {
-                db: Db::new(),
-                wal_path: PathBuf::new(),
-            })),
-            token: Arc::from(&b"test-token"[..]),
-            requests: Arc::new(Semaphore::new(1)),
-            operations: Arc::new(Semaphore::new(1)),
-        };
-        let held = state.operations.clone().acquire_owned().await.unwrap();
-        let waiter = tokio::spawn({
-            let state = state.clone();
-            async move {
-                state
-                    .acquire_maintenance_permit()
-                    .await
-                    .map_err(|error| error.2)
-                    .unwrap()
-            }
-        });
-        tokio::task::yield_now().await;
-        assert!(!waiter.is_finished());
-        drop(held);
-        let acquired = tokio::time::timeout(Duration::from_secs(1), waiter)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(state.operations.available_permits(), 0);
-        drop(acquired);
-        assert_eq!(state.operations.available_permits(), 1);
     }
 }

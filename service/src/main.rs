@@ -3,7 +3,8 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::{to_bytes, Bytes};
@@ -18,9 +19,16 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use shrunk::{Agg, Db, DeleteResult, Error, Point, Predicate, Query, QueryStats};
 use subtle::ConstantTimeEq;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::Semaphore;
+
+mod admission;
+mod connections;
+use admission::{Config, Executor};
+use connections::LimitedListener;
 
 mod retention;
+#[cfg(test)]
+mod test_support;
 use retention::RetentionPolicy;
 
 const MAX_BODY_BYTES: usize = 1024 * 1024;
@@ -31,10 +39,9 @@ const CHECKPOINT_WAL_BYTES: u64 = 32 * 1024 * 1024;
 
 #[derive(Clone)]
 struct AppState {
-    store: Arc<Mutex<Store>>,
+    executor: Executor,
     token: Arc<[u8]>,
     requests: Arc<Semaphore>,
-    operations: Arc<Semaphore>,
 }
 
 struct Store {
@@ -47,43 +54,11 @@ impl AppState {
     where
         F: FnOnce(&mut Store) -> Result<Value, ApiError> + Send + 'static,
     {
-        // Keep the permit inside the blocking operation: a disconnected client
-        // cannot leave unlimited queued work behind.
-        let permit = self
-            .operations
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| ApiError::busy())?;
-        self.run_permitted(permit, operation).await
-    }
-
-    async fn acquire_maintenance_permit(&self) -> Result<OwnedSemaphorePermit, ApiError> {
-        self.operations
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| ApiError::busy())
-    }
-
-    async fn run_permitted<F>(
-        &self,
-        permit: OwnedSemaphorePermit,
-        operation: F,
-    ) -> Result<Value, ApiError>
-    where
-        F: FnOnce(&mut Store) -> Result<Value, ApiError> + Send + 'static,
-    {
-        let store = self.store.clone();
-        tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            let mut store = store.lock().map_err(|_| ApiError::busy())?;
-            operation(&mut store)
-        })
-        .await
-        .map_err(|_| ApiError::internal("database worker failed"))?
+        self.executor.run(operation).await
     }
 }
 
+#[derive(Debug)]
 struct ApiError(StatusCode, &'static str, String);
 
 impl ApiError {
@@ -117,7 +92,6 @@ impl From<Error> for ApiError {
             }
             Error::InvalidInput(_) => (StatusCode::BAD_REQUEST, "invalid_request"),
             Error::Limit(_) => (StatusCode::PAYLOAD_TOO_LARGE, "limit_exceeded"),
-            Error::Locked(_) => return Self::busy(),
             _ => {
                 eprintln!("database operation failed: {error}");
                 return Self::internal("database operation failed; check server logs");
@@ -134,6 +108,11 @@ impl IntoResponse for ApiError {
             Json(json!({"error": {"code": self.1, "message": self.2}})),
         )
             .into_response();
+        if self.0 == StatusCode::SERVICE_UNAVAILABLE {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, header::HeaderValue::from_static("1"));
+        }
         if self.0 == StatusCode::UNAUTHORIZED {
             response.headers_mut().insert(
                 header::WWW_AUTHENTICATE,
@@ -221,6 +200,11 @@ async fn authorize(State(state): State<AppState>, request: Request, next: Next) 
         .into_response();
     }
     let Ok(_permit) = state.requests.try_acquire() else {
+        state
+            .executor
+            .metrics()
+            .http_rejections
+            .fetch_add(1, Ordering::Relaxed);
         return ApiError::busy().into_response();
     };
     let mut response = next.run(request).await;
@@ -242,6 +226,7 @@ fn app(state: AppState) -> Router {
         .route("/v1/downsample", post(downsample))
         .route("/v1/rollup", post(rollup))
         .route("/v1/series", get(series))
+        .route("/v1/status", get(status))
         .route("/v1/checkpoint", post(checkpoint))
         .route_layer(middleware::from_fn_with_state(state.clone(), authorize))
         .route("/healthz", get(|| async { Json(json!({"status": "ok"})) }))
@@ -269,7 +254,18 @@ struct WriteRequest {
     points: Vec<InputPoint>,
 }
 
-fn check_series(series: &str) -> Result<(), ApiError> {
+// References must cover every name admitted by the storage format, including
+// empty/control names from CLI/library snapshots. Creation stays stricter.
+fn check_reference(series: &str) -> Result<(), ApiError> {
+    if series.len() > 1024 {
+        return Err(ApiError::bad(
+            "series reference must not exceed 1024 UTF-8 bytes",
+        ));
+    }
+    Ok(())
+}
+
+fn check_new_series(series: &str) -> Result<(), ApiError> {
     if series.is_empty() || series.len() > 255 || series.chars().any(char::is_control) {
         return Err(ApiError::bad(
             "series must contain 1..255 UTF-8 bytes without control characters",
@@ -282,7 +278,7 @@ async fn write(
     State(state): State<AppState>,
     Body(input): Body<WriteRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    check_series(&input.series)?;
+    check_reference(&input.series)?;
     if input.points.is_empty() || input.points.len() > MAX_BATCH_POINTS {
         return Err(ApiError::bad(format!(
             "points must contain 1..{MAX_BATCH_POINTS} samples"
@@ -294,7 +290,11 @@ async fn write(
     state
         .run(move |store| {
             let names = store.db.series_names();
-            if names.len() >= MAX_SERIES && !names.contains(&input.series.as_str()) {
+            let exists = names.contains(&input.series.as_str());
+            if !exists {
+                check_new_series(&input.series)?;
+            }
+            if names.len() >= MAX_SERIES && !exists {
                 return Err(ApiError::bad(format!(
                     "database supports at most {MAX_SERIES} series"
                 )));
@@ -357,7 +357,7 @@ struct QueryRequest {
 }
 
 fn check_range(series: &str, from: Option<i64>, to: Option<i64>) -> Result<(i64, i64), ApiError> {
-    check_series(series)?;
+    check_reference(series)?;
     let from = from.unwrap_or(i64::MIN);
     let to = to.unwrap_or(i64::MAX);
     if from > to {
@@ -490,7 +490,7 @@ async fn delete_series(
     State(state): State<AppState>,
     Body(input): Body<SeriesRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    check_series(&input.series)?;
+    check_reference(&input.series)?;
     state
         .run(move |store| {
             let deleted = store.db.delete_series(&input.series)?;
@@ -619,7 +619,7 @@ async fn rollup(
     Body(input): Body<RollupRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let (from, to) = check_range(&input.series, input.from, input.to)?;
-    check_series(&input.target)?;
+    check_new_series(&input.target)?;
     let max_buckets = input.max_buckets.unwrap_or(MAX_QUERY_POINTS);
     let agg = check_bucket_options(input.interval_ms, &input.agg, max_buckets)?;
     state
@@ -649,6 +649,10 @@ async fn rollup(
         })
         .await
         .map(Json)
+}
+
+async fn status(State(state): State<AppState>) -> Json<Value> {
+    Json(state.executor.status())
 }
 
 async fn series(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
@@ -762,6 +766,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         None => {}
     }
     let token = token()?;
+    let config = Config::from_env()?;
     let data_dir = PathBuf::from(env::var_os("SHRUNK_DATA_DIR").unwrap_or_else(|| "data".into()));
     fs::create_dir_all(&data_dir)?;
     let path = data_dir.join("shrunk.db");
@@ -774,32 +779,47 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(policy) = policy {
         RetentionPolicy::report(policy.sweep(&mut db).map_err(|error| error.2)?);
     }
-    let state = AppState {
-        store: Arc::new(Mutex::new(Store {
+    let (executor, worker) = Executor::start(
+        Store {
             db,
             wal_path: data_dir.join("shrunk.db.wal"),
-        })),
+        },
+        config,
+    )?;
+    let state = AppState {
+        executor,
         token: token.into(),
         requests: Arc::new(Semaphore::new(16)),
-        operations: Arc::new(Semaphore::new(8)),
     };
     eprintln!("shrunk-server listening on {}", listener.local_addr()?);
+    let listener = LimitedListener::new(listener, config.max_connections, state.executor.metrics());
     let retention = policy.map(|policy| policy.start(state.clone()));
+    let stop_retention = retention.as_ref().map(|(stop, _)| stop.clone());
+    let shutdown_executor = state.executor.clone();
     let result = axum::serve(listener, app(state.clone()))
-        .with_graceful_shutdown(shutdown_signal())
-        .await;
-    if let Some((stop, task)) = retention {
-        let _ = stop.send(true);
-        task.await?;
-    }
-    result?;
-    state
-        .run(|store| {
-            store.db.checkpoint()?;
-            Ok(json!(null))
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            // Stop all producers at signal time. Existing HTTP bodies may
+            // finish reading, but cannot submit new database commands.
+            shutdown_executor.close();
+            if let Some(stop) = stop_retention {
+                let _ = stop.send(true);
+            }
         })
-        .await
-        .map_err(|e| e.2)?;
+        .await;
+    state.executor.close();
+    let retention_result = if let Some((stop, task)) = retention {
+        let _ = stop.send(true);
+        task.await
+    } else {
+        Ok(())
+    };
+    // The dedicated worker drains accepted commands and then checkpoints,
+    // including running mutations whose clients disconnected.
+    let drained = worker.finish().await;
+    result?;
+    retention_result?;
+    drained.map_err(|e| e.2)?;
     Ok(())
 }
 
@@ -821,4 +841,230 @@ fn healthcheck(mut address: SocketAddr) -> Result<(), Box<dyn std::error::Error>
         return Err("health check did not receive HTTP 200".into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::TestStore;
+
+    fn state(executor: Executor) -> AppState {
+        AppState {
+            executor,
+            token: Arc::from(&b"test-token"[..]),
+            requests: Arc::new(Semaphore::new(16)),
+        }
+    }
+
+    fn write_input(series: &str, ts: i64) -> Body<WriteRequest> {
+        Body(WriteRequest {
+            series: series.into(),
+            points: vec![InputPoint {
+                ts,
+                value: ts as f64,
+            }],
+        })
+    }
+
+    #[tokio::test]
+    async fn imported_names_remain_addressable_but_http_creation_is_strict() {
+        let database = TestStore::new();
+        let mut store = database.store();
+        let names = [
+            "".to_owned(),
+            "line\ncontrol".to_owned(),
+            "x".repeat(256),
+            "🦀".repeat(256),
+        ];
+        for name in &names {
+            store.db.append(name, &[Point::new(1, 1.0)]).unwrap();
+        }
+        let (executor, worker) = Executor::start(
+            store,
+            Config {
+                max_inflight: 8,
+                queue_timeout: Duration::from_secs(60),
+                max_connections: 16,
+            },
+        )
+        .unwrap();
+        let state = state(executor);
+        for (n, name) in names.iter().enumerate() {
+            assert_eq!(
+                write(State(state.clone()), write_input(name, 2))
+                    .await
+                    .unwrap()
+                    .0,
+                json!({"written": 1})
+            );
+            let queried = query(
+                State(state.clone()),
+                Body(QueryRequest {
+                    series: name.clone(),
+                    from: None,
+                    to: None,
+                    limit: None,
+                    filter: None,
+                }),
+            )
+            .await
+            .unwrap()
+            .0;
+            assert_eq!(queried["points"].as_array().unwrap().len(), 2);
+            assert_eq!(
+                aggregate(
+                    State(state.clone()),
+                    Body(AggregateRequest {
+                        series: name.clone(),
+                        from: None,
+                        to: None,
+                        agg: "count".into(),
+                        filter: None
+                    })
+                )
+                .await
+                .unwrap()
+                .0["value"],
+                2.0
+            );
+            assert_eq!(
+                downsample(
+                    State(state.clone()),
+                    Body(DownsampleRequest {
+                        series: name.clone(),
+                        from: None,
+                        to: None,
+                        interval_ms: 10,
+                        agg: "sum".into(),
+                        limit: None
+                    })
+                )
+                .await
+                .unwrap()
+                .0["points"][0]["value"],
+                3.0
+            );
+            let target = format!("valid-{n}");
+            assert_eq!(
+                rollup(
+                    State(state.clone()),
+                    Body(RollupRequest {
+                        series: name.clone(),
+                        target,
+                        from: None,
+                        to: None,
+                        interval_ms: 10,
+                        agg: "sum".into(),
+                        max_buckets: None
+                    })
+                )
+                .await
+                .unwrap()
+                .0["written"],
+                1
+            );
+            assert_eq!(
+                delete_range(
+                    State(state.clone()),
+                    Body(DeleteRequest {
+                        series: name.clone(),
+                        from: Some(1),
+                        to: Some(1)
+                    })
+                )
+                .await
+                .unwrap()
+                .0["points_deleted"],
+                1
+            );
+            assert_eq!(
+                delete_series(
+                    State(state.clone()),
+                    Body(SeriesRequest {
+                        series: name.clone()
+                    })
+                )
+                .await
+                .unwrap()
+                .0["points_deleted"],
+                1
+            );
+            assert_eq!(
+                write(State(state.clone()), write_input(name, 3))
+                    .await
+                    .unwrap_err()
+                    .0,
+                StatusCode::BAD_REQUEST
+            );
+        }
+        assert!(check_reference(&"x".repeat(1025)).is_err());
+        assert!(check_new_series(&"🦀".repeat(64)).is_err());
+        worker.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn status_bypasses_busy_store_and_new_name_validation_uses_executor_membership() {
+        let database = TestStore::new();
+        let mut store = database.store();
+        store.db.append("", &[Point::new(1, 1.0)]).unwrap();
+        let (executor, worker) = Executor::start(
+            store,
+            Config {
+                max_inflight: 2,
+                queue_timeout: Duration::from_secs(60),
+                max_connections: 16,
+            },
+        )
+        .unwrap();
+        let state = state(executor);
+        let (release, wait) = std::sync::mpsc::channel();
+        let (started, running) = tokio::sync::oneshot::channel();
+        let deletion = tokio::spawn({
+            let state = state.clone();
+            async move {
+                state
+                    .run(move |store| {
+                        let _ = started.send(());
+                        wait.recv().unwrap();
+                        store.db.delete_series("")?;
+                        Ok(Value::Null)
+                    })
+                    .await
+            }
+        });
+        running.await.unwrap();
+        let snapshot = status(State(state.clone())).await.0;
+        assert_eq!(snapshot["running_operations"], 1);
+        let append = tokio::spawn({
+            let state = state.clone();
+            async move { write(State(state), write_input("", 2)).await }
+        });
+        for _ in 0..10000 {
+            if state.executor.status()["queued_operations"] == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(state.executor.status()["queued_operations"], 1);
+        release.send(()).unwrap();
+        deletion.await.unwrap().unwrap();
+        // It was imported when the request arrived, but deleted before this
+        // command executes; appending would now create a new invalid name.
+        assert_eq!(
+            append.await.unwrap().unwrap_err().0,
+            StatusCode::BAD_REQUEST
+        );
+        worker.finish().await.unwrap();
+    }
+
+    #[test]
+    fn only_admission_unavailability_advises_retry() {
+        let response = ApiError::busy().into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+        let response =
+            ApiError::from(Error::Locked("unexpected storage error".into())).into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!response.headers().contains_key(header::RETRY_AFTER));
+    }
 }

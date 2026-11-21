@@ -48,6 +48,18 @@ pub(crate) struct Wal {
     file: File,
     header_written: bool,
     block_size: usize,
+    poisoned: bool,
+    #[cfg(test)]
+    faults: std::collections::VecDeque<Fault>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Fault {
+    WritePrefix(usize),
+    SyncData,
+    SetLen,
+    SyncAll,
 }
 
 /// A WAL that is exclusively locked but has not yet been replayed.
@@ -94,14 +106,7 @@ impl LockedWal {
             if created {
                 sync_parent_dir(&path)?;
             }
-            return Ok((
-                Wal {
-                    file,
-                    header_written: true,
-                    block_size,
-                },
-                block_size,
-            ));
+            return Ok((Wal::new(file, block_size), block_size));
         }
         let block_size = read_header(&mut file)?;
         if block_size == 0 {
@@ -125,18 +130,32 @@ impl LockedWal {
         if created {
             sync_parent_dir(&path)?;
         }
-        Ok((
-            Wal {
-                file,
-                header_written: true,
-                block_size,
-            },
-            block_size,
-        ))
+        Ok((Wal::new(file, block_size), block_size))
     }
 }
 
 impl Wal {
+    fn new(file: File, block_size: usize) -> Self {
+        Self {
+            file,
+            header_written: true,
+            block_size,
+            poisoned: false,
+            #[cfg(test)]
+            faults: Default::default(),
+        }
+    }
+
+    pub(crate) fn ensure_healthy(&self) -> Result<()> {
+        if self.poisoned {
+            return Err(std::io::Error::other(
+                "WAL durability is uncertain; close and reopen the database before mutating it",
+            )
+            .into());
+        }
+        Ok(())
+    }
+
     /// Open or create the WAL and take the exclusive lock before the caller
     /// reads the snapshot. Replay and torn-tail repair happen afterwards in
     /// [`LockedWal::recover`].
@@ -177,6 +196,7 @@ impl Wal {
     /// Append one durable batch. The record is fsynced before the caller
     /// applies it to memory, so a crash cannot lose an acknowledged batch.
     pub fn append(&mut self, series: &str, points: &[Point]) -> Result<()> {
+        self.ensure_healthy()?;
         if points.is_empty() {
             return Ok(());
         }
@@ -205,54 +225,112 @@ impl Wal {
                 "appending would exceed WAL recovery limit {MAX_WAL_BYTES}"
             )));
         }
-        if let Err(error) = self.file.write_all(&record) {
-            self.file.set_len(old_len)?;
-            self.file.sync_data()?;
-            return Err(error.into());
-        }
-        if let Err(error) = self.file.sync_data() {
-            self.file.set_len(old_len)?;
-            self.file.sync_data()?;
-            return Err(error.into());
-        }
-        Ok(())
+        self.write_synced(&record, old_len)
     }
 
     /// Empty the WAL after a successful snapshot checkpoint. The next append
     /// recreates the header.
     pub fn truncate(&mut self) -> Result<()> {
-        self.file.set_len(0)?;
-        // Reflect the truncated file even if the durability sync fails, so a
-        // later append does not write a record without a header.
-        self.header_written = false;
-        self.file.sync_all()?;
+        self.ensure_healthy()?;
+        let result = self.set_len(0).and_then(|()| {
+            self.header_written = false;
+            self.sync_all()
+        });
+        if let Err(error) = result {
+            // The snapshot is durable, but further mutations must wait until
+            // reopen establishes whether the old WAL was durably removed.
+            self.poisoned = true;
+            return Err(error.into());
+        }
         Ok(())
     }
 
     pub fn ensure_header(&mut self, block_size: usize) -> Result<()> {
+        self.ensure_healthy()?;
         if !self.header_written {
-            write_header(&mut self.file, block_size)?;
-            if let Err(error) = self.file.sync_data() {
-                // The header write may have reached the file without being
-                // durable. Drop it so a retry rewrites instead of appending a
-                // second header.
-                let _ = self.file.set_len(0);
-                return Err(error.into());
-            }
+            let old_len = self.file.metadata()?.len();
+            self.write_synced(&header_bytes(block_size), old_len)?;
             self.header_written = true;
         }
         Ok(())
     }
+
+    fn write_synced(&mut self, bytes: &[u8], old_len: u64) -> Result<()> {
+        let result = self.write_all(bytes).and_then(|()| self.sync_data());
+        if let Err(error) = result {
+            // O_APPEND ignores the cursor left by recovery or a partial
+            // write. Restore and sync the previous valid length before a
+            // retry is allowed to append another header or record.
+            if let Err(rollback) = self.set_len(old_len).and_then(|()| self.sync_data()) {
+                self.poisoned = true;
+                return Err(std::io::Error::new(
+                    rollback.kind(),
+                    format!(
+                        "WAL rollback failed after {error}: {rollback}; close and reopen the database"
+                    ),
+                )
+                .into());
+            }
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_faults(&mut self, faults: impl IntoIterator<Item = Fault>) {
+        self.faults.extend(faults);
+    }
+
+    fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        #[cfg(test)]
+        if let Some(Fault::WritePrefix(n)) = self.faults.front().copied() {
+            self.faults.pop_front();
+            self.file.write_all(&bytes[..n])?;
+            return Err(std::io::Error::other("injected WAL write failure"));
+        }
+        self.file.write_all(bytes)
+    }
+
+    fn set_len(&mut self, len: u64) -> std::io::Result<()> {
+        #[cfg(test)]
+        if matches!(self.faults.front(), Some(Fault::SetLen)) {
+            self.faults.pop_front();
+            return Err(std::io::Error::other("injected WAL truncate failure"));
+        }
+        self.file.set_len(len)
+    }
+
+    fn sync_data(&mut self) -> std::io::Result<()> {
+        #[cfg(test)]
+        if matches!(self.faults.front(), Some(Fault::SyncData)) {
+            self.faults.pop_front();
+            return Err(std::io::Error::other("injected WAL data sync failure"));
+        }
+        self.file.sync_data()
+    }
+
+    fn sync_all(&mut self) -> std::io::Result<()> {
+        #[cfg(test)]
+        if matches!(self.faults.front(), Some(Fault::SyncAll)) {
+            self.faults.pop_front();
+            return Err(std::io::Error::other("injected WAL full sync failure"));
+        }
+        self.file.sync_all()
+    }
 }
 
 fn write_header(file: &mut File, block_size: usize) -> Result<()> {
+    file.write_all(&header_bytes(block_size))?;
+    Ok(())
+}
+
+fn header_bytes(block_size: usize) -> Vec<u8> {
     let mut header = Vec::with_capacity(WAL_HEADER_BYTES as usize);
     header.extend_from_slice(WAL_MAGIC);
     header.extend_from_slice(&WAL_VERSION.to_le_bytes());
     header.extend_from_slice(&0u16.to_le_bytes());
     put_u32(&mut header, block_size as u32);
-    file.write_all(&header)?;
-    Ok(())
+    header
 }
 
 /// Linux/Android `O_NOFOLLOW`. The value is architecture-specific: 0x8000 on
