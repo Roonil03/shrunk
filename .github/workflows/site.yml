@@ -1,0 +1,43 @@
+name: Website
+
+on:
+  pull_request:
+    paths: ['site/**', 'src/**', '.github/workflows/site.yml']
+  push:
+    branches: [main]
+    paths: ['site/**', 'src/**', '.github/workflows/site.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  site:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: site/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Redis for isolated archive tests
+        run: |
+          if ! command -v redis-server; then
+            sudo apt-get update
+            sudo apt-get install -y redis-server
+          fi
+      - name: Compile the Rust block reader for the codec tests
+        run: |
+          rustc --edition=2021 --crate-type=rlib --crate-name shrunk src/lib.rs -o "$RUNNER_TEMP/libshrunk.rlib"
+          rustc --edition=2021 site/demo/codec-oracle.rs --extern shrunk="$RUNNER_TEMP/libshrunk.rlib" -o "$RUNNER_TEMP/codec-oracle"
+      - run: npm ci
+        working-directory: site
+      - run: npm run typecheck
+        working-directory: site
+      - run: npm test
+        working-directory: site
+        env:
+          SHRUNK_RUST_ORACLE: ${{ runner.temp }}/codec-oracle
+      - run: npm run build
+        working-directory: site
