@@ -128,13 +128,19 @@
   .hero-scrim {
     position: absolute;
     inset: 0;
-    background: linear-gradient(
-      180deg,
-      rgba(1, 7, 9, 0.72) 0%,
-      rgba(1, 7, 9, 0.34) 48%,
-      rgba(1, 7, 9, 0.15) 75%,
-      rgba(1, 7, 9, 0.65) 100%
-    );
+    background:
+      radial-gradient(
+        ellipse 66% 84% at 24% 48%,
+        rgba(1, 6, 8, 0.86) 0%,
+        rgba(1, 6, 8, 0.56) 54%,
+        rgba(1, 6, 8, 0.06) 100%
+      ),
+      linear-gradient(
+        180deg,
+        rgba(1, 7, 9, 0.62) 0%,
+        rgba(1, 7, 9, 0.14) 45%,
+        rgba(1, 7, 9, 0.58) 100%
+      );
     pointer-events: none;
   }
 
@@ -177,7 +183,8 @@
     max-width: 48ch;
     font-size: 17.5px;
     line-height: 1.58;
-    color: rgba(242, 244, 240, 0.84);
+    color: rgba(246, 249, 248, 0.94);
+    text-shadow: 0 1px 14px rgba(0, 0, 0, 0.65);
     margin: 0 0 34px;
   }
 
