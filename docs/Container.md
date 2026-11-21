@@ -102,6 +102,7 @@ curl --fail-with-body http://127.0.0.1:8080/v1/series \
 | `POST /v1/retain` | `cutoff`, or both `now` and `window_ms` | Effective `cutoff` and deletion counters |
 | `POST /v1/downsample` | `series`, `interval_ms`, `agg`; optional `from`, `to`, `limit` | Bucket `points`, `truncated`, `next_from`, compression `stats` |
 | `POST /v1/rollup` | `series`, `target`, `interval_ms`, `agg`; optional `from`, `to`, `max_buckets` | Target `series`, `written` bucket count |
+| `GET /v1/status` | None | Small approximate admission/connection counters and operation timings; no database scan |
 | `GET /v1/series` | None | Series names, point/block counts, compressed/raw sizes, total points, format version |
 | `POST /v1/checkpoint` | Optional empty object | `{"checkpointed":true}` |
 
@@ -118,23 +119,69 @@ write: query the affected range before retrying. Writes have no idempotency key.
 
 Unknown JSON fields are rejected. Validation errors use HTTP 400, unknown series
 404, missing/incorrect tokens 401, oversized bodies 413, incorrect content types
-415, and a full work queue 503. API errors use
+415, and unavailable admission or an expired queued operation 503 with
+`Retry-After: 1`. A 503 means that database operation never started; it is safe
+to retry that operation. Once execution starts, the server waits for its actual
+result even if the queue deadline passes. API errors use
 `{"error":{"code":"...","message":"..."}}`. Routing/method errors may use the
 HTTP framework's default response. Server-side I/O failures return 500 and log
 details to stderr. There is no request/body/token logging.
 
-The API accepts at most 1 MiB per body, 10,000 points per write, 10,000 series,
-and series names of 1..255 UTF-8 bytes without control characters. Body reads
-time out after 10 seconds. At most 16 authenticated requests and eight database
-operations can be in flight; excess work gets 503. Database operations serialize
-on a blocking worker, keeping disk access off the HTTP runtime. These limits do
-not impose a disk quota; monitor volume space and memory. Retention is disabled
-unless explicitly enabled below.
+The API accepts at most 1 MiB per body, 10,000 points per write, and 100,000
+returned query points or buckets. New HTTP series names contain 1..255 UTF-8
+bytes without control characters; HTTP creation stops at 10,000 series. Body
+reads time out after 10 seconds. At most 16 authenticated request handlers run
+at once, including body reads.
+
+One dedicated FIFO executor owns the database and keeps disk work off the HTTP
+runtime. `SHRUNK_MAX_INFLIGHT_OPERATIONS` sets the hard maximum of accepted queued
+plus running commands (default 8). `SHRUNK_QUEUE_TIMEOUT_MS` sets the maximum wait
+before execution (default 1000 milliseconds). A timeout atomically cancels only
+pending work. Disconnected pending requests are skipped; running operations
+finish, including durable writes. Cancelled queue entries retain their capacity
+until the worker skips them, so repeated retries cannot accumulate payloads.
+
+The admission target adapts between one and the configured operation maximum.
+It uses operation duration EWMA with alpha 1/8 and computes
+`1 + floor(queue_timeout / max(EWMA, 1 millisecond))`, capped at that maximum.
+Updates occur at most once per second: decreases apply at the next update and
+growth is at most one slot per update. Already accepted commands are preserved
+when the target decreases. This controls queueing within one server; all
+operations still use one writer and there is no distributed load balancer.
+
+`SHRUNK_MAX_CONNECTIONS` caps accepted socket lifetimes (default 16), including
+idle keep-alive sockets, partial headers, body reads, and slow response readers.
+Overflow sockets are closed without an HTTP response. A connection keeps its
+slot until its IO is dropped, so slow clients cannot accumulate unlimited
+response buffers. All three settings must be positive integers; invalid values
+fail startup. Compose forwards them. A reverse proxy may still need its own
+connection, request, and timeout policy.
+
+Authenticated `GET /v1/status` reads only atomics and stays independent of the
+database queue. It reports active/max connections, queued/running operations,
+current/max target, queue timeout, connection/HTTP/admission rejections, queue
+expiries, skipped pending cancellations, completed operations, and last queue,
+last operation, and EWMA operation durations in microseconds. Counters are
+approximate independent samples and reset at restart; pending cancellations
+include expired requests skipped by the worker. Status still shares the HTTP
+handler and connection caps.
+
+These bounds control traffic-driven outstanding work and response lifetimes;
+they do not impose dataset, disk, or total process-memory quotas. Imported
+databases can exceed the HTTP creation limit. A large imported database, a
+full series listing, or snapshot maintenance can exceed available memory.
+Monitor dataset growth, volume space, and memory. Retention is disabled unless
+explicitly enabled below.
 
 Existing snapshots created with the CLI/library can be placed in the volume as
 `shrunk.db` together with their `shrunk.db.wal`, if present, while the server is
-stopped. Non-finite values already present in imported files are returned as
-JSON `null`; aggregates follow the library's NaN semantics. See
+stopped. References accept every storage-format name up to 1024 UTF-8 bytes,
+including empty names and names with control characters. Queries, aggregates,
+downsampling, deletion, rollup sources, and appends to an existing imported
+series accept those names. Appending checks membership inside the serialized
+executor; creating a missing series and naming a new rollup target use the
+stricter HTTP rules above. Non-finite values already present in imported files
+are returned as JSON `null`; aggregates follow the library's NaN semantics. See
 [the database API and storage format](Info.md).
 
 ## Deletion, retention, and rollups
@@ -212,7 +259,10 @@ curl --fail-with-body -X POST http://127.0.0.1:8080/v1/checkpoint \
 docker stop --time 60 shrunk
 ```
 
-SIGTERM and Ctrl-C drain active HTTP requests, then checkpoint before exiting.
+SIGTERM and Ctrl-C close database admission and stop maintenance producers,
+drain every accepted command, and perform the final checkpoint before exiting.
+Running mutations finish even if their clients have disconnected. Requests
+still reading a body when shutdown begins cannot submit new database work.
 Use a sufficient shutdown grace period for the size of your database; Compose
 sets 60 seconds. A forced kill may skip that checkpoint, but acknowledged
 appends recover from the WAL on restart. Recovery guarantees still depend on
@@ -254,8 +304,10 @@ names and future-dated points. Clock adjustments affect the cutoff. Old data
 accepted by a write can remain queryable until the next pass; writes remain
 durable and the policy later deletes expired points explicitly.
 
-Policy work shares the serialized database worker. A busy or failed sweep logs
-an error and retries at the next interval; missed ticks do not queue a backlog.
+Policy work waits fairly for capacity in the same FIFO executor. A waiting
+sweep prevents new HTTP work from overtaking it; missed ticks coalesce rather
+than queueing a backlog. A failed sweep logs an error and retries at the next
+interval.
 No-op checks read the earliest timestamp from metadata without copying database
 payloads or rewriting snapshots. When data expires, the same durable retention
 path used by HTTP is applied. Shutdown stops the timer, waits for any active
@@ -293,7 +345,11 @@ tests range/series deletion, accidental omitted ranges, explicit retention,
 bounded bucket pagination, cross-block aggregation, compressed rollup storage,
 restart persistence, and startup/scheduled wall-clock expiry. Use
 `--scenario base`, `--scenario lifecycle`, or `--scenario retention` to run one
-group; the default runs all three on separate data volumes.
+group; the default runs all scenarios on separate data volumes. `--scenario admission` verifies configured socket limits, partial requests, HTTP admission,
+status authentication, and recovery after disconnected clients. Rust tests
+exercise queue/start cancellation races, FIFO/maintenance fairness, adaptive
+target limits, socket ownership through slow responses and keep-alive, imported
+names, and disconnected mutation draining through checkpoint/reopen.
 
 ## Image publication
 
