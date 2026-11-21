@@ -63,7 +63,7 @@ export default function App() {
     <>
       <header className="site-head">
         <div className="wrap head-inner">
-          <a className="brand" href="/">
+          <a className="brand" href="/" aria-label="shrunk home">
             <img src="/logo.svg" alt="" width={28} height={28} />
             <span>shrunk</span>
           </a>
