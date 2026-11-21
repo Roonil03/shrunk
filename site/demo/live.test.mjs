@@ -69,3 +69,35 @@ test('cooldown skips NOAA and old persisted observations remain visibly stale', 
   assert.equal(result.stale, true);
   assert.equal(result.rawBytes, 32);
 });
+
+test('a failed lease release preserves a valid snapshot', async () => {
+  const archive = {
+    lease: async () => 'lease', readSnapshot: async () => snapshot,
+    release: async () => { throw new Error('Release connection lost'); },
+  };
+  const result = await liveSnapshot(archive, encodeBatch, { now: () => now, read: async () => [] });
+  assert.equal(result.stale, false);
+  assert.deepEqual(result.points, stored);
+});
+
+test('a failed lease release preserves the stale fallback after a refresh error', async () => {
+  const archive = {
+    lease: async () => 'lease', readSnapshot: async () => snapshot,
+    release: async () => { throw new Error('Release connection lost'); },
+  };
+  const result = await liveSnapshot(archive, encodeBatch, {
+    now: () => now, read: async () => { throw new Error('Feed unavailable'); },
+  });
+  assert.equal(result.stale, true);
+  assert.deepEqual(result.points, stored);
+});
+
+test('a failed lease release does not mask an error without a durable snapshot', async () => {
+  const readError = new Error('Snapshot unavailable');
+  const archive = {
+    lease: async () => 'lease',
+    readSnapshot: async () => { throw readError; },
+    release: async () => { throw new Error('Release connection lost'); },
+  };
+  await assert.rejects(liveSnapshot(archive, encodeBatch), error => error === readError);
+});

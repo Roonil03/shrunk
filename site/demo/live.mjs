@@ -57,7 +57,10 @@ export async function liveSnapshot(archive, encodeBatch, { now = Date.now, read 
     failed = true;
   } finally {
     // A lost connection here leaves a bounded lease which expires by itself.
-    if (lease) await archive.release(lease);
+    // Cleanup must not discard a valid snapshot or mask the refresh error.
+    if (lease) {
+      try { await archive.release(lease); } catch {}
+    }
   }
   const { points, count, rawBytes, compressedBytes, updatedAt, codec, latestTs } = snapshot;
   return {
