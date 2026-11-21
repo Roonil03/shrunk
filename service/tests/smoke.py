@@ -3,6 +3,7 @@
 
 import argparse
 import concurrent.futures
+import errno
 import http.client
 import json
 import os
@@ -260,7 +261,10 @@ def exercise_retention_policy(server):
             env.pop("SHRUNK_TOKEN_FILE", None)
             env.update(server.environment)
             failed = subprocess.run([server.binary], env=env, capture_output=True, timeout=10)
-            assert failed.returncode != 0 and b"Address already in use" in failed.stderr, failed.stderr
+            # libc variants use different text for EADDRINUSE; Rust also
+            # includes the platform's numeric OS error in the diagnostic.
+            address_in_use = f"(os error {errno.EADDRINUSE})".encode()
+            assert failed.returncode != 0 and address_in_use in failed.stderr, failed.stderr
         server.environment = {}
         server.start()
         assert server.request("/v1/query", {"series": "policy"})["points"] == [
