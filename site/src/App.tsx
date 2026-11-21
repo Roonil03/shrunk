@@ -3,6 +3,7 @@ import { SpotlightNavbar, type NavItem } from "@/components/ui/spotlight-navbar"
 import TextAnimation from "@/components/ui/stagger-text";
 import StatsCounter from "@/components/ui/stats-counter";
 import { CopyButton } from "@/components/ui/copy-button";
+import LiveDemo from "@/components/live-demo";
 
 const NAV: NavItem[] = [
   { label: "Block", href: "#label" },
@@ -153,6 +154,8 @@ export default function App() {
             </div>
           </div>
         </section>
+
+        <LiveDemo />
 
         <section className="sheet" id="label">
           <div className="wrap">
