@@ -156,7 +156,26 @@ def exercise(server):
     assert server.request("/v1/query", {"series": "cpu"})["points"] == points + [tail]
     # Independent clients share one writer and cannot lose each other's writes.
     def write_series(i):
-        return server.request("/v1/write", {"series": f"worker-{i}", "points": points})
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{server.port}/v1/write",
+            data=json.dumps({"series": f"worker-{i}", "points": points}).encode(),
+            headers={"Authorization": "Bearer " + TOKEN, "Content-Type": "application/json"},
+        )
+        for attempt in range(5):
+            try:
+                with urllib.request.urlopen(request, timeout=30) as response:
+                    assert response.status == 200, (response.status, response.read())
+                    return json.loads(response.read())
+            except urllib.error.HTTPError as error:
+                with error:
+                    payload = error.read()
+                # Only this documented pre-execution rejection is safe to
+                # retry. Transport failures may have committed the batch.
+                if (error.code != 503 or error.headers.get("Retry-After") != "1"
+                        or json.loads(payload) != {"error": {"code": "busy", "message": "database busy; retry later"}}
+                        or attempt == 4):
+                    raise
+                time.sleep(1)
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
         assert all(result == {"written": 6} for result in pool.map(write_series, range(8)))
     assert server.request("/v1/series")["points"] == 55
@@ -304,6 +323,34 @@ def raw_status(server):
         return response.status, dict(response.getheaders()), response.read()
 
 
+def admitted_socket(server, minimum_connections):
+    # A TCP connect may finish at Docker's forwarder before the server accepts
+    # it. A complete keep-alive response confirms that this socket holds a permit.
+    deadline = time.monotonic() + 5
+    while True:
+        sock = socket.create_connection(("127.0.0.1", server.port), timeout=5)
+        try:
+            sock.sendall(("GET /v1/status HTTP/1.1\r\nHost: localhost\r\n"
+                          "Authorization: Bearer " + TOKEN + "\r\nConnection: keep-alive\r\n\r\n").encode())
+            with http.client.HTTPResponse(sock) as response:
+                response.begin()
+                assert response.status == 200, response.status
+                assert response.version == 11 and not response.will_close, response.getheaders()
+                snapshot = json.loads(response.read())
+            assert minimum_connections <= snapshot["active_connections"] <= snapshot["max_connections"], snapshot
+            return sock
+        except (ConnectionResetError, BrokenPipeError, http.client.RemoteDisconnected):
+            # A just-closed readiness/request socket can briefly retain its
+            # permit. Retry only transport rejection, never an invalid response.
+            sock.close()
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.01)
+        except BaseException:
+            sock.close()
+            raise
+
+
 def exercise_admission(server):
     server.environment = {"SHRUNK_MAX_CONNECTIONS": "4",
                           "SHRUNK_MAX_INFLIGHT_OPERATIONS": "2",
@@ -317,9 +364,10 @@ def exercise_admission(server):
     server.request("/v1/write", {"series": "survives", "points": [{"ts": 1, "value": 1}]})
     held = []
     try:
-        # Partial headers consume sockets before HTTP authentication/admission.
+        # Confirm all four permits before probing overflow; then leave partial
+        # headers on each keep-alive socket before HTTP authentication/admission.
         for _ in range(4):
-            sock = socket.create_connection(("127.0.0.1", server.port), timeout=5)
+            sock = admitted_socket(server, len(held) + 1)
             held.append(sock)
             sock.sendall(b"GET /v1/status HTTP/1.1\r\nHost: localhost\r\n")
         with socket.create_connection(("127.0.0.1", server.port), timeout=5) as overflow:
@@ -350,24 +398,26 @@ def exercise_admission(server):
     assert server.request("/v1/query", {"series": "survives"})["points"] == [{"ts": 1, "value": 1.0}]
     held = []
     try:
-        # Sixteen authenticated, incomplete bodies use every HTTP handler slot
-        # while leaving the database executor idle and socket headroom to probe.
+        # First confirm all sockets, then confirm each body reader has entered
+        # its handler. A 100 Continue is emitted when the body is polled, after
+        # authentication and HTTP admission, so a probe cannot steal its slot.
         for _ in range(16):
-            sock = socket.create_connection(("127.0.0.1", server.port), timeout=5)
-            held.append(sock)
+            held.append(admitted_socket(server, len(held) + 1))
+        for sock in held:
             sock.sendall(("POST /v1/write HTTP/1.1\r\nHost: localhost\r\n"
                           "Authorization: Bearer " + TOKEN + "\r\nContent-Type: application/json\r\n"
-                          "Content-Length: 100\r\n\r\n{").encode())
-        deadline = time.monotonic() + 5
-        while True:
-            status, headers, payload = raw_status(server)
-            if status == 503:
-                assert headers.get("retry-after") == "1", headers
-                assert json.loads(payload)["error"]["code"] == "busy"
-                break
-            assert status == 200, (status, payload)
-            assert time.monotonic() < deadline, "HTTP cap never rejected excess work"
-            time.sleep(0.01)
+                          "Content-Length: 100\r\nExpect: 100-continue\r\n\r\n").encode())
+            with sock.makefile("rb") as response:
+                status_line = response.readline()
+                assert status_line == b"HTTP/1.1 100 Continue\r\n", status_line
+                assert response.readline() == b"\r\n", "unexpected interim response headers"
+            sock.sendall(b"{")
+        # All sixteen authenticated, incomplete bodies now hold handler slots,
+        # leaving the database executor idle and socket headroom for this probe.
+        status, headers, payload = raw_status(server)
+        assert status == 503, (status, payload)
+        assert headers.get("retry-after") == "1", headers
+        assert json.loads(payload)["error"]["code"] == "busy"
     finally:
         for sock in held:
             sock.close()
