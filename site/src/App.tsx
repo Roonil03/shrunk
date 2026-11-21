@@ -17,10 +17,12 @@ cargo build --release
 
 export default function App() {
   const [active, setActive] = useState(0);
+  const [scrolled, setScrolled] = useState(false);
 
   useEffect(() => {
     const ids = NAV.map((item) => item.id);
     const update = () => {
+      setScrolled(window.scrollY > 40);
       let next = 0;
       for (let i = 0; i < ids.length; i++) {
         const el = document.getElementById(ids[i]);
@@ -51,7 +53,7 @@ export default function App() {
 
   return (
     <>
-      <header className="site-head">
+      <header className={scrolled ? "site-head is-scrolled" : "site-head"}>
         <div className="wrap head-inner">
           <a className="brand" href="/" aria-label="shrunk home">
             <img src="/logo.svg" alt="" width={26} height={26} />
