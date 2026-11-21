@@ -32,10 +32,12 @@ async function storeReadings(archive, lease, snapshot, fresh, encodeBatch) {
   const points = extend ? tail.points.concat(fresh) : fresh;
   for (let start = 0; start < points.length; start += blockSize) {
     const block = points.slice(start, start + blockSize);
-    await archive.append({
+    const result = await archive.append({
       lease, points: block, ...encodeBatch(block),
       replaceTailId: start === 0 && extend ? tail.id : undefined,
     });
+    // A fenced-out writer cannot skip its failed block and commit later ones.
+    if (!result.stored) throw new Error('Archive changed during refresh');
   }
 }
 
