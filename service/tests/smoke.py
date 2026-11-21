@@ -156,7 +156,26 @@ def exercise(server):
     assert server.request("/v1/query", {"series": "cpu"})["points"] == points + [tail]
     # Independent clients share one writer and cannot lose each other's writes.
     def write_series(i):
-        return server.request("/v1/write", {"series": f"worker-{i}", "points": points})
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{server.port}/v1/write",
+            data=json.dumps({"series": f"worker-{i}", "points": points}).encode(),
+            headers={"Authorization": "Bearer " + TOKEN, "Content-Type": "application/json"},
+        )
+        for attempt in range(5):
+            try:
+                with urllib.request.urlopen(request, timeout=30) as response:
+                    assert response.status == 200, (response.status, response.read())
+                    return json.loads(response.read())
+            except urllib.error.HTTPError as error:
+                with error:
+                    payload = error.read()
+                # Only this documented pre-execution rejection is safe to
+                # retry. Transport failures may have committed the batch.
+                if (error.code != 503 or error.headers.get("Retry-After") != "1"
+                        or json.loads(payload) != {"error": {"code": "busy", "message": "database busy; retry later"}}
+                        or attempt == 4):
+                    raise
+                time.sleep(1)
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
         assert all(result == {"written": 6} for result in pool.map(write_series, range(8)))
     assert server.request("/v1/series")["points"] == 55
