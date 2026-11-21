@@ -63,7 +63,7 @@ export default function App() {
     <>
       <header className="site-head">
         <div className="wrap head-inner">
-          <a className="brand" href="/">
+          <a className="brand" href="/" aria-label="shrunk home">
             <img src="/logo.svg" alt="" width={28} height={28} />
             <span>shrunk</span>
           </a>
@@ -350,7 +350,7 @@ export default function App() {
       <footer>
         <div className="wrap">
           <span>shrunk · a tiny time series database · GPL-3.0</span>
-          <nav>
+          <nav aria-label="Footer">
             <a href="https://github.com/shrunk-db/shrunk">GitHub</a>
             <a href="https://github.com/shrunk-db/shrunk/tree/main/docs">Docs</a>
             <a href="https://github.com/shrunk-db/shrunk/blob/main/LICENSE">License</a>
