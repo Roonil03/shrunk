@@ -81,16 +81,20 @@ export default function App() {
 
       <main>
         <section className="hero">
-          <img
+          <video
             className="hero-sun"
-            src="/solar-131.jpg"
-            alt=""
+            autoPlay
+            loop
+            muted
+            playsInline
+            preload="auto"
             aria-hidden="true"
             width={1024}
             height={1024}
-            fetchPriority="high"
-            decoding="async"
-          />
+          >
+            <source src="/solar-131-av1.mp4" type='video/mp4; codecs="av01.0.08M.08"' />
+            <source src="/solar-131-hevc.mp4" type='video/mp4; codecs="hvc1"' />
+          </video>
           <div className="hero-scrim" aria-hidden="true" />
           <div className="wrap hero-inner">
             <div className="hero-copy">
