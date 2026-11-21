@@ -35,7 +35,7 @@ function readMeasurements(value: unknown): Measurements {
   return { ...data, points: [...data.points].sort((a, b) => a.ts - b.ts) };
 }
 
-function FluxChart({ points }: { points: Point[] }) {
+export function FluxChart({ points }: { points: Point[] }) {
   const titleId = useId();
   const descId = useId();
   const element = useRef<SVGSVGElement>(null);
@@ -62,7 +62,7 @@ function FluxChart({ points }: { points: Point[] }) {
   const y = (value: number) => 22 + (1 - (Math.log10(value) - min) / range) * 164;
   // A missing minute stays a gap instead of implying an observation there.
   const path = points.map((point, index) =>
-    `${index === 0 || point.ts - points[index - 1].ts > 120_000 ? "M" : "L"}${x(point.ts).toFixed(2)},${y(point.value).toFixed(2)}`
+    `${index === 0 || point.ts - points[index - 1].ts > 60_000 ? "M" : "L"}${x(point.ts).toFixed(2)},${y(point.value).toFixed(2)}`
   ).join(" ");
 
   return (
