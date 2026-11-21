@@ -100,7 +100,6 @@ export default function App() {
           <div className="hero-scrim" aria-hidden="true" />
           <div className="wrap hero-inner">
             <div className="hero-copy">
-              <p className="hero-kicker">shrunk · v3 block format · zero dependencies</p>
               <h1>
                 <span className="line">Compress the readings.</span>
                 <span className="line">Skip the rest.</span>
@@ -122,20 +121,11 @@ export default function App() {
           </div>
           <div className="hero-bar">
             <div className="wrap hero-bar-inner">
-              <dl className="facts">
-                <div className="fact">
-                  <dt>Benchmark</dt>
-                  <dd>6.5× smaller file</dd>
-                </div>
-                <div className="fact">
-                  <dt>5-minute query</dt>
-                  <dd>2 of 196 blocks read</dd>
-                </div>
-                <div className="fact">
-                  <dt>Block header</dt>
-                  <dd>58 bytes</dd>
-                </div>
-              </dl>
+              <ul className="facts">
+                <li>6.5× smaller file</li>
+                <li>2 of 196 blocks read</li>
+                <li>58-byte block header</li>
+              </ul>
               <span className="hero-credit">NASA / SDO AIA 131 Å · extreme UV</span>
             </div>
           </div>
