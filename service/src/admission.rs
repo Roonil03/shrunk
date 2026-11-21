@@ -255,7 +255,7 @@ impl Executor {
     where
         F: FnOnce(&mut Store) -> Result<Value, ApiError> + Send + 'static,
     {
-        let waiting = MaintenanceWaiter::new(self.0.clone());
+        let mut waiting = MaintenanceWaiter::new(self.0.clone());
         let mut operation = Some(operation);
         let receiver = loop {
             let notified = self.0.capacity.notified();
@@ -273,8 +273,15 @@ impl Executor {
                         None,
                     );
                     self.push(&mut gate, command);
+                    // Enqueue and release the fairness reservation together:
+                    // HTTP may use any remaining capacity immediately.
+                    gate.maintenance_waiting = false;
+                    waiting.active = false;
                     break receiver;
                 }
+                // Reserve priority only when maintenance actually must wait.
+                gate.maintenance_waiting = true;
+                waiting.active = true;
             }
             notified.await;
         };
@@ -325,27 +332,30 @@ impl Drop for Cancellation {
     }
 }
 
-struct MaintenanceWaiter(Arc<Shared>);
+struct MaintenanceWaiter {
+    shared: Arc<Shared>,
+    active: bool,
+}
 
 impl MaintenanceWaiter {
     fn new(shared: Arc<Shared>) -> Self {
-        shared
-            .gate
-            .lock()
-            .expect("admission mutex")
-            .maintenance_waiting = true;
-        Self(shared)
+        Self {
+            shared,
+            active: false,
+        }
     }
 }
 
 impl Drop for MaintenanceWaiter {
     fn drop(&mut self) {
-        self.0
-            .gate
-            .lock()
-            .expect("admission mutex")
-            .maintenance_waiting = false;
-        self.0.capacity.notify_waiters();
+        if self.active {
+            self.shared
+                .gate
+                .lock()
+                .expect("admission mutex")
+                .maintenance_waiting = false;
+            self.shared.capacity.notify_waiters();
+        }
     }
 }
 
@@ -412,13 +422,12 @@ fn work(shared: &Shared, store: &mut Store) -> Result<(), ApiError> {
                 .state
                 .compare_exchange(PENDING, CANCELLED, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok();
-        let target = if expired {
+        let (target, result) = if expired {
             shared
                 .metrics
                 .queue_expiries
                 .fetch_add(1, Ordering::Relaxed);
-            let _ = command.reply.send(Err(ApiError::busy()));
-            adaptive.target
+            (adaptive.target, Some(Err(ApiError::busy())))
         } else if command
             .state
             .compare_exchange(PENDING, RUNNING, Ordering::AcqRel, Ordering::Acquire)
@@ -443,14 +452,13 @@ fn work(shared: &Shared, store: &mut Store) -> Result<(), ApiError> {
             );
             shared.metrics.completed.fetch_add(1, Ordering::Relaxed);
             shared.metrics.running.store(0, Ordering::Relaxed);
-            let _ = command.reply.send(result);
-            target
+            (target, Some(result))
         } else {
             shared
                 .metrics
                 .pending_cancellations
                 .fetch_add(1, Ordering::Relaxed);
-            adaptive.target
+            (adaptive.target, None)
         };
         {
             let mut gate = shared.gate.lock().expect("admission mutex");
@@ -459,6 +467,11 @@ fn work(shared: &Shared, store: &mut Store) -> Result<(), ApiError> {
             shared.metrics.target.store(target, Ordering::Relaxed);
         }
         shared.capacity.notify_waiters();
+        // A caller receiving its result must see this operation's slot freed,
+        // including when the adaptive target permits only one operation.
+        if let Some(result) = result {
+            let _ = command.reply.send(result);
+        }
     }
     // Admission is closed, policy producers have been stopped, and every
     // accepted command (even one whose HTTP client disappeared) is drained.
@@ -471,8 +484,10 @@ mod tests {
     use super::*;
     use crate::test_support::TestStore;
     use shrunk::{Point, Query};
+    use std::future::Future;
     use std::sync::atomic::AtomicBool;
     use std::sync::mpsc;
+    use std::task::{Context, Poll, Wake, Waker};
 
     async fn blocked(
         executor: &Executor,
@@ -602,6 +617,130 @@ mod tests {
         release.send(()).unwrap();
         assert_eq!(task.await.unwrap().unwrap(), json!("finished"));
         worker.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn completed_reply_wakes_only_after_its_capacity_is_released() {
+        struct ObserveCapacity {
+            shared: Arc<Shared>,
+            observed: mpsc::Sender<usize>,
+        }
+
+        impl Wake for ObserveCapacity {
+            fn wake(self: Arc<Self>) {
+                let outstanding = self.shared.gate.lock().unwrap().outstanding;
+                self.observed.send(outstanding).unwrap();
+            }
+        }
+
+        let database = TestStore::new();
+        let (executor, worker) = database.executor(1);
+        let (observed, observation) = mpsc::channel();
+        let waker = Waker::from(Arc::new(ObserveCapacity {
+            shared: executor.0.clone(),
+            observed,
+        }));
+        let (command, mut receiver) = command(|_| Ok(Value::Null), Instant::now(), None);
+        // Register a synchronous observer at the exact reply notification,
+        // before the runtime can mask ordering by delaying the next request.
+        assert!(matches!(
+            std::future::Future::poll(
+                std::pin::Pin::new(&mut receiver),
+                &mut Context::from_waker(&waker)
+            ),
+            Poll::Pending
+        ));
+        executor.push(&mut executor.0.gate.lock().unwrap(), command);
+        let outstanding = observation.recv_timeout(Duration::from_secs(5)).unwrap();
+        receiver.await.unwrap().unwrap();
+        let next = executor.run(|_| Ok(json!("next"))).await;
+        worker.finish().await.unwrap();
+        assert_eq!(outstanding, 0);
+        assert_eq!(next.unwrap(), json!("next"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn maintenance_with_spare_capacity_does_not_reject_http() {
+        let database = TestStore::new();
+        let (executor, worker) = database.executor(8);
+        let maintenance = tokio::spawn({
+            let executor = executor.clone();
+            async move {
+                for _ in 0..2000 {
+                    executor.maintenance(|_| Ok(Value::Null)).await?;
+                }
+                Ok::<_, ApiError>(())
+            }
+        });
+        // At most two commands are outstanding, so neither the capacity cap
+        // nor maintenance fairness should ever reject these HTTP operations.
+        let mut result = Ok(Value::Null);
+        for _ in 0..2000 {
+            result = executor.run(|_| Ok(Value::Null)).await;
+            if result.is_err() {
+                break;
+            }
+        }
+        maintenance.await.unwrap().unwrap();
+        worker.finish().await.unwrap();
+        result.unwrap();
+        assert_eq!(executor.status()["admission_rejections"], 0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_waiting_maintenance_releases_fairness_and_wakes_waiters() {
+        let database = TestStore::new();
+        let (executor, worker) = database.executor(1);
+        let (release, first) = blocked(&executor).await;
+        let mut maintenance = Box::pin(executor.maintenance(|_| panic!("cancelled policy ran")));
+        assert!(matches!(
+            std::future::poll_fn(|cx| Poll::Ready(maintenance.as_mut().poll(cx))).await,
+            Poll::Pending
+        ));
+        assert!(executor.0.gate.lock().unwrap().maintenance_waiting);
+        let notified = executor.0.capacity.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        drop(maintenance);
+        assert!(!executor.0.gate.lock().unwrap().maintenance_waiting);
+        tokio::time::timeout(Duration::from_secs(5), notified)
+            .await
+            .unwrap();
+        release.send(()).unwrap();
+        first.await.unwrap().unwrap();
+        executor.run(|_| Ok(Value::Null)).await.unwrap();
+        worker.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn accepted_maintenance_survives_cancellation_and_allows_spare_capacity() {
+        let database = TestStore::new();
+        let (executor, worker) = database.executor(3);
+        let (release, first) = blocked(&executor).await;
+        let executed = Arc::new(AtomicBool::new(false));
+        let mut maintenance = Box::pin(executor.maintenance({
+            let executed = executed.clone();
+            move |_| {
+                executed.store(true, Ordering::Relaxed);
+                Ok(Value::Null)
+            }
+        }));
+        assert!(matches!(
+            std::future::poll_fn(|cx| Poll::Ready(maintenance.as_mut().poll(cx))).await,
+            Poll::Pending
+        ));
+        assert!(!executor.0.gate.lock().unwrap().maintenance_waiting);
+        drop(maintenance);
+        let next = tokio::spawn({
+            let executor = executor.clone();
+            async move { executor.run(|_| Ok(Value::Null)).await }
+        });
+        queued(&executor, 2).await;
+        release.send(()).unwrap();
+        first.await.unwrap().unwrap();
+        next.await.unwrap().unwrap();
+        worker.finish().await.unwrap();
+        assert!(executed.load(Ordering::Relaxed));
     }
 
     #[tokio::test]
