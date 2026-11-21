@@ -1,13 +1,8 @@
-"use client";
-
-import { useEffect, useRef, useState } from "react";
-import { useInView, useMotionValue, useReducedMotion, useSpring } from "framer-motion";
+import { useEffect, useRef } from "react";
 import { cn } from "@/lib/utils";
 
 interface StatsCounterProps {
   value: number;
-  duration?: number;
-  prefix?: string;
   suffix?: string;
   decimals?: number;
   className?: string;
@@ -15,47 +10,65 @@ interface StatsCounterProps {
 
 export default function StatsCounter({
   value,
-  duration = 1.5,
-  prefix = "",
   suffix = "",
   decimals = 0,
   className,
 }: StatsCounterProps) {
   const ref = useRef<HTMLSpanElement>(null);
-  const reduceMotion = useReducedMotion();
-  const isInView = useInView(ref, { once: true, margin: "-100px" });
-  const motionValue = useMotionValue(0);
-  const springValue = useSpring(motionValue, { duration: duration * 1000, bounce: 0 });
-  const [displayValue, setDisplayValue] = useState(0);
+  const label = value.toFixed(decimals) + suffix;
 
   useEffect(() => {
-    if (isInView) {
-      motionValue.set(value);
+    const el = ref.current;
+    if (!el) return;
+
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      el.textContent = label;
+      return;
     }
-  }, [isInView, value, motionValue]);
 
-  useEffect(() => {
-    const unsubscribe = springValue.on("change", (latest) => {
-      setDisplayValue(latest);
-    });
-    return unsubscribe;
-  }, [springValue]);
+    let raf = 0;
+    let started = 0;
+    const duration = 1200;
+    const write = (n: number) => {
+      el.textContent = n.toFixed(decimals) + suffix;
+    };
+    write(0);
 
-  if (reduceMotion) {
-    return (
-      <span ref={ref} className={cn("tabular-nums", className)}>
-        {prefix}
-        {value.toFixed(decimals)}
-        {suffix}
-      </span>
+    const tick = (t: number) => {
+      if (!started) started = t;
+      const progress = Math.min((t - started) / duration, 1);
+      const eased = 1 - Math.pow(1 - progress, 3);
+      write(value * eased);
+      if (progress < 1) raf = requestAnimationFrame(tick);
+    };
+
+    const io = new IntersectionObserver(
+      (entries) => {
+        if (!entries.some((entry) => entry.isIntersecting)) return;
+        io.disconnect();
+        raf = requestAnimationFrame(tick);
+      },
+      { rootMargin: "-80px" }
     );
-  }
+    io.observe(el);
+
+    return () => {
+      io.disconnect();
+      cancelAnimationFrame(raf);
+    };
+  }, [value, decimals, suffix, label]);
 
   return (
-    <span ref={ref} className={cn("tabular-nums", className)}>
-      {prefix}
-      {displayValue.toFixed(decimals)}
-      {suffix}
+    <span className={cn("relative inline-block", className)}>
+      <span className="sr-only">{label}</span>
+      <span aria-hidden="true" className="invisible">
+        {label}
+      </span>
+      <span
+        aria-hidden="true"
+        ref={ref}
+        className="absolute left-0 top-0 whitespace-nowrap"
+      />
     </span>
   );
 }

@@ -1,36 +1,77 @@
-"use client";
-
-import * as React from "react";
-import { Check, Copy } from "lucide-react";
+import { useEffect, useState } from "react";
 import { cn } from "@/lib/utils";
 
-export function CopyButton({ code, className }: { code: string; className?: string }) {
-  const [hasCopied, setHasCopied] = React.useState(false);
+function CopyIcon() {
+  return (
+    <svg
+      width="14"
+      height="14"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <rect x="9" y="9" width="12" height="12" rx="2" />
+      <path d="M5 15V5a2 2 0 0 1 2-2h10" />
+    </svg>
+  );
+}
 
-  React.useEffect(() => {
-    if (!hasCopied) return;
-    const timeout = setTimeout(() => {
-      setHasCopied(false);
-    }, 2000);
+function CheckIcon() {
+  return (
+    <svg
+      width="14"
+      height="14"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M20 6 9 17l-5-5" />
+    </svg>
+  );
+}
+
+export function CopyButton({
+  code,
+  className,
+}: {
+  code: string;
+  className?: string;
+}) {
+  const [copied, setCopied] = useState(false);
+
+  useEffect(() => {
+    if (!copied) return;
+    const timeout = setTimeout(() => setCopied(false), 2000);
     return () => clearTimeout(timeout);
-  }, [hasCopied]);
+  }, [copied]);
 
   return (
     <button
+      type="button"
       className={cn(
-        "relative z-10 flex h-7 w-7 items-center justify-center rounded-md border bg-zinc-900 border-zinc-800 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-50 transition-colors",
+        "relative z-10 flex h-7 w-7 items-center justify-center rounded-md border border-zinc-800 bg-zinc-900 text-zinc-400 transition-colors hover:bg-zinc-800 hover:text-zinc-50",
         className
       )}
       onClick={() => {
         navigator.clipboard.writeText(code);
-        setHasCopied(true);
+        setCopied(true);
       }}
     >
       <span className="sr-only">Copy</span>
-      {hasCopied ? (
-        <Check className="h-3.5 w-3.5 text-emerald-400" />
+      {copied ? (
+        <span className="text-emerald-400">
+          <CheckIcon />
+        </span>
       ) : (
-        <Copy className="h-3.5 w-3.5" />
+        <CopyIcon />
       )}
     </button>
   );
