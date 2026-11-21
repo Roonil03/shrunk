@@ -12,8 +12,13 @@ export default async function handler(req, res) {
     const archive = createArchive();
     if (!archive) throw new Error('Archive unavailable');
     const snapshot = await liveSnapshot(archive, encodeBatch);
-    // Share successful reads at the edge and let each browser poll for fresh data.
-    if (snapshot.count) res.setHeader('Vercel-CDN-Cache-Control', 'public, s-maxage=30');
+    const manualRefresh = Boolean(req.query?.refresh) || String(req.url || '').includes('refresh=');
+    // Share background polls at the edge, but let explicit Refresh clicks bypass edge cache.
+    if (manualRefresh) {
+      res.setHeader('Vercel-CDN-Cache-Control', 'no-store');
+    } else if (snapshot.count) {
+      res.setHeader('Vercel-CDN-Cache-Control', 'public, s-maxage=30');
+    }
     return res.status(200).json(snapshot);
   } catch {
     res.setHeader('Retry-After', '60');

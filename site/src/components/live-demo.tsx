@@ -12,13 +12,20 @@ type Measurements = {
 };
 
 const integer = new Intl.NumberFormat("en-US");
-const date = new Intl.DateTimeFormat("en-GB", {
-  timeZone: "UTC", day: "2-digit", month: "short", year: "numeric",
+const date = new Intl.DateTimeFormat(undefined, {
+  day: "2-digit", month: "short", year: "numeric",
+  hour: "2-digit", minute: "2-digit", second: "2-digit",
+  hourCycle: "h23", timeZoneName: "short",
+});
+const clock = new Intl.DateTimeFormat(undefined, {
+  hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+});
+const clockWithSeconds = new Intl.DateTimeFormat(undefined, {
   hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23",
 });
-const clock = new Intl.DateTimeFormat("en-GB", {
-  timeZone: "UTC", hour: "2-digit", minute: "2-digit", hourCycle: "h23",
-});
+const localZone = new Intl.DateTimeFormat(undefined, { timeZoneName: "short" })
+  .formatToParts(new Date())
+  .find(part => part.type === "timeZoneName")?.value ?? "";
 
 function readMeasurements(value: unknown): Measurements {
   if (!value || typeof value !== "object") throw new Error("Invalid measurement response");
@@ -69,7 +76,7 @@ export function FluxChart({ points }: { points: Point[] }) {
     <svg ref={element} className="flux-chart" viewBox={`0 0 ${width} 224`} role="img" aria-labelledby={`${titleId} ${descId}`}>
       <title id={titleId}>Observed GOES solar X-ray flux</title>
       <desc id={descId}>
-        {points.length} observations, from {date.format(first.ts)} UTC to {date.format(last.ts)} UTC.
+        {points.length} observations, from {date.format(first.ts)} to {date.format(last.ts)}.
         Flux ranges from {(10 ** low).toExponential(2)} to {(10 ** high).toExponential(2)} watts per square metre.
         The vertical scale is logarithmic. Gaps indicate missing observations.
       </desc>
@@ -83,7 +90,7 @@ export function FluxChart({ points }: { points: Point[] }) {
       <path className="flux-line" d={path} />
       <circle className="flux-point" cx={x(last.ts)} cy={y(last.value)} r="3" />
       <text x="62" y="213">{clock.format(first.ts)}</text>
-      <text x={right} y="213" textAnchor="end">{clock.format(last.ts)} UTC</text>
+      <text x={right} y="213" textAnchor="end">{clock.format(last.ts)}{localZone ? ` ${localZone}` : ""}</text>
     </svg>
   );
 }
@@ -92,24 +99,45 @@ export default function LiveDemo() {
   const [data, setData] = useState<Measurements | null>(null);
   const [failed, setFailed] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [refreshed, setRefreshed] = useState(false);
   const [attempt, setAttempt] = useState(0);
   const [now, setNow] = useState(Date.now());
+  const [checkedAt, setCheckedAt] = useState<number | null>(null);
 
   useEffect(() => {
     let disposed = false;
     let timer: ReturnType<typeof setTimeout>;
+    let feedbackTimer: ReturnType<typeof setTimeout>;
     let controller: AbortController;
+    let manual = attempt > 0;
+
     const poll = async () => {
+      const isManual = manual;
+      manual = false;
+      const started = Date.now();
       controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 15_000);
       setLoading(true);
+      setRefreshed(false);
       try {
-        const response = await fetch("/api/demo", { signal: controller.signal, cache: "no-store" });
+        const endpoint = isManual ? `/api/demo?refresh=${started}` : "/api/demo";
+        const response = await fetch(endpoint, { signal: controller.signal, cache: "no-store" });
         if (!response.ok) throw new Error("Measurements unavailable");
         const result = readMeasurements(await response.json());
+        if (isManual) {
+          const elapsed = Date.now() - started;
+          if (elapsed < 350) await new Promise(resolve => setTimeout(resolve, 350 - elapsed));
+        }
         if (!disposed) {
           setData(result);
           setFailed(false);
+          setCheckedAt(Date.now());
+          if (isManual) {
+            setRefreshed(true);
+            feedbackTimer = setTimeout(() => {
+              if (!disposed) setRefreshed(false);
+            }, 1800);
+          }
         }
       } catch {
         if (!disposed) setFailed(true);
@@ -126,6 +154,7 @@ export default function LiveDemo() {
     return () => {
       disposed = true;
       clearTimeout(timer);
+      clearTimeout(feedbackTimer);
       controller?.abort();
     };
   }, [attempt]);
@@ -155,7 +184,7 @@ export default function LiveDemo() {
               <i aria-hidden="true" />{status}
             </span>
             <button className="live-refresh" type="button" disabled={loading} onClick={() => setAttempt(value => value + 1)}>
-              {loading ? "Checking…" : "Refresh"}
+              {loading ? "Checking…" : refreshed ? "Updated" : "Refresh"}
             </button>
           </div>
 
@@ -165,7 +194,7 @@ export default function LiveDemo() {
                 <span className="live-label">Latest X-ray flux</span>
                 <p className="live-value">{latest.value.toExponential(3)} <span>W/m²</span></p>
               </div>
-              <p className="live-observed">Observed <time dateTime={new Date(latest.ts).toISOString()}>{date.format(latest.ts)} UTC</time></p>
+              <p className="live-observed">Observed <time dateTime={new Date(latest.ts).toISOString()}>{date.format(latest.ts)}</time></p>
             </div>
             {stale && <p className="live-notice">The feed is delayed. Showing the latest available observations; refreshes continue automatically.</p>}
             <figure className="live-figure">
@@ -191,7 +220,14 @@ export default function LiveDemo() {
 
           <div className="live-panel-foot">
             <a href="https://www.swpc.noaa.gov/products/goes-x-ray-flux">Source: NOAA SWPC / GOES</a>
-            <span>{data?.updatedAt ? <>Archive updated <time dateTime={new Date(data.updatedAt).toISOString()}>{date.format(data.updatedAt)} UTC</time></> : "Observation timestamps are UTC"}</span>
+            <span>
+              {data?.updatedAt ? (
+                <>
+                  Archive updated <time dateTime={new Date(data.updatedAt).toISOString()}>{date.format(data.updatedAt)}</time>
+                  {checkedAt ? <> · Checked {clockWithSeconds.format(checkedAt)}</> : null}
+                </>
+              ) : "Observation timestamps are in local time"}
+            </span>
           </div>
         </div>
         <p className="note">Raw size counts timestamps and values. Stored size includes block overhead. This demo selects Gorilla or raw encoding for each block. Ratios vary with the observed signal.</p>
