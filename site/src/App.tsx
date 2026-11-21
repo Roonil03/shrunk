@@ -1,16 +1,13 @@
 import { useEffect, useState } from "react";
-import { SpotlightNavbar, type NavItem } from "@/components/ui/spotlight-navbar";
-import TextAnimation from "@/components/ui/stagger-text";
-import StatsCounter from "@/components/ui/stats-counter";
 import { CopyButton } from "@/components/ui/copy-button";
 import LiveDemo from "@/components/live-demo";
 
-const NAV: NavItem[] = [
-  { label: "Block", href: "#label" },
-  { label: "Queries", href: "#queries" },
-  { label: "Codecs", href: "#codecs" },
-  { label: "Run", href: "#build" },
-  { label: "GitHub", href: "https://github.com/shrunk-db/shrunk" },
+const NAV = [
+  { id: "live", label: "Live", href: "#live" },
+  { id: "label", label: "Blocks", href: "#label" },
+  { id: "queries", label: "Queries", href: "#queries" },
+  { id: "codecs", label: "Codecs", href: "#codecs" },
+  { id: "build", label: "Run", href: "#build" },
 ];
 
 const TERMINAL = `git clone https://github.com/shrunk-db/shrunk.git
@@ -18,19 +15,11 @@ cd shrunk
 cargo build --release
 ./target/release/shrunk demo`;
 
-function onNav(item: NavItem) {
-  if (item.href.startsWith("http")) {
-    window.open(item.href, "_blank", "noopener,noreferrer");
-    return;
-  }
-  document.querySelector(item.href)?.scrollIntoView({ behavior: "smooth" });
-}
-
 export default function App() {
   const [active, setActive] = useState(0);
 
   useEffect(() => {
-    const ids = ["label", "queries", "codecs", "build"];
+    const ids = NAV.map((item) => item.id);
     const update = () => {
       let next = 0;
       for (let i = 0; i < ids.length; i++) {
@@ -65,28 +54,54 @@ export default function App() {
       <header className="site-head">
         <div className="wrap head-inner">
           <a className="brand" href="/" aria-label="shrunk home">
-            <img src="/logo.svg" alt="" width={28} height={28} />
+            <img src="/logo.svg" alt="" width={26} height={26} />
             <span>shrunk</span>
           </a>
-          <SpotlightNavbar items={NAV} activeIndex={active} onItemClick={onNav} className="nav-spotlight" />
+          <nav className="site-nav" aria-label="Primary">
+            {NAV.map((item, idx) => (
+              <a
+                key={item.id}
+                href={item.href}
+                className={active === idx ? "is-active" : undefined}
+              >
+                {item.label}
+              </a>
+            ))}
+            <a
+              className="site-nav-gh"
+              href="https://github.com/shrunk-db/shrunk"
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              GitHub ↗
+            </a>
+          </nav>
         </div>
       </header>
 
       <main>
         <section className="hero">
-          <div className="wrap">
+          <img
+            className="hero-sun"
+            src="/solar-131.jpg"
+            alt=""
+            aria-hidden="true"
+            width={1024}
+            height={1024}
+            fetchPriority="high"
+            decoding="async"
+          />
+          <div className="hero-scrim" aria-hidden="true" />
+          <div className="wrap hero-inner">
             <div className="hero-copy">
+              <p className="hero-kicker">shrunk · v3 block format · zero dependencies</p>
               <h1>
-                <span className="line">
-                  <TextAnimation delay={0.05}>Compress the readings.</TextAnimation>
-                </span>
-                <span className="line grad">Skip the rest.</span>
+                <span className="line">Compress the readings.</span>
+                <span className="line">Skip the rest.</span>
               </h1>
               <p className="lede">
-                shrunk is a tiny time series database. It puts readings into blocks of
-                1,024, compresses each block with the best codec, and writes a 58-byte
-                summary next to it. A query reads the summary before it touches the
-                block.
+                Every 1,024 readings become one sealed, compressed block paired with a
+                58-byte label. Queries inspect the label before decoding a single byte.
               </p>
               <div className="actions">
                 <a className="btn btn-primary" href="https://github.com/shrunk-db/shrunk">
@@ -95,62 +110,27 @@ export default function App() {
                     <path d="M3 8h9M8.5 3.5 13 8l-4.5 4.5" stroke="currentColor" strokeWidth="1.6" strokeLinecap="square" />
                   </svg>
                 </a>
-                <a className="btn btn-ghost" href="#build">Build it</a>
+                <a className="btn btn-ghost" href="#live">Live NOAA X-ray feed ↓</a>
               </div>
+            </div>
+          </div>
+          <div className="hero-bar">
+            <div className="wrap hero-bar-inner">
               <dl className="facts">
                 <div className="fact">
                   <dt>Benchmark</dt>
-                  <dd>
-                    <StatsCounter value={6.5} decimals={1} suffix="x" className="fact-num" /> smaller file
-                  </dd>
+                  <dd>6.5× smaller file</dd>
                 </div>
                 <div className="fact">
                   <dt>5-minute query</dt>
-                  <dd>
-                    <StatsCounter value={2} suffix=" of 196" className="fact-num" /> blocks read
-                  </dd>
+                  <dd>2 of 196 blocks read</dd>
                 </div>
                 <div className="fact">
                   <dt>Block header</dt>
-                  <dd>
-                    <StatsCounter value={58} suffix=" bytes" className="fact-num" />
-                  </dd>
+                  <dd>58 bytes</dd>
                 </div>
               </dl>
-            </div>
-
-            <div>
-              <aside className="blockcard" aria-label="One block and its label">
-                <div className="blockcard-head">
-                  <span className="name">series/temperature · block 42</span>
-                  <span className="seal"><i />sealed</span>
-                </div>
-                <dl className="fields">
-                  <div><dt>t_min</dt><dd>14:00:00</dd></div>
-                  <div><dt>t_max</dt><dd>16:49:10</dd></div>
-                  <div><dt>count</dt><dd>1,024</dd></div>
-                  <div><dt>v_min</dt><dd>18.2</dd></div>
-                  <div><dt>v_max</dt><dd>24.9</dd></div>
-                  <div><dt>sum</dt><dd>22,431.7</dd></div>
-                  <div><dt>has_nan</dt><dd>false</dd></div>
-                </dl>
-                <div className="blockcard-foot">
-                  <span>payload: gorilla-rle</span>
-                  <span>still compressed</span>
-                </div>
-              </aside>
-
-              <div className="ruler" aria-label="File size comparison from the demo">
-                <div className="ruler-row">
-                  <div className="ruler-label"><span>raw</span><b>9.2 MiB</b></div>
-                  <div className="track raw"><span style={{ width: "100%", animationDelay: "420ms" }} /></div>
-                </div>
-                <div className="ruler-row">
-                  <div className="ruler-label"><span>stored by shrunk</span><b>1.4 MiB</b></div>
-                  <div className="track stored"><span style={{ width: "15.2%", animationDelay: "560ms" }} /></div>
-                </div>
-                <p className="ruler-note">600,000 synthetic readings, three series, from <span style={{ color: "#AAB6C3" }}>shrunk demo</span>.</p>
-              </div>
+              <span className="hero-credit">NASA / SDO AIA 131 Å · extreme UV</span>
             </div>
           </div>
         </section>
