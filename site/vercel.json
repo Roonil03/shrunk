@@ -1,6 +1,8 @@
 {
   "buildCommand": "npm run build",
   "outputDirectory": "dist",
+  "functions": { "api/demo.js": { "maxDuration": 60 } },
+  "crons": [{ "path": "/api/demo", "schedule": "17 4 * * *" }],
   "headers": [
     {
       "source": "/(.*)",
