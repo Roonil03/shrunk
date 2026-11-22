@@ -159,6 +159,33 @@ Timings vary by a few percent between runs; record the command and the hardware
 when you publish results. Measured results and the research verdicts behind
 each codec are in [COMPRESSION.md](COMPRESSION.md).
 
+## Real sensor benchmark
+
+The fixture contains all 8,091 available hourly PM2.5 readings (µg/m³) from the
+US Embassy in Beijing in 2010. Missing hours are omitted and Beijing local time
+(UTC+8) is converted to Unix milliseconds. Adapted from Song Chen's
+[Beijing PM2.5 dataset](https://doi.org/10.24432/C5JS49) under
+[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
+
+Measure full snapshot bytes per reading and inspect the blocks decoded for
+June 1, Beijing time. Run from the repository root:
+
+```sh
+cargo build --release --locked
+(
+  set -eu
+  dir=$(mktemp -d)
+  trap 'rm -rf "$dir"' EXIT
+  gzip -dc tests/fixtures/beijing-pm25-2010.csv.gz > "$dir/air.csv"
+  target/release/shrunk ingest "$dir/air.db" --series pm25 --file "$dir/air.csv"
+  awk -v bytes="$(wc -c < "$dir/air.db")" 'END {printf "%.2f bytes/reading\n", bytes / NR}' "$dir/air.csv"
+  target/release/shrunk query "$dir/air.db" --series pm25 --from 1275321600000 --to 1275407999999 --explain > /dev/null
+)
+```
+
+With default settings the snapshot occupies 11,402 bytes (1.41 bytes/reading).
+The query decodes one of eight blocks and returns 21 readings.
+
 ## See also
 
 - [Architecture.md](Architecture.md): how the codecs and query path work.
