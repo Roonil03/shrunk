@@ -479,24 +479,25 @@ fn encode_ts_rle(points: &[Point], out: &mut Vec<u8>) {
         let mut prev_delta = points[1].ts.wrapping_sub(points[0].ts);
         put_uvarint(out, zigzag(prev_delta));
 
-        let mut runs: Vec<(i64, u64)> = Vec::new();
+        let mut runs = Vec::new();
+        let mut last_dod = 0;
+        let mut run_len = 0;
         for p in points.iter().skip(2) {
             let delta = p.ts.wrapping_sub(prev_ts);
             let dod = delta.wrapping_sub(prev_delta);
-            if let Some((last_dod, len)) = runs.last_mut() {
-                if *last_dod == dod {
-                    *len += 1;
-                } else {
-                    runs.push((dod, 1));
-                }
-            } else {
-                runs.push((dod, 1));
+            if dod != last_dod && run_len != 0 {
+                runs.push((last_dod, run_len));
+                run_len = 0;
             }
+            last_dod = dod;
+            run_len += 1;
             prev_delta = delta;
             prev_ts = p.ts;
         }
-        put_uvarint(out, runs.len() as u64);
-        for (dod, len) in runs {
+        // A single run needs no heap storage, including fixed-frequency timestamps.
+        let last = (run_len != 0).then_some((last_dod, run_len));
+        put_uvarint(out, runs.len() as u64 + u64::from(last.is_some()));
+        for (dod, len) in runs.into_iter().chain(last) {
             put_uvarint(out, zigzag(dod));
             put_uvarint(out, len);
         }
@@ -1151,6 +1152,25 @@ mod tests {
             }
         }
         cost
+    }
+
+    #[test]
+    fn timestamp_run_bytes_at_boundaries() {
+        for (timestamps, expected) in [
+            (vec![0], vec![0]),
+            (vec![0, 1], vec![0, 2, 0]),
+            ((0..130).collect(), vec![0, 2, 1, 0, 128, 1]),
+            (vec![0, 1, 3, 6, 11], vec![0, 2, 2, 2, 2, 4, 1]),
+            (vec![0, 1, 2, 3, 5], vec![0, 2, 2, 0, 2, 2, 1]),
+        ] {
+            let points: Vec<_> = timestamps
+                .into_iter()
+                .map(|ts| Point::new(ts, 0.0))
+                .collect();
+            let mut bytes = Vec::new();
+            encode_ts_rle(&points, &mut bytes);
+            assert_eq!(bytes, expected);
+        }
     }
 
     #[test]
