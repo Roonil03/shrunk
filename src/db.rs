@@ -308,6 +308,16 @@ impl Series {
         }
     }
 
+    /// Pending writes are strictly ordered by timestamp, just like the sealed blocks.
+    fn pending_from(&self, start: i64) -> &[Point] {
+        if self.pending.first().is_some_and(|p| p.ts < start) {
+            let first = self.pending.partition_point(|p| p.ts < start);
+            &self.pending[first..]
+        } else {
+            &self.pending
+        }
+    }
+
     fn flush(&mut self, block_size: usize) -> Result<()> {
         if self.pending.is_empty() {
             return Ok(());
@@ -680,10 +690,7 @@ impl Db {
             }
 
             if out.len() < limit {
-                for p in &s.pending {
-                    if p.ts < q.start {
-                        continue;
-                    }
+                for p in s.pending_from(q.start) {
                     if p.ts > q.end {
                         break;
                     }
@@ -837,10 +844,7 @@ impl Db {
                 }
             }
 
-            for p in &s.pending {
-                if p.ts < start {
-                    continue;
-                }
+            for p in s.pending_from(start) {
                 if p.ts > end {
                     break;
                 }
@@ -909,11 +913,11 @@ impl Db {
         else {
             return Ok(None);
         };
-        for p in &s.pending {
+        for p in s.pending_from(start) {
             if p.ts > end {
                 break;
             }
-            if p.ts >= start && pred.matches(p.value) {
+            if pred.matches(p.value) {
                 fold_value(*p);
             }
         }
@@ -2270,6 +2274,24 @@ mod tests {
             db.query(&Query::new("nope", 0, 10)),
             Err(Error::UnknownSeries(_))
         ));
+    }
+
+    #[test]
+    fn pending_range_includes_exact_start_and_handles_past_end() {
+        let mut db = Db::new();
+        let points = [Point::new(-2, 1.0), Point::new(0, 2.0), Point::new(3, 3.0)];
+        db.write_many("s", &points).unwrap();
+        for (start, expected) in [(0, &points[1..]), (1, &points[2..]), (4, &points[3..])] {
+            let query = db.query(&Query::new("s", start, i64::MAX)).unwrap();
+            assert_eq!(query.points, expected);
+            let count = db
+                .aggregate("s", start, i64::MAX, Agg::Count, None)
+                .unwrap();
+            assert_eq!(
+                count.value,
+                (!expected.is_empty()).then_some(expected.len() as f64)
+            );
+        }
     }
 
     #[test]
