@@ -91,6 +91,17 @@ impl<'a> BitReader<'a> {
     #[inline]
     pub fn read_bits(&mut self, n: u32) -> u64 {
         debug_assert!(n <= 64);
+        let offset = (self.bit % 8) as u32;
+        if n >= 8 && n <= 64 - offset {
+            if let Some(word) = self
+                .buf
+                .get(self.bit / 8..)
+                .and_then(|tail| tail.first_chunk::<8>())
+            {
+                self.bit += n as usize;
+                return (u64::from_be_bytes(*word) << offset) >> (64 - n);
+            }
+        }
         let mut v = 0u64;
         for _ in 0..n {
             v = (v << 1) | self.read_bit() as u64;
@@ -126,6 +137,27 @@ impl<'a> BitReader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_fields_match_individual_bits() {
+        let data: Vec<_> = (0..20u8).map(|i| i.wrapping_mul(79) ^ 171).collect();
+        for len in 0..=data.len() {
+            for start in 0..=len * 8 + 1 {
+                for width in 0..=64 {
+                    let mut field = BitReader::new(&data[..len]);
+                    let mut bits = BitReader::new(&data[..len]);
+                    for _ in 0..start {
+                        field.read_bit();
+                        bits.read_bit();
+                    }
+                    let expected = (0..width).fold(0, |v, _| (v << 1) | u64::from(bits.read_bit()));
+                    assert_eq!(field.read_bits(width), expected);
+                    assert_eq!(field.bits_consumed(), bits.bits_consumed());
+                    assert_eq!(field.overrun(), bits.overrun());
+                }
+            }
+        }
+    }
 
     #[test]
     fn roundtrip_bits() {
