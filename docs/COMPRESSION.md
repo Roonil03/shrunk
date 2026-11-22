@@ -256,8 +256,8 @@ the default write path. No lossy codec is selected unless explicitly requested.
 
 - Ingest is slower on non-predictable data because the predictor gate encodes a
   128-point sample. CPU ingest went from about 175 ms to 191 ms at 1M points.
-- The predictor allocates two 4096-entry tables per encoded/decoded block. This
-  is a future optimization; a reusable scratch buffer would remove it.
+- The predictor reuses two 4096-entry tables on each thread that runs the codec.
+  Every block starts with cleared tables.
 - A checkpoint still rewrites the whole snapshot. The WAL avoids that cost
   between checkpoints, but there is no incremental compaction yet.
 - The WAL has one writer and no group commit. Each batch is fsynced

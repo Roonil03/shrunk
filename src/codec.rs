@@ -14,6 +14,8 @@
 //! wins. The block header keeps `t_min/t_max`, `v_min/v_max`, a sum, and a NaN
 //! flag so queries can skip blocks without decoding them.
 
+use std::cell::RefCell;
+
 use crate::bits::{BitReader, BitWriter};
 use crate::Point;
 
@@ -143,7 +145,9 @@ impl Codec {
             Codec::Rle => rle_decode(bytes, count),
             Codec::GorillaRle => gorilla_rle_decode(bytes, count),
             Codec::Dolphin => dolphin_decode(bytes, count),
-            Codec::Predictor => predictor_decode(bytes, count),
+            Codec::Predictor => {
+                with_predictor_tables(|fcm, dfcm| predictor_decode(bytes, count, fcm, dfcm))
+            }
         }
     }
 }
@@ -798,7 +802,22 @@ pub(crate) fn predictor_is_promising(points: &[Point]) -> bool {
     predictor_encode(sample).len() < gorilla_rle_encode_greedy(sample).len()
 }
 
+fn with_predictor_tables<T>(run: impl FnOnce(&mut [u64], &mut [u64]) -> T) -> T {
+    thread_local! {
+        static TABLES: RefCell<Vec<u64>> = RefCell::new(vec![0; 2 * PREDICTOR_TABLE_SIZE]);
+    }
+    TABLES.with_borrow_mut(|tables| {
+        tables.fill(0);
+        let (fcm, dfcm) = tables.split_at_mut(PREDICTOR_TABLE_SIZE);
+        run(fcm, dfcm)
+    })
+}
+
 fn predictor_encode(points: &[Point]) -> Vec<u8> {
+    with_predictor_tables(|fcm, dfcm| predictor_encode_block(points, fcm, dfcm))
+}
+
+fn predictor_encode_block(points: &[Point], fcm: &mut [u64], dfcm: &mut [u64]) -> Vec<u8> {
     let mut out = Vec::new();
     encode_ts_rle(points, &mut out);
 
@@ -806,8 +825,6 @@ fn predictor_encode(points: &[Point]) -> Vec<u8> {
     let mut prev = points[0].value.to_bits();
     w.write_bits(prev, 64);
 
-    let mut fcm = vec![0u64; PREDICTOR_TABLE_SIZE];
-    let mut dfcm = vec![0u64; PREDICTOR_TABLE_SIZE];
     let mut last_delta = 0u64;
     let mut window: Option<(u32, u32)> = None;
 
@@ -840,7 +857,12 @@ fn predictor_encode(points: &[Point]) -> Vec<u8> {
     out
 }
 
-fn predictor_decode(bytes: &[u8], count: usize) -> Result<Vec<Point>, String> {
+fn predictor_decode(
+    bytes: &[u8],
+    count: usize,
+    fcm: &mut [u64],
+    dfcm: &mut [u64],
+) -> Result<Vec<Point>, String> {
     let mut pos = 0usize;
     let timestamps = decode_ts_rle(bytes, &mut pos, count, "predictor")?;
     if pos >= bytes.len() {
@@ -851,8 +873,6 @@ fn predictor_decode(bytes: &[u8], count: usize) -> Result<Vec<Point>, String> {
     let mut values = value_vec(count, "predictor")?;
     values.push(f64::from_bits(prev));
 
-    let mut fcm = vec![0u64; PREDICTOR_TABLE_SIZE];
-    let mut dfcm = vec![0u64; PREDICTOR_TABLE_SIZE];
     let mut last_delta = 0u64;
     let mut window: Option<(u32, u32)> = None;
 
@@ -1638,6 +1658,9 @@ mod tests {
             "predictor should win big"
         );
         let back = Codec::Predictor.decode(&predictor, pts.len()).unwrap();
+        // Reusing the decoder's tables must reproduce the original wire bytes.
+        assert_eq!(crate::crc::crc32(&predictor), 0x43b0_f3a1);
+        assert_eq!(Codec::Predictor.encode(&pts).unwrap(), predictor);
         assert_eq!(back.len(), pts.len());
         for (a, b) in pts.iter().zip(back.iter()) {
             assert_eq!(a.ts, b.ts);
