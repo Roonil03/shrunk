@@ -83,6 +83,19 @@ cargo test --doc
 cargo build --release
 ```
 
+## Checkpoint cost after a small append
+
+```sh
+cargo test --release --locked --test lifecycle checkpoint_after_small_append -- --ignored --nocapture
+```
+
+The benchmark adds 128 CPU readings to progressively larger, already-checkpointed
+snapshots. It times only the next checkpoint, including sync. Each row reports
+the existing and appended point counts, the full replacement snapshot's logical
+byte length, and elapsed microseconds. Physical disk traffic depends on the
+filesystem. On Unix, set `TMPDIR` to a directory on the disk being measured.
+Repeat runs on the same filesystem when comparing timings.
+
 ## Formal checks
 
 The [core verification guide](../proofs/README.md) separates Lean

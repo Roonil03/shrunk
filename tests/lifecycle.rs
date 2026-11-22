@@ -390,3 +390,33 @@ fn oldest_timestamp_tracks_pending_blocks_empty_series_and_retention() {
     db.delete_range("later", i64::MIN, i64::MAX).unwrap();
     assert_eq!(db.oldest_timestamp(), None);
 }
+
+#[test]
+#[ignore = "manual checkpoint benchmark; run in release mode with --nocapture"]
+fn checkpoint_after_small_append() {
+    use shrunk::gen::{generate, Pattern};
+    use std::time::Instant;
+
+    let files = Files::new();
+    let path = files.db();
+    let mut db = Db::open_rw(&path).unwrap();
+    println!("existing_points,appended_points,snapshot_bytes,checkpoint_us");
+    for existing in [16_384, 131_072, 524_288] {
+        let start = db.point_count() as usize;
+        let seed = generate(Pattern::Cpu, existing - start, start as i64, 1);
+        db.write_many("cpu", &seed).unwrap();
+        db.checkpoint().unwrap();
+
+        let append = generate(Pattern::Cpu, 128, existing as i64, 1);
+        db.write_many("cpu", &append).unwrap();
+        let timer = Instant::now();
+        db.checkpoint().unwrap();
+        let elapsed = timer.elapsed().as_micros();
+        let bytes = fs::metadata(&path).unwrap().len();
+        println!("{existing},{},{bytes},{elapsed}", append.len());
+        assert_eq!(
+            Db::open(&path).unwrap().point_count(),
+            (existing + append.len()) as u64
+        );
+    }
+}
