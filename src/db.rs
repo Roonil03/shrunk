@@ -1611,8 +1611,9 @@ fn write_db(db: &Db, out: &mut impl Write) -> Result<()> {
             b.validate_meta().map_err(Error::Format)?;
             b.payload
                 .with_bytes(|payload| -> Result<()> {
+                    let payload_crc = crc32(payload);
                     if let Some(expected) = b.payload_crc {
-                        if crc32(payload) != expected {
+                        if payload_crc != expected {
                             return Err(Error::Format(format!(
                                 "series {:?}: payload changed before save",
                                 s.name
@@ -1642,7 +1643,7 @@ fn write_db(db: &Db, out: &mut impl Write) -> Result<()> {
                     out.write_all(&header)?;
                     out.write_all(&header_crc.to_le_bytes())?;
                     out.write_all(payload)?;
-                    out.write_all(&crc32(payload).to_le_bytes())?;
+                    out.write_all(&payload_crc.to_le_bytes())?;
                     Ok(())
                 })
                 .map_err(Error::Format)??;

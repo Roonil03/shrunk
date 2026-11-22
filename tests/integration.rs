@@ -235,9 +235,16 @@ fn corrupt_payload_is_rejected() {
     fs::write(&path, &bytes).unwrap();
 
     // v3 opens from metadata only; the payload checksum is verified lazily.
-    let db = Db::open(&path).expect("metadata is intact");
+    let mut db = Db::open(&path).expect("metadata is intact");
     let err = db.query(&Query::new("m", i64::MIN, i64::MAX)).unwrap_err();
     assert!(format!("{err}").contains("checksum"), "got: {err}");
+    let copy = dir.join("copy.shrunk");
+    let err = db.save(&copy).unwrap_err();
+    assert!(
+        err.to_string().contains("payload changed before save"),
+        "{err}"
+    );
+    assert!(!copy.exists());
 
     let _ = fs::remove_dir_all(&dir);
 }
