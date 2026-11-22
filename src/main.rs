@@ -867,10 +867,7 @@ fn write_query_stats(out: &mut impl Write, stats: &QueryStats) -> io::Result<()>
         stats.points_decoded,
         stats.bytes_decoded,
         if stats.pending_points > 0 {
-            format!(
-                "; {} pending points scanned uncompressed",
-                stats.pending_points
-            )
+            format!("; {} pending points in series", stats.pending_points)
         } else {
             String::new()
         }

@@ -200,16 +200,14 @@ impl Db {
                 }
             }
             if !stopped {
-                for p in &s.pending {
+                for p in s.pending_from(start) {
                     if p.ts > end {
                         break;
                     }
-                    if p.ts >= start {
-                        output.point(*p)?;
-                        if output.points.len() >= limit {
-                            stopped = true;
-                            break;
-                        }
+                    output.point(*p)?;
+                    if output.points.len() >= limit {
+                        stopped = true;
+                        break;
                     }
                 }
             }
