@@ -11,7 +11,7 @@ shrunk is a small Rust crate and CLI. It has no runtime dependencies.
 ## Build from source
 
 ```sh
-git clone https://github.com/vee1e/shrunk.git
+git clone https://github.com/shrunk-db/shrunk.git
 cd shrunk
 cargo build --release
 ```

@@ -262,7 +262,6 @@ the default write path. No lossy codec is selected unless explicitly requested.
   between checkpoints, but there is no incremental compaction yet.
 - The WAL has one writer and no group commit. Each batch is fsynced
   individually.
-- No concurrent writer coordination, deletes, retention, or downsampling.
 - The Dolphin prototype is not a full ACTF implementation; it captures the skip
   mechanism but not every branch of the paper.
 - WZS parameter optimization (genetic algorithm) was not reproduced.
