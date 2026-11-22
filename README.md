@@ -165,8 +165,7 @@ These are deliberate for a small project:
 - A 58-byte block overhead means very small series can occupy more space than raw
   points. Use a larger block size for many tiny series.
 - Aggregates ignore NaN in sum, avg, min, and max. Count counts every point.
-- The predictor codec allocates two small tables per encoded/decoded block.
-  That is fine at the default block size but is a future optimization target.
+- The predictor codec reuses 64 KiB of scratch space per thread that runs the codec.
 
 ## License
 
