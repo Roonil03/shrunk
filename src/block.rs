@@ -143,7 +143,8 @@ impl Block {
         }
 
         let mut best_codec = Codec::Raw;
-        let mut best = Codec::Raw.encode(points).expect("raw always encodes");
+        let mut best_size = points.len() * 16;
+        let mut best = None;
         // Dolphin only pays off on oscillating blocks. Skip its extra bit per
         // new window elsewhere, where it cannot beat Gorilla.
         let use_dolphin = dolphin_skip_rate(points) >= 0.08;
@@ -157,10 +158,21 @@ impl Block {
             if codec == Codec::Predictor && !use_predictor {
                 continue;
             }
+            // Without adjacent equal values RLE needs one run per point:
+            // at least three varints and eight value bytes per run, plus the count.
+            if codec == Codec::Rle
+                && best_size <= 1 + 11 * points.len()
+                && points
+                    .windows(2)
+                    .all(|w| w[0].value.to_bits() != w[1].value.to_bits())
+            {
+                continue;
+            }
             if let Some(bytes) = codec.encode(points) {
-                if bytes.len() < best.len() {
+                if bytes.len() < best_size {
+                    best_size = bytes.len();
                     best_codec = codec;
-                    best = bytes;
+                    best = Some(bytes);
                 }
             }
         }
@@ -180,7 +192,9 @@ impl Block {
             } else {
                 None
             },
-            payload: Payload::Memory(best),
+            payload: Payload::Memory(
+                best.unwrap_or_else(|| Codec::Raw.encode(points).expect("raw always encodes")),
+            ),
             payload_crc: None,
         }
     }
@@ -321,6 +335,27 @@ impl Block {
 mod tests {
     use super::*;
     use crate::gen::{generate, Pattern};
+
+    #[test]
+    fn raw_keeps_priority_on_a_size_tie() {
+        let points = [Point::new(i64::MIN, f64::from_bits(0x7ff8_0000_0000_0042))];
+        let raw = Codec::Raw.encode(&points).unwrap();
+        assert_eq!(Codec::Gorilla.encode(&points).unwrap().len(), raw.len());
+        let block = Block::build(&points);
+        assert_eq!(block.codec, Codec::Raw);
+        assert_eq!(block.payload.bytes().unwrap(), raw);
+    }
+
+    #[test]
+    fn repeated_values_keep_rle_eligible() {
+        let points: Vec<_> = (0..128).map(|ts| Point::new(ts, 0.5)).collect();
+        let block = Block::build(&points);
+        assert_eq!(block.codec, Codec::Rle);
+        assert_eq!(
+            block.payload.bytes().unwrap(),
+            Codec::Rle.encode(&points).unwrap()
+        );
+    }
 
     #[test]
     fn nan_value_bounds_are_rejected_without_nan_flag() {
