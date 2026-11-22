@@ -37,7 +37,7 @@ Fork the repository on GitHub, then clone your fork:
 ```sh
 git clone git@github.com:<your-user>/shrunk.git
 cd shrunk
-git remote add upstream git@github.com:vee1e/shrunk.git
+git remote add upstream git@github.com:shrunk-db/shrunk.git
 git fetch upstream
 ```
 
@@ -178,7 +178,7 @@ change is needed, not just what changed. Reference issues when relevant.
    ```sh
    git push -u origin feat/short-description
    ```
-4. Open a pull request against `vee1e/shrunk:main`.
+4. Open a pull request against `shrunk-db/shrunk:main`.
 5. Fill in the repository pull request template (see below). GitHub inserts it
    automatically from `.github/pull_request_template.md`.
 6. Link the issue the pull request closes, if there is one.
