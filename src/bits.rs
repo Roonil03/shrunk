@@ -40,6 +40,18 @@ impl BitWriter {
     #[inline]
     pub fn write_bits(&mut self, value: u64, n: u32) {
         debug_assert!(n <= 64);
+        if n >= 8 {
+            // Append the field to the low bits already waiting in cur.
+            let mask = (1u128 << n) - 1;
+            let packed = (u128::from(self.cur) << n) | (u128::from(value) & mask);
+            let total = u32::from(self.used) + n;
+            let bytes = (total / 8) as usize;
+            self.used = (total % 8) as u8;
+            let whole = ((packed >> self.used) as u64).to_be_bytes();
+            self.buf.extend_from_slice(&whole[8 - bytes..]);
+            self.cur = (packed as u8) & ((1 << self.used) - 1);
+            return;
+        }
         for i in (0..n).rev() {
             self.write_bit((value >> i) & 1 == 1);
         }
@@ -176,6 +188,29 @@ mod tests {
         assert_eq!(r.read_signed(5), -3);
         assert_eq!(r.read_bits(64), u64::MAX);
         assert!(!r.overrun());
+    }
+
+    #[test]
+    fn write_fields_match_individual_bits() {
+        for offset in 0..8 {
+            for width in 0..=64 {
+                for value in [0, u64::MAX, 0xa376_b59c_5e21_70da] {
+                    let mut field = BitWriter::new();
+                    let mut bits = BitWriter::new();
+                    for _ in 0..offset {
+                        field.write_bit(true);
+                        bits.write_bit(true);
+                    }
+                    field.write_bits(value, width);
+                    for shift in (0..width).rev() {
+                        bits.write_bit((value >> shift) & 1 == 1);
+                    }
+                    field.write_bit(true);
+                    bits.write_bit(true);
+                    assert_eq!(field.finish(), bits.finish());
+                }
+            }
+        }
     }
 
     #[test]
