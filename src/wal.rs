@@ -203,19 +203,18 @@ impl Wal {
         let payload_len = checked_payload_len(series.len(), points.len())?;
         let block_size = self.block_size;
         self.ensure_header(block_size)?;
-        let mut payload = Vec::with_capacity(payload_len);
-        payload.push(RECORD_KIND_POINTS);
-        put_u32(&mut payload, series.len() as u32);
-        put_u32(&mut payload, points.len() as u32);
-        payload.extend_from_slice(series.as_bytes());
+        let mut record = Vec::with_capacity(payload_len + 8);
+        put_u32(&mut record, payload_len as u32);
+        record.push(RECORD_KIND_POINTS);
+        put_u32(&mut record, series.len() as u32);
+        put_u32(&mut record, points.len() as u32);
+        record.extend_from_slice(series.as_bytes());
         for p in points {
-            payload.extend_from_slice(&p.ts.to_le_bytes());
-            payload.extend_from_slice(&p.value.to_bits().to_le_bytes());
+            record.extend_from_slice(&p.ts.to_le_bytes());
+            record.extend_from_slice(&p.value.to_bits().to_le_bytes());
         }
-        let mut record = Vec::with_capacity(payload.len() + 8);
-        put_u32(&mut record, payload.len() as u32);
-        record.extend_from_slice(&payload);
-        put_u32(&mut record, crc32(&payload));
+        let checksum = crc32(&record[4..]);
+        put_u32(&mut record, checksum);
         let old_len = self.file.metadata()?.len();
         let new_len = old_len
             .checked_add(record.len() as u64)
@@ -802,6 +801,28 @@ mod tests {
         assert_eq!(back.len(), 2);
         assert_eq!(back[0], points[0]);
         assert_eq!(back[1].value.to_bits(), points[1].value.to_bits());
+    }
+
+    #[test]
+    fn append_preserves_record_format() {
+        let path = test_path("append-record-format");
+        remove(&path);
+        let points = [
+            Point::new(i64::MIN, -0.0),
+            Point::new(0, f64::from_bits(0x7ff8_0000_0000_0123)),
+            Point::new(i64::MAX, f64::INFINITY),
+        ];
+        let mut wal = open_writer(&path, 64);
+        wal.append("cpu.\u{03b1}", &points).unwrap();
+        wal.append("other", &points[..1]).unwrap();
+        drop(wal);
+
+        let mut expected = Vec::new();
+        write_header_to_vec(&mut expected, 64);
+        expected.extend_from_slice(&encoded_record("cpu.\u{03b1}", &points));
+        expected.extend_from_slice(&encoded_record("other", &points[..1]));
+        assert_eq!(std::fs::read(&path).unwrap(), expected);
+        remove(&path);
     }
 
     #[test]

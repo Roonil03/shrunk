@@ -22,19 +22,45 @@ residual windows (`lz ≤ 31`, `lz + tz < 64`). Zero XORs add one bit without
 changing the state. No theorem connects the Rust dynamic program or byte
 writer to this recurrence, and wider fresh windows remain outside its scope.
 
+The efficiency baseline is now explicit rather than an assumed valid plan:
+`greedyChoices`/`greedyCost` implement the existing compatible-window rule,
+reusing exactly when eligible and no more expensive than a fresh window,
+including ties. `greedy_plan_valid` establishes validity for every step list.
+`canonical_no_regression_bits` therefore proves, for every valid canonical
+window stream, that the optimal mathematical bit cost is at most this concrete
+greedy cost, without assuming the desired inequality or a valid competing plan.
+The capped model uses the actual 2048-point threshold and greedy fallback.
+`canonical_no_regression_bytes` preserves the bound after adding arbitrary
+shared framing bits, one bit per zero XOR, and padding to whole bytes. The
+point count, nonzero windows, zero count and framing are model inputs; their
+correspondence to a Rust block still requires refinement.
+
+`CodecSelection.lean` models the existing strict-improvement size fold, starting
+at Raw's `16 * pointCount` bytes. For all candidate lengths it proves that the
+selected size is at most Raw and every admitted candidate. With the six existing
+candidate slots it also proves exactly one size comparison per admitted slot,
+and at most six comparisons overall. `None` represents a gated-out or
+inapplicable candidate: there is no bound against a skipped candidate. These
+are encoded-size and abstract comparison-count bounds, not execution-time,
+allocation, gate-cost or codec-computation bounds. In particular, the window
+optimizer can do more work than greedy while producing fewer encoded bits.
+
 | Module | Established property | Assumptions and boundary |
 |---|---|---|
 | `WindowChoice.lean` | Local compatible-window cost bounds and reuse on ties; XOR reconstruction and residual-list round trip; conditional window packing | Both window alternatives must be valid for the local cost comparison. Packing requires the explicit zero-region bounds. No Rust tags, window eligibility, or whole-stream optimality proof. |
-| `OptimalWindowPath.lean` | Canonical finite-horizon cost is attained by a valid path and is no greater than every valid path; fresh/reuse steps use Gorilla bit costs and compatibility | Valid nonzero tight-window bounds are part of the model. Zero XORs add the same one-bit cost to every plan. Rust recurrence refinement, byte packing, and noncanonical windows are not proved. |
+| `OptimalWindowPath.lean` | Canonical optimum is attained and no greater than every valid path; concrete greedy policy is valid; optimum and capped fallback use no more bits or padded bytes than greedy | Valid nonzero tight-window bounds are part of the model. Shared framing and zero costs are explicit. Rust recurrence refinement, byte packing, and noncanonical windows are not proved. |
+| `CodecSelection.lean` | Selected mathematical byte length is at most Raw and every admitted candidate; exactly one size comparison per admitted slot and at most six for the existing schedule | Candidate lengths and admission decisions are inputs. No bound against skipped candidates, no Rust refinement, and no runtime or encoder-cost proof. |
 | `BitCodec.lean` | Eight Boolean writes pack into a byte read MSB first; partial-byte alignment and zero padding; abstract prefix consumption and one exhausted read | The list reader starts after byte expansion. No theorem links this abstraction to Rust, and no arbitrary-length stateful byte-writer theorem is claimed. |
 | `Storage.lean` | Ordered record partition equals filtering beyond a watermark; replay at a covered final timestamp adds nothing; time pruning and ordered-block break are safe; cache contribution replacement identity | Timestamps are mathematical integers, records strictly ordered where required, bounds honest, blocks ordered and non-overlapping. The cache identity assumes the old contribution is represented; it is not a proof of cache maintenance or filesystem replay. |
 
 Every named theorem prints its axiom dependencies. The checked modules use
 only `propext`, `Classical.choice`, and `Quot.sound`, or fewer axioms. The runner
-treats warnings as errors (including admitted `sorry` proofs) and rejects
-reported `sorryAx` or `Lean.ofReduceBool` dependencies. New theorem declarations
-still require review and a matching `#print axioms`: the output scan is not a
-general analysis of every declaration. Zigzag is checked on the Rust code below.
+treats warnings as errors (including admitted `sorry` proofs), rejects
+reported `sorryAx` or `Lean.ofReduceBool` dependencies and permits only the
+three listed axioms in dependency reports. It also requires a matching
+`#print axioms` for each top-level `theorem` declaration in these standalone
+modules. This source-format check is not a general Lean parser or an analysis
+of every declaration. Zigzag is checked on the Rust code below.
 
 ## Actual Rust checks
 
