@@ -123,7 +123,75 @@ theorem canonical_optimal_le_valid_plan (windows : List CanonicalWindow)
     optimalCost (windows.map canonicalStep) none ≤ cost :=
   optimal_le_valid_plan _ _ _ _ h
 
+/- The existing greedy policy is a concrete baseline, not an assumed valid
+   competitor: reuse exactly when eligible and no dearer than fresh, including
+   ties. Costs include both tag bits, so comparing them is equivalent to the
+   Rust comparison old_width ≤ 11 + new_width. -/
+def greedyChoices {State : Type} : List (WindowStep State) → State → List Bool
+  | [], _ => []
+  | step :: rest, state =>
+    match step.reuseCost state with
+    | none => true :: greedyChoices rest step.freshState
+    | some reuse =>
+      if reuse ≤ step.freshCost then false :: greedyChoices rest state
+      else true :: greedyChoices rest step.freshState
+
+def greedyCost {State : Type} : List (WindowStep State) → State → Nat
+  | [], _ => 0
+  | step :: rest, state =>
+    match step.reuseCost state with
+    | none => step.freshCost + greedyCost rest step.freshState
+    | some reuse =>
+      if reuse ≤ step.freshCost then reuse + greedyCost rest state
+      else step.freshCost + greedyCost rest step.freshState
+
+theorem greedy_plan_valid {State : Type} (steps : List (WindowStep State)) (state : State) :
+    planCost steps state (greedyChoices steps state) = some (greedyCost steps state) := by
+  induction steps generalizing state with
+  | nil => rfl
+  | cons step rest ih =>
+    cases hre : step.reuseCost state with
+    | none => simp [greedyChoices, greedyCost, planCost, hre, ih]
+    | some reuse =>
+      by_cases hle : reuse ≤ step.freshCost
+      · simp [greedyChoices, greedyCost, planCost, hre, hle, ih]
+      · simp [greedyChoices, greedyCost, planCost, hre, hle, ih]
+
+-- No plan-validity or desired cost inequality is assumed from the caller.
+theorem canonical_no_regression_bits (windows : List CanonicalWindow) :
+    optimalCost (windows.map canonicalStep) none ≤
+      greedyCost (windows.map canonicalStep) none :=
+  optimal_le_valid_plan _ _ _ _ (greedy_plan_valid _ _)
+
+/- The production optimizer falls back to greedy above 2048 points. Count
+   includes the first point and zero residuals, unlike `windows`. Keeping it
+   explicit avoids treating the number of nonzero residuals as the cap. -/
+def cappedCanonicalCost (pointCount : Nat) (windows : List CanonicalWindow) : Nat :=
+  if pointCount ≤ 2048 then optimalCost (windows.map canonicalStep) none
+  else greedyCost (windows.map canonicalStep) none
+
+theorem capped_canonical_no_regression_bits (pointCount : Nat)
+    (windows : List CanonicalWindow) :
+    cappedCanonicalCost pointCount windows ≤ greedyCost (windows.map canonicalStep) none := by
+  unfold cappedCanonicalCost
+  split
+  · exact canonical_no_regression_bits windows
+  · exact Nat.le_refl _
+
+-- Shared framing (first value and timestamp stream) and one bit per omitted
+-- zero XOR are explicit. Padding to whole bytes preserves the bit bound.
+theorem canonical_no_regression_bytes (pointCount framingBits zeroCount : Nat)
+    (windows : List CanonicalWindow) :
+    (framingBits + zeroCount + cappedCanonicalCost pointCount windows + 7) / 8 ≤
+      (framingBits + zeroCount + greedyCost (windows.map canonicalStep) none + 7) / 8 := by
+  have bound := capped_canonical_no_regression_bits pointCount windows
+  omega
+
 #print axioms optimal_le_valid_plan
 #print axioms optimal_attained
 #print axioms canonical_optimal_attained
 #print axioms canonical_optimal_le_valid_plan
+#print axioms greedy_plan_valid
+#print axioms canonical_no_regression_bits
+#print axioms capped_canonical_no_regression_bits
+#print axioms canonical_no_regression_bytes

@@ -467,8 +467,8 @@ impl Db {
         s.last_ts = Some(ts);
         s.pending.push(Point { ts, value });
         if s.pending.len() >= block_size {
-            let chunk = std::mem::take(&mut s.pending);
-            s.blocks.push(Block::build(&chunk));
+            s.blocks.push(Block::build(&s.pending));
+            s.pending.clear();
         }
         self.projected_blocks = projected;
         Ok(())
@@ -539,9 +539,9 @@ impl Db {
             let room = block_size - s.pending.len();
             let take = room.min(remaining.len());
             if s.pending.len() + take == block_size {
-                let mut chunk = std::mem::take(&mut s.pending);
-                chunk.extend_from_slice(&remaining[..take]);
-                s.blocks.push(Block::build(&chunk));
+                s.pending.extend_from_slice(&remaining[..take]);
+                s.blocks.push(Block::build(&s.pending));
+                s.pending.clear();
                 remaining = &remaining[take..];
             } else {
                 s.pending.extend_from_slice(remaining);
@@ -2291,6 +2291,36 @@ mod tests {
                 count.value,
                 (!expected.is_empty()).then_some(expected.len() as f64)
             );
+        }
+    }
+
+    #[test]
+    fn mixed_writes_match_batch_snapshot_across_block_boundaries() {
+        let points: Vec<_> = (0..79).map(|ts| Point::new(ts, ts as f64 - 40.0)).collect();
+        for block_size in [1, 2, 7, 16] {
+            let mut mixed = Db::with_block_size(block_size);
+            let mut offset = 0;
+            for size in [1, 1, 12, 1, 2, 17, 1, 3, 1, 40] {
+                let chunk = &points[offset..offset + size];
+                if size == 1 {
+                    mixed.write("s", chunk[0].ts, chunk[0].value).unwrap();
+                } else {
+                    mixed.write_many("s", chunk).unwrap();
+                }
+                offset += size;
+                assert_eq!(
+                    mixed
+                        .query(&Query::new("s", i64::MIN, i64::MAX))
+                        .unwrap()
+                        .points,
+                    points[..offset]
+                );
+            }
+            let mut batched = Db::with_block_size(block_size);
+            batched.write_many("s", &points).unwrap();
+            mixed.flush_all().unwrap();
+            batched.flush_all().unwrap();
+            assert_eq!(encode_db(&mixed).unwrap(), encode_db(&batched).unwrap());
         }
     }
 
