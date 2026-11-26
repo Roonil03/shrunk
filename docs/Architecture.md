@@ -7,8 +7,8 @@ blocks it does not need. For the exact byte layout, see
 ## Blocks and codec selection
 
 Each series is an ordered list of immutable blocks, 1024 points by default.
-When a block fills, shrunk encodes it with every applicable codec and keeps the
-smallest result:
+When a block fills, shrunk tries eligible codec candidates and keeps the
+smallest result, falling back to raw storage when no candidate is smaller:
 
 | codec | id | timestamps | values | good for |
 |---|---|---|---|---|
@@ -22,8 +22,9 @@ smallest result:
 
 Gorilla follows the format from Facebook's Gorilla paper: the first timestamp
 is 64 bits, the first delta is 64 bits, later timestamps use delta-of-delta
-prefixes (`0`, `10`, `110`, `1110`, `1111`), and values reuse a previous XOR
-window when the new XOR fits inside it.
+prefixes (`0`, `10`, `110`, `1110`, `1111`), and values can reuse a previous XOR
+window when the new XOR fits inside it; the encoder compares reuse and
+fresh-window costs. See the [current Gorilla-RLE optimizer description](COMPRESSION.md#canonical-gorilla-window-path-optimization-2026-11-15).
 
 `gorilla-rle` adds a run-length layer over delta-of-delta timestamps, which
 collapses a fixed-step series to a single timestamp run. `dolphin` follows the
@@ -39,7 +40,7 @@ Every block header also stores:
 - `t_min`, `t_max`: time bounds
 - `v_min`, `v_max`: value bounds
 - `count`: points in the block
-- `sum`: total when all values are finite
+- `sum`: total when every value and the accumulated sum are finite
 - `has_nan`: disables value and min/max shortcuts when NaN is present
 
 Each block costs 58 bytes for its header and checksums, plus the payload. That
@@ -54,9 +55,9 @@ is negligible for a 1024-point block and noticeable for a three-point series.
 3. If a value predicate exists, skip blocks whose `[v_min, v_max]` cannot
    satisfy it.
 4. Decode only the blocks that survive.
-5. For aggregates with no value predicate, answer a fully covered block from
-   the header instead of decoding anything: count from `count`, sum and average
-   from `sum`, min and max from `v_min`/`v_max`.
+5. For fully covered blocks without a value predicate, count uses `count`;
+   sum and average use `sum` when present; min and max use the bounds when
+   `has_nan` is false. Otherwise, decode the block.
 
 That last step is why `avg` over one million points takes under a millisecond.
 It uses the stored per-block totals, not sampling.

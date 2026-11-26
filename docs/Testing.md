@@ -72,7 +72,7 @@ Legacy format fixtures live in `tests/fixtures/`:
 - `v1.shrunk`: a v1 database used by the migration test.
 - `v2.shrunk`: a v2 database used by the migration test.
 
-Before opening a pull request, run the full check suite:
+Before opening a pull request, run the core Rust checks:
 
 ```sh
 cargo fmt --all --check
@@ -82,6 +82,8 @@ cargo test --all-targets
 cargo test --doc
 cargo build --release
 ```
+
+Additional checks are defined in the [CI workflows](../.github/workflows/).
 
 ## Checkpoint cost after a small append
 
