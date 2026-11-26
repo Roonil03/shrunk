@@ -1,0 +1,37 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+language: "en-US"
+early_access: false
+reviews:
+  profile: "chill"
+  request_changes_workflow: false
+  high_level_summary: true
+  poem: false
+  review_status: true
+  collapse_walkthrough: false
+  path_filters:
+    - "!Cargo.lock"
+    - "!service/Cargo.lock"
+    - "!site/package-lock.json"
+    - "!tests/fixtures/**"
+    - "!site/public/**"
+    - "!assets/**"
+  path_instructions:
+    - path: "Cargo.toml"
+      instructions: "The core shrunk crate is intentionally dependency-free and forbids unsafe code. Flag any new runtime dependency or relaxation of [lints]."
+    - path: "src/**"
+      instructions: "Verify unsafe code remains forbidden, FORMAT_VERSION remains the single source of truth, persisted codec IDs are never renumbered, and v1/v2 decoders remain backward-compatible."
+    - path: "service/**"
+      instructions: "Focus on HTTP authentication (constant-time token checks), admission/retention bounds, request validation, and keeping service/Cargo.lock consistent with --locked builds."
+    - path: "proofs/**"
+      instructions: "Lean 4 proofs must compile cleanly under the pinned lean-toolchain with no sorry, admit, or unexpected custom axioms."
+    - path: ".github/workflows/**"
+      instructions: "Verify minimal GITHUB_TOKEN permissions, safe expression usage (actionlint), and pinned action versions."
+  auto_review:
+    enabled: true
+    drafts: false
+    base_branches:
+      - "main"
+    ignore_usernames:
+      - "dependabot[bot]"
+chat:
+  auto_reply: true
