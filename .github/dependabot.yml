@@ -41,6 +41,16 @@ updates:
     labels:
       - "dependencies"
     groups:
+      react:
+        patterns:
+          - "react"
+          - "react-dom"
+          - "@types/react"
+          - "@types/react-dom"
+      vite:
+        patterns:
+          - "vite"
+          - "@vitejs/*"
       npm-development:
         dependency-type: "development"
         update-types:
