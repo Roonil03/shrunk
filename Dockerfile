@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-FROM rust:1.89.0-alpine AS build
+FROM rust:1.100.0-alpine AS build
 RUN apk add --no-cache musl-dev
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
