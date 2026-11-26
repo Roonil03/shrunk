@@ -51,6 +51,10 @@ updates:
         patterns:
           - "vite"
           - "@vitejs/*"
+      tailwindcss:
+        patterns:
+          - "tailwindcss"
+          - "@tailwindcss/*"
       npm-development:
         dependency-type: "development"
         update-types:

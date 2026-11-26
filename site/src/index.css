@@ -1,6 +1,4 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
 
 @font-face {
   font-family: "Bricolage Grotesque";
@@ -53,24 +51,26 @@
     --gutter: 24px;
   }
 
-  * { box-sizing: border-box; }
+  @layer base {
+    * { box-sizing: border-box; }
 
-  html { -webkit-text-size-adjust: 100%; background: var(--ink); overflow-x: clip; }
+    html { -webkit-text-size-adjust: 100%; background: var(--ink); overflow-x: clip; }
 
-  body {
-    margin: 0;
-    background: var(--paper);
-    color: var(--text);
-    font-family: var(--sans);
-    font-size: 17px;
-    line-height: 1.6;
-    overflow-x: clip;
-    -webkit-font-smoothing: antialiased;
-    text-rendering: optimizeLegibility;
+    body {
+      margin: 0;
+      background: var(--paper);
+      color: var(--text);
+      font-family: var(--sans);
+      font-size: 17px;
+      line-height: 1.6;
+      overflow-x: clip;
+      -webkit-font-smoothing: antialiased;
+      text-rendering: optimizeLegibility;
+    }
+
+    a { color: inherit; }
+    img { display: block; max-width: 100%; }
   }
-
-  a { color: inherit; }
-  img { display: block; max-width: 100%; }
 
   .wrap {
     width: 100%;
