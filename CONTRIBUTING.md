@@ -28,8 +28,8 @@ discussed before you spend time on it.
 
 Prerequisites:
 
-- A Rust toolchain with Cargo (edition 2021). Install it from
-  [rustup.rs](https://rustup.rs/).
+- Rust 1.89 or newer with Cargo (edition 2021), as required by the
+  [package manifest](Cargo.toml). Install it from [rustup.rs](https://rustup.rs/).
 - No C compiler, database server, or external library is required.
 
 Fork the repository on GitHub, then clone your fork:
@@ -165,7 +165,7 @@ change is needed, not just what changed. Reference issues when relevant.
 ## Pull request process
 
 1. Rebase on the latest upstream `main`.
-2. Run the full check suite:
+2. Run the core Rust checks:
    ```sh
    cargo fmt --all --check
    cargo clippy --all-targets --locked -- -D warnings
@@ -174,6 +174,7 @@ change is needed, not just what changed. Reference issues when relevant.
    cargo test --doc
    cargo build --release
    ```
+   Additional checks are defined in the [CI workflows](.github/workflows/).
 3. Push your branch to your fork:
    ```sh
    git push -u origin feat/short-description

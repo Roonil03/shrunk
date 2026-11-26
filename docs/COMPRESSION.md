@@ -59,16 +59,15 @@ On `bench --points 100000 --pattern cpu`, the selected whole file fell from
 main cost of the optimization; decode needs no new logic. On counter and saw,
 the predictor still wins block selection despite the Gorilla-RLE improvement.
 
-This file records what was implemented, what was measured, and what was
-rejected. All numbers come from the checked-in benchmark commands, so they can
-be reproduced on another machine.
+The sections below preserve measurements from earlier implementation stages.
+The commands document how those runs were made; current results may differ.
 
-Environment for every measurement below:
+Environment for the whole-file and per-codec measurements below:
 
 - Linux Mint 22.3, x86_64, 8 logical CPUs, 7.6 GiB RAM
 - rustc/cargo 1.99.1, `--release` (`opt-level=3`, LTO, `panic=abort`)
 - `--points 1000000`, block size 1024, one series
-- Timings are one run and vary by a few percent between runs.
+- Timings are from one run.
 
 Commands:
 
@@ -100,7 +99,8 @@ because the v3 block header carries a separate header CRC and the file header is
 larger; RLE still wins the payload by a wide margin.
 
 Peak RSS for the whole `bench` process was 42-50 MiB. `open` no longer reads
-payloads, so open time is 1-2 ms even at one million points (baseline 8-54 ms).
+payloads, so open time is 1-2 ms even at one million points (nonconstant baseline
+8-54 ms).
 
 ## Per-codec results (payload only)
 
@@ -128,15 +128,17 @@ Encode/decode cost at the same settings (ns per point, payload only):
 | oscillating | 75 / 85 | 77 / 94 | 82 / 85 |
 
 The predictor is both smaller and faster on the patterns where it wins. Dolphin
-wins on oscillating data but costs more decode time there; it is only tried when
-at least 8% of adjacent XORs can take the skip path.
+beats Gorilla and Gorilla-RLE on this oscillating workload, but predictor has
+the smallest payload. Dolphin costs more decode time there; it is only tried
+when at least 8% of adjacent XORs can take the skip path.
 
 ## Implemented
 
 ### Validation and format
 
 - Block metadata is validated on read: non-zero count, count/size limits,
-  `t_min <= t_max`, `v_min <= v_max`, finite bounds, codec id known.
+  `t_min <= t_max`, non-NaN value bounds, `v_min <= v_max` when `has_nan` is
+  false, finite stored sums, codec id known.
 - v3 stores a CRC over the block header and a separate CRC over the payload.
   `open` validates headers; queries validate payloads lazily.
 - v1 and v2 decoders are retained. Saving upgrades a legacy database to the
@@ -247,10 +249,14 @@ The result is the largest win in this work: 2.63 bits/point on a counter versus
 unpredictable blocks pay about 12% extra ingest time instead of a full predictor
 pass.
 
+The comparator for the earlier 11.72 bits/point (10.9x) figure is not identified
+here; the named [pre-hardening baseline](BASELINE.md) lists 12.72 bits/point
+(10.1x).
+
 ### ARIMA/RL quantization and LSCodec
 
-Not enabled. The existing lossy experiments remain optional and are not part of
-the default write path. No lossy codec is selected unless explicitly requested.
+Not implemented or integrated into the write path; the available codecs are
+lossless.
 
 ## Trade-offs and remaining gaps
 
@@ -267,8 +273,10 @@ the default write path. No lossy codec is selected unless explicitly requested.
 - WZS parameter optimization (genetic algorithm) was not reproduced.
 - The AFC prototype is FCM/DFCM-based, not a verified reproduction of all four
   AFC strategies.
-- Benchmarks are synthetic. Real sensor traces should be added before claiming
-  production numbers.
+- The measurements in this document use synthetic workloads. See
+  [the real sensor benchmark](Testing.md#real-sensor-benchmark) for the checked-in
+  Beijing PM2.5 trace; these measurements do not establish general production
+  performance.
 - A `cargo fuzz` target is not checked in; randomized deterministic round-trip
   tests cover codec correctness, and integration tests cover corruption and
   crash recovery.
@@ -305,11 +313,14 @@ cargo build --release
   compression algorithm based on RLE. ICCAIS 2025, 2026.
   https://doi.org/10.1117/12.3111295
 
-## Cost-based Gorilla window updates
+## Historical cost-based Gorilla window updates
 
-The Gorilla XOR encoder now compares the cost of reusing a compatible window
-with the cost of declaring a new one: the old window width versus 11 metadata
-bits plus the new width. Both alternatives use the same two tag bits. Ties
+This records the earlier greedy window update. The canonical path optimization
+described above supersedes it for Gorilla-RLE blocks of at most 2048 points.
+
+At this stage, the Gorilla XOR encoder compares the cost of reusing a compatible
+window with the cost of declaring a new one: the old window width versus 11
+metadata bits plus the new width. Both alternatives use the same two tag bits. Ties
 reuse the old window. The existing wire grammar and decoders are unchanged.
 The choice minimizes the current residual's bits, not the entire stream: a
 narrower window can make a later residual more expensive. See

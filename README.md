@@ -42,7 +42,7 @@ shrunk changes how the readings are stored:
 
 - Readings are grouped into blocks. The default is 1024 readings, about 3 hours
   of data at one reading every 10 seconds.
-- Each block is compressed with whichever codec makes that block smallest. A
+- Each block uses the smallest encoding among the codecs tried for that block. A
   flat thermostat uses a different codec than a noisy sensor or an oscillating
   waveform.
 - Each block gets a label: its time range, its lowest and highest value, how
@@ -50,7 +50,7 @@ shrunk changes how the readings are stored:
 - Queries use labels to skip blocks. Totals come from the labels, so a question
   like "what was the average?" does not need to unpack every reading.
 
-On 600,000 synthetic readings from three sensors:
+In a recorded demo run on 600,000 synthetic readings from three sensors:
 
 ```text
 9.2 MiB of raw readings  ->  1.4 MiB stored  (6.5x smaller)
@@ -98,7 +98,8 @@ the label on the box.
 
 ## What shrunk is not
 
-- It is not a cloud service. It is one file and one local process.
+- It is not a cloud service. It runs in one local process; durable writes use a
+  snapshot file and a write-ahead log.
 - It is not a replacement for Prometheus, InfluxDB, or TimescaleDB. There is no
   replication, clustering, or SQL.
 - It is not lossless magic for every data set. Noisy floating point sensors get
@@ -163,7 +164,7 @@ These are deliberate for a small project:
 - Gorilla's advantage depends on data. Noisy f64 gauges get about 2x. Integer
   counters and flat signals get 10x to 200x.
 - A 58-byte block overhead means very small series can occupy more space than raw
-  points. Use a larger block size for many tiny series.
+  points. Increasing block size does not combine points from different series.
 - Aggregates ignore NaN in sum, avg, min, and max. Count counts every point.
 - The predictor codec reuses 64 KiB of scratch space per thread that runs the codec.
 

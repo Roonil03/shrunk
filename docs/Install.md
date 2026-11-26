@@ -4,7 +4,8 @@ shrunk is a small Rust crate and CLI. It has no runtime dependencies.
 
 ## Prerequisites
 
-- A Rust toolchain with Cargo (edition 2021). Install it from
+- Rust 1.89 or newer with Cargo (edition 2021), as required by the
+  [package manifest](../Cargo.toml). Install it from
   [rustup.rs](https://rustup.rs/) if you do not have one.
 - No C compiler, database server, or external library is required.
 
@@ -53,7 +54,7 @@ The count query covers 300 inclusive timestamps.
 
 ## Run a benchmark
 
-One million noisy gauge points (one run; timings vary by a few percent):
+One million noisy gauge points (one run):
 
 ```sh
 ./target/release/shrunk bench --points 1000000 --pattern noise
